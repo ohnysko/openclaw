@@ -137,6 +137,23 @@ function createGatewayHarness(scopes = ["operator.read"]) {
   };
 }
 
+function mountRow(row = sessionRow("agent:main:demo", "wt-demo"), scopes?: string[]) {
+  const harness = createGatewayHarness(scopes);
+  return { harness, row, host: mountLifecycleHost(harness.gateway, () => [row]) };
+}
+
+function expectSubscription(
+  harness: ReturnType<typeof createGatewayHarness>,
+  passiveSessionKeys: string[],
+  sessionKeys: string[] = [],
+) {
+  expect(harness.request).toHaveBeenLastCalledWith(
+    SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD,
+    { sessionKeys, passiveSessionKeys },
+    { timeoutMs: 30_000, signal: expect.any(AbortSignal) },
+  );
+}
+
 afterEach(() => {
   document.querySelectorAll(LIFECYCLE_HOST_TAG).forEach((host) => host.remove());
   vi.useRealTimers();
@@ -144,9 +161,10 @@ afterEach(() => {
 
 it("does not subscribe to PR status for session-only sidebar viewers", async () => {
   vi.useFakeTimers();
-  const harness = createGatewayHarness(["operator.sessions.read", "operator.sessions.write"]);
-  const row = sessionRow("agent:main:demo", "wt-demo");
-  const host = mountLifecycleHost(harness.gateway, () => [row]);
+  const { harness, row, host } = mountRow(undefined, [
+    "operator.sessions.read",
+    "operator.sessions.write",
+  ]);
   await host.updateComplete;
   await vi.advanceTimersByTimeAsync(60_000);
   expect(harness.request).not.toHaveBeenCalled();
@@ -175,16 +193,9 @@ it.each(["merged"] as const)(
   "observes visible rows and keeps the pushed %s summary through backoff",
   async (state) => {
     vi.useFakeTimers();
-    const harness = createGatewayHarness();
-    const row = sessionRow("agent:main:demo", "wt-demo");
-    const getRows = vi.fn(() => [row]);
-    const host = mountLifecycleHost(harness.gateway, getRows);
+    const { harness, row, host } = mountRow();
     await settle(host);
-    expect(harness.request).toHaveBeenLastCalledWith(
-      SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD,
-      { sessionKeys: [], passiveSessionKeys: [row.key] },
-      { timeoutMs: 30_000, signal: expect.any(AbortSignal) },
-    );
+    expectSubscription(harness, [row.key]);
 
     harness.publish(row.key, {
       pullRequests: [
@@ -222,9 +233,10 @@ it.each(["merged"] as const)(
 
 it("counts cold task receipts without a worktree or an invented state", async () => {
   vi.useFakeTimers();
-  const harness = createGatewayHarness();
-  const row = { key: "agent:main:task", isChild: false } as SidebarRecentSession;
-  const host = mountLifecycleHost(harness.gateway, () => [row]);
+  const { harness, row, host } = mountRow({
+    key: "agent:main:task",
+    isChild: false,
+  } as SidebarRecentSession);
   await settle(host);
   const tasks = [41, 42, 43].map((number) => ({
     owner: "example",
@@ -246,10 +258,8 @@ it("counts cold task receipts without a worktree or an invented state", async ()
 
 it("preserves catalog branch facts only while receipt-only hydration leaves the branch unread", async () => {
   vi.useFakeTimers();
-  const harness = createGatewayHarness();
-  const row = sessionRow("agent:main:task", "wt");
+  const { harness, row, host } = mountRow(sessionRow("agent:main:task", "wt"));
   const initial = { numbers: [40], state: "open" as const };
-  const host = mountLifecycleHost(harness.gateway, () => [row]);
   await settle(host);
   for (const [index, branchRead] of [false, undefined, false].entries()) {
     harness.publish(row.key, {
@@ -267,9 +277,7 @@ it("preserves catalog branch facts only while receipt-only hydration leaves the 
 
 it("clears alias indicators when the selected agent changes", async () => {
   vi.useFakeTimers();
-  const harness = createGatewayHarness();
-  const row = sessionRow("global", "wt-global");
-  const host = mountLifecycleHost(harness.gateway, () => [row]);
+  const { harness, row, host } = mountRow(sessionRow("global", "wt-global"));
   await settle(host);
   harness.publish("agent:main:global", {
     pullRequests: [
@@ -380,11 +388,10 @@ it.each(["agent", "client", "permissions", "sessions"] as const)(
   },
 );
 it("hides the row's saved PR summary after a same-client read-scope revocation", async () => {
-  const harness = createGatewayHarness();
   const row = sessionRow("agent:main:demo", "wt-demo", {
     pullRequest: { numbers: [42], state: "open" },
   });
-  const host = mountLifecycleHost(harness.gateway, () => [row]);
+  const { harness, host } = mountRow(row);
   await host.updateComplete;
   expect(host.textContent).toContain("42");
 
@@ -419,37 +426,26 @@ it("retains sidebar snapshots while only the viewed checkout drives subscription
 
   await settle(host);
 
-  expect(harness.request).toHaveBeenLastCalledWith(
-    SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD,
-    { sessionKeys: [], passiveSessionKeys: rows.map((row) => row.key).toSorted() },
-    { timeoutMs: 30_000, signal: expect.any(AbortSignal) },
-  );
+  expectSubscription(harness, rows.map((row) => row.key).toSorted());
 
   const viewer = {};
   const store = sessionPullRequestsForGateway(harness.gateway);
   const key = rows[0]!.key;
   store.watch(viewer, [key], { foreground: true });
   await vi.advanceTimersByTimeAsync(0);
-  expect(harness.request).toHaveBeenLastCalledWith(
-    SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD,
-    {
-      sessionKeys: [key],
-      passiveSessionKeys: rows
-        .slice(1)
-        .map((row) => row.key)
-        .toSorted(),
-    },
-    { timeoutMs: 30_000, signal: expect.any(AbortSignal) },
+  expectSubscription(
+    harness,
+    rows
+      .slice(1)
+      .map((row) => row.key)
+      .toSorted(),
+    [key],
   );
   harness.publish(key, { pullRequests: [{ number: 7, state: "open" }] });
   store.unwatch(viewer);
   await vi.advanceTimersByTimeAsync(0);
   await host.updateComplete;
-  expect(harness.request).toHaveBeenLastCalledWith(
-    SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD,
-    { sessionKeys: [], passiveSessionKeys: rows.map((row) => row.key).toSorted() },
-    { timeoutMs: 30_000, signal: expect.any(AbortSignal) },
-  );
+  expectSubscription(harness, rows.map((row) => row.key).toSorted());
   expect(host.textContent?.trim()).toBe("7");
 
   harness.request.mockClear();
@@ -509,9 +505,7 @@ it("clears a rendered fallback after the visible snapshot leaves the bounded wat
 
 it("keeps sidebar watches passive across disconnect and reconnect", async () => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-  const harness = createGatewayHarness();
-  const row = sessionRow("agent:main:demo", "wt-demo");
-  const host = mountLifecycleHost(harness.gateway, () => [row]);
+  const { harness, row, host } = mountRow();
   await settle(host);
   expect(harness.request.mock.lastCall?.[1]).toEqual(
     host.isConnected ? { sessionKeys: [], passiveSessionKeys: [row.key] } : { sessionKeys: [] },

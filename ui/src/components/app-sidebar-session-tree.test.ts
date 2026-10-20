@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import type { GatewaySessionRow } from "../api/types.ts";
+import { runningRow } from "../test-helpers/app-sidebar-session-narration.ts";
 import { projectSessionTree } from "./app-sidebar-session-tree.ts";
 import {
   SIDEBAR_SESSION_NO_ATTENTION,
@@ -10,20 +11,16 @@ const homeKey = "agent:main:main";
 const conversationKey = "agent:main:dashboard:conversation";
 const workerKey = "agent:main:subagent:review";
 
-// Only presentation fields consumed by the tree matter to these placement assertions.
 function present(row: GatewaySessionRow, isChild = false): SidebarRecentSession {
   return {
-    key: row.key,
+    ...runningRow(row.key),
     label: row.label ?? row.key,
     isChild,
-    attention: { kind: "none" },
     hasActiveRun: row.hasActiveRun === true,
     active: row.key === conversationKey,
     unread: row.unread === true,
     status: row.status,
-    runningChildCount: 0,
-    failedChildCount: 0,
-  } as SidebarRecentSession;
+  };
 }
 
 function makeRow(key: string, fields: Partial<GatewaySessionRow> = {}): GatewaySessionRow {

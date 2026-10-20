@@ -1,14 +1,12 @@
 // @vitest-environment node
-import { expect, it, vi } from "vitest";
-import type {
-  SessionCatalog,
-  SessionCatalogHost,
-} from "../../../packages/gateway-protocol/src/index.ts";
+import { beforeEach, expect, it, vi } from "vitest";
+import type { SessionCatalog } from "../../../packages/gateway-protocol/src/index.ts";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 import { SessionCatalogLiveState } from "./app-sidebar-session-catalog-live.ts";
 import { refetchExpandedSessionCatalogPages } from "./app-sidebar-session-catalog-state.ts";
 import { sessionCatalogHostKey } from "./app-sidebar-session-types.ts";
 
+const idleSession = { status: "idle", archived: false, canContinue: true, canArchive: true };
 function catalog(id: string, hostCount: number): SessionCatalog {
   return {
     id,
@@ -19,42 +17,33 @@ function catalog(id: string, hostCount: number): SessionCatalog {
       label: `Host ${hostIndex}`,
       kind: "node",
       connected: true,
-      sessions: [
-        {
-          threadId: `${id}-thread-${hostIndex}`,
-          status: "idle",
-          archived: false,
-          canContinue: true,
-          canArchive: true,
-        },
-      ],
+      sessions: [{ ...idleSession, threadId: `${id}-thread-${hostIndex}` }],
     })),
   };
 }
 
-function startLive() {
-  const live = new SessionCatalogLiveState();
-  const { progressId } = live.beginRequest(1);
-  return {
-    live,
-    apply: (
-      incoming: SessionCatalog,
-      catalogs: SessionCatalog[],
-      pageDepths = new Map<string, number>(),
-    ) =>
-      live.applyHost({
-        payload: { progressId, agentId: "main", catalog: incoming },
-        agentId: "main",
-        catalogs,
-        pageDepths,
-      }),
-  };
+let live: SessionCatalogLiveState;
+let progressId: string;
+beforeEach(() => {
+  live = new SessionCatalogLiveState();
+  progressId = live.beginRequest(1).progressId;
+});
+function apply(
+  incoming: SessionCatalog,
+  catalogs: SessionCatalog[],
+  pages = new Map<string, number>(),
+) {
+  return live.applyHost({
+    payload: { progressId, agentId: "main", catalog: incoming },
+    agentId: "main",
+    catalogs,
+    pageDepths: pages,
+  });
 }
 
 it.each(["final", "incremental"] as const)(
   "retains rows and cursors for a pending host in %s publications",
   async (publication) => {
-    const { live, apply } = startLive();
     const current = catalog("codex", 2);
     current.hosts[0]!.nextCursor = "next-page";
     const pending = { ...current.hosts[0]!, pending: true, sessions: [], nextCursor: undefined };
@@ -87,9 +76,8 @@ it.each(["final", "incremental"] as const)(
 );
 
 it("does not replace a settled progressive host with its pending final response", () => {
-  const { live, apply } = startLive();
   const current = catalog("codex", 1);
-  const pending: SessionCatalogHost = { ...current.hosts[0]!, pending: true, sessions: [] };
+  const pending = { ...current.hosts[0]!, pending: true, sessions: [] };
   const published = apply(current, [{ ...current, hosts: [pending] }])!;
   expect(live.mergeFinal([{ ...current, hosts: [pending] }], published.catalogs)).toEqual([
     current,
@@ -97,7 +85,6 @@ it("does not replace a settled progressive host with its pending final response"
 });
 
 it("clears unavailable native readiness without losing another host or expanded rows", () => {
-  const { apply } = startLive();
   const current = catalog("codex", 2);
   current.capabilities.startTerminal = true;
   current.hosts.forEach((host) => {
@@ -119,7 +106,6 @@ it("clears unavailable native readiness without losing another host or expanded 
   expect(result?.catalogs[0]?.hosts[0]?.sessions).toEqual(current.hosts[0]?.sessions);
 });
 it("compares a host event only with the catalog and host it can replace", () => {
-  const { apply } = startLive();
   const changed = catalog("changed", 1);
   const unrelated = catalog("unrelated", 100);
   Object.defineProperty(unrelated, "toJSON", {
@@ -128,5 +114,5 @@ it("compares a host event only with the catalog and host it can replace", () => 
     },
   });
 
-  expect(apply({ ...changed, hosts: [changed.hosts[0]!] }, [changed, unrelated])).toBeNull();
+  expect(apply(changed, [changed, unrelated])).toBeNull();
 });

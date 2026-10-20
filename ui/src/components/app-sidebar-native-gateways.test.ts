@@ -42,9 +42,13 @@ async function mountNative(key = "agent:main:main") {
     element.click();
     await sidebar.updateComplete;
   };
-  const open = async () => {
+  const open = async (gateways = false) => {
     await click(query(sidebar, ".sidebar-identity-card")!);
-    return query(sidebar, ".sidebar-identity-menu")!;
+    const menu = query(sidebar, ".sidebar-identity-menu")!;
+    if (gateways) {
+      await click(item(menu, "command:gateways")!);
+    }
+    return menu;
   };
   return { ...mounted, gateway, sessions, click, open };
 }
@@ -76,30 +80,20 @@ it("closes the session menu on Gateway changes after moves and context replaceme
 it("lists native gateways and dispatches switching, window, primary, and settings actions", async () => {
   document.documentElement.classList.add("openclaw-native-macos");
   const postMessage = setNativeGatewayTestState("remote")!;
-  const capability = nativeGatewaysCapability()!;
+  const [local, remote] = nativeGatewaysCapability()!.snapshot!.gateways;
   const snapshot = {
     gateways: [
-      capability.snapshot!.gateways[0]!,
-      { ...capability.snapshot!.gateways[1]!, id: "profile:team", health: "error" as const },
-      {
-        ...capability.snapshot!.gateways[1]!,
-        id: "unknown",
-        name: "Unprobed Gateway",
-        health: "unknown" as const,
-      },
+      local!,
+      { ...remote!, id: "profile:team", health: "error" as const },
+      { ...remote!, id: "unknown", name: "Unprobed Gateway", health: "unknown" as const },
     ],
     currentId: "profile:team",
   };
   publishSnapshot(snapshot);
-  const { sidebar, click, open: openIdentity } = await mountNative();
-  const open = async () => {
-    const menu = await openIdentity();
-    await click(item(menu, "command:gateways")!);
-    return menu;
-  };
+  const { sidebar, open: openIdentity } = await mountNative();
+  const open = () => openIdentity(true);
   const choose = async (value: string, modifiers?: MouseEventInit, eventType = "click") => {
-    const menu = await open();
-    const target = item(menu, value)!;
+    const target = item(await open(), value)!;
     expect(target).not.toBeNull();
     if (modifiers) {
       target.dispatchEvent(
@@ -117,16 +111,18 @@ it("lists native gateways and dispatches switching, window, primary, and setting
   expect(current.textContent).toContain("Remote Gateway");
   expect(query(current, ".sidebar-gateway-health")?.getAttribute("aria-label")).toBe("Unreachable");
   expect(item(menu, "command:apps")).toBeNull();
-  const rows = snapshot.gateways.map((gateway) =>
-    query(menu, `[data-value="gateway:${encodeURIComponent(gateway.id)}"]`)!,
-  );
+  const rows = snapshot.gateways.map(({ id }) => item(menu, `gateway:${encodeURIComponent(id)}`)!);
   expect(
-    rows.map((row) => query(row, ".sidebar-customize-menu__text")?.textContent?.trim()),
-  ).toEqual(["Local Gateway", "Remote Gateway", "Unprobed Gateway"]);
-  expect(
-    rows.map((row) => query(row, ".sidebar-gateway-health")?.getAttribute("aria-label")),
-  ).toEqual(["Connected", "Unreachable", "Unknown status"]);
-  expect(rows.map(shortcut)).toEqual(["⌘1", undefined, "⌘3"]);
+    rows.map((row) => [
+      query(row, ".sidebar-customize-menu__text")?.textContent?.trim(),
+      query(row, ".sidebar-gateway-health")?.getAttribute("aria-label"),
+      shortcut(row),
+    ]),
+  ).toEqual([
+    ["Local Gateway", "Connected", "⌘1"],
+    ["Remote Gateway", "Unreachable", undefined],
+    ["Unprobed Gateway", "Unknown status", "⌘3"],
+  ]);
   for (const keycap of menu.querySelectorAll("kbd")) {
     expect(keycap.getAttribute("aria-hidden")).toBe("true");
   }
@@ -139,19 +135,17 @@ it("lists native gateways and dispatches switching, window, primary, and setting
   expect(postMessage).not.toHaveBeenCalled();
   expect(query(sidebar, ".sidebar-identity-menu")).toBeNull();
 
-  await choose("gateway:local");
-  expect(postMessage).toHaveBeenLastCalledWith({ type: "select", id: "local" });
-  for (const modifiers of [{ metaKey: true }, { ctrlKey: true }]) {
-    await choose("gateway:profile%3Ateam", modifiers);
-    expect(postMessage).toHaveBeenLastCalledWith({ type: "open-window", id: "profile:team" });
+  for (const [target, type, id, modifiers, event] of [
+    ["gateway:local", "select", "local"],
+    ["gateway:profile%3Ateam", "open-window", "profile:team", { metaKey: true }],
+    ["gateway:profile%3Ateam", "open-window", "profile:team", { ctrlKey: true }],
+    ["gateway:profile%3Ateam", "open-window", "profile:team", { ctrlKey: true }, "contextmenu"],
+    ["command:gateway-set-primary", "set-primary", "profile:team"],
+    ["command:gateway-settings", "open-settings"],
+  ] as const) {
+    await choose(target, modifiers, event);
+    expect(postMessage).toHaveBeenLastCalledWith({ type, ...(id ? { id } : {}) });
   }
-  // macOS sends a contextmenu event for Control-click instead of click.
-  await choose("gateway:profile%3Ateam", { ctrlKey: true }, "contextmenu");
-  expect(postMessage).toHaveBeenLastCalledWith({ type: "open-window", id: "profile:team" });
-  await choose("command:gateway-set-primary");
-  expect(postMessage).toHaveBeenLastCalledWith({ type: "set-primary", id: "profile:team" });
-  await choose("command:gateway-settings");
-  expect(postMessage).toHaveBeenLastCalledWith({ type: "open-settings" });
   expect(postMessage).toHaveBeenCalledTimes(6);
 
   snapshot.gateways = [snapshot.gateways[0]!];
