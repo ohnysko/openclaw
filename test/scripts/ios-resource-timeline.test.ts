@@ -73,6 +73,23 @@ describe("iOS resource timeline workload boundary", () => {
     expect(existsSync(output)).toBe(false);
   });
 
+  it("reports a failed workload spawn without waiting on diagnostics", () => {
+    const root = tempDirs.make("ios-resource-timeline-");
+    const output = path.join(root, "timeline.jsonl");
+    const result = spawnSync(
+      process.execPath,
+      [script, "--output", output, "--", path.join(root, "missing-workload")],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    expect(result.status).toBe(127);
+    expect(result.error).toBeUndefined();
+    expect(JSON.parse(readFileSync(output, "utf8").trim().split("\n").at(-1)!)).toMatchObject({
+      type: "end",
+      code: 127,
+      signal: null,
+    });
+  });
+
   posixIt("retains the child's terminating signal", () => {
     const output = path.join(tempDirs.make("ios-resource-timeline-"), "timeline.jsonl");
     const result = run(output, `process.kill(process.pid, "SIGTERM");`);

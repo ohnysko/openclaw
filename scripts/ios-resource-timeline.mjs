@@ -457,6 +457,9 @@ function main() {
   const handlers = new Map(
     ["SIGINT", "SIGTERM", "SIGHUP"].map((signal) => {
       const handler = () => {
+        if (child.pid === undefined) {
+          return;
+        }
         try {
           process.kill(process.platform === "win32" ? child.pid : -child.pid, signal);
         } catch {
