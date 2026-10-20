@@ -25,11 +25,15 @@ import {
   markGatewayRestartDraining,
   resetGatewayWorkAdmission,
 } from "../../../process/gateway-work-admission.js";
-import { createDeferredCore } from "../../../shared/deferred.js";
+import { createDeferredCore, type Deferred } from "../../../shared/deferred.js";
 import { createGatewayMethodRegistry } from "../../methods/registry.js";
 import { agentHandlers } from "../../server-methods/agent.js";
 import { createLazyCoreHandlers } from "../../server-methods/lazy-core-handlers.js";
-import type { GatewayRequestHandler, RespondFn } from "../../server-methods/types.js";
+import type {
+  GatewayRequestHandler,
+  GatewayRequestHandlers,
+  RespondFn,
+} from "../../server-methods/types.js";
 import {
   createDispatchTestHarness,
   createOperatorWsClient,
@@ -48,6 +52,8 @@ vi.mock("node:worker_threads", async (importOriginal) => ({
 }));
 
 const scheduling = vi.hoisted(() => ({ start: vi.fn<() => Promise<void> | null>() }));
+const traceId = "1".repeat(32);
+const parentSpanId = "1".repeat(16);
 vi.mock("./request-start.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./request-start.js")>()),
   scheduleGatewayRequestStart: scheduling.start,
@@ -104,11 +110,20 @@ function observeRequests() {
   };
 }
 
-function createRequest(handler: GatewayRequestHandler, method = "health") {
+const respondOk: GatewayRequestHandler = ({ respond }) => respond(true, {});
+
+function createRequest(
+  handler: GatewayRequestHandler | GatewayRequestHandlers = respondOk,
+  method = "health",
+  options: Parameters<typeof createDispatchTestHarness>[0] = {},
+) {
   const observed = observeRequests();
   const socket = new EventEmitter();
   const client = createOperatorWsClient({ socket });
-  const harness = createDispatchTestHarness({ extraHandlers: { [method]: handler } });
+  const harness = createDispatchTestHarness({
+    ...options,
+    extraHandlers: typeof handler === "function" ? { [method]: handler } : handler,
+  });
   const dispatch = (
     params: Record<string, unknown> = {},
     connection = client,
@@ -124,9 +139,62 @@ function createRequest(handler: GatewayRequestHandler, method = "health") {
     client,
     socket,
     dispatch,
-    run: async () => {
-      await dispatch();
+    run: async (...args: Parameters<typeof dispatch>) => {
+      await dispatch(...args);
       await observed.finished;
+    },
+  };
+}
+
+function privateClient(id: string) {
+  const client = createOperatorWsClient({ clientInfo: { id, mode: "backend" } });
+  Object.assign(client.connect.client, {
+    displayName: "private-display-name",
+    instanceId: "private-instance",
+    platform: "private-platform",
+  });
+  client.connect.userAgent = "private-user-agent";
+  return client;
+}
+
+function mockHeap(heapUsed: number) {
+  const memory = { ...process.memoryUsage(), heapUsed };
+  const sample = vi.spyOn(process, "memoryUsage").mockImplementation(() => ({ ...memory }));
+  return { memory, sample };
+}
+
+function expectPhaseCounts(fixture: ReturnType<typeof createRequest>, ...phases: string[]) {
+  expect(
+    phases.map((phase) => fixture.events.filter((event) => event.phase === phase).length),
+  ).toEqual(phases.map(() => 1));
+}
+
+function finishAfterTest(dispatch: Promise<unknown>, ...gates: Deferred[]) {
+  onTestFinished(async () => {
+    gates.forEach((gate) => gate.resolve());
+    await dispatch;
+  });
+}
+
+function createPausedRequest(handler: GatewayRequestHandler, method = "health") {
+  const entered = createDeferredCore();
+  const release = createDeferredCore();
+  const fixture = createRequest(async (request) => {
+    entered.resolve();
+    await release.promise;
+    await handler(request);
+  }, method);
+  return {
+    ...fixture,
+    entered: entered.promise,
+    release,
+    start: async () => {
+      finishAfterTest(fixture.dispatch(), release);
+      await entered.promise;
+    },
+    finish: async () => {
+      release.resolve();
+      await fixture.finished;
     },
   };
 }
@@ -165,96 +233,73 @@ describe("authenticated Gateway RPC diagnostics", () => {
     ["openclaw-linux", "other"],
     ["test", "other"],
   ] as const)("attributes ordinary RPCs from %s as %s", async (id, clientKind) => {
-    const fixture = createRequest(({ respond }) => respond(true, {}));
-    const client = createOperatorWsClient({ clientInfo: { id, mode: "backend" } });
-    client.connect.client.displayName = "private-display-name";
-    client.connect.client.instanceId = "private-instance";
-    client.connect.client.platform = "private-platform";
-    await fixture.dispatch({}, client, { id: "private-request" });
-    await fixture.finished;
-    expect(fixture.phase("received")[0]).toMatchObject({
-      method: "health",
-      clientKind,
-    });
+    const fixture = createRequest();
+    await fixture.run({}, privateClient(id));
+    expect(fixture.phase("received")[0]).toMatchObject({ method: "health", clientKind });
     expect(JSON.stringify(fixture.events)).not.toContain("private-");
   });
 
-  it.each([
-    {
-      clientKind: "openclaw-control-ui",
-      params: { sessionKey: "private-session", agentId: "private-agent", compact: true },
-      shape: { scope: "session", compact: true, page: "first" },
+  it.each<[string, string, Record<string, unknown>, Record<string, unknown>]>([
+    [
+      "cron.list",
+      "openclaw-control-ui",
+      { sessionKey: "private-session", agentId: "private-agent", compact: true },
+      { scope: "session", compact: true, page: "first" },
+    ],
+    [
+      "cron.list",
+      "openclaw-macos",
+      { agentId: "private-agent", offset: 50 },
+      { scope: "agent", compact: false, page: "append" },
+    ],
+    [
+      "cron.list",
+      "gateway-client",
+      { compact: "private-invalid", offset: "private-invalid", query: "private-query" },
+      { scope: "global", compact: false, page: "first" },
+    ],
+    [
+      "models.list",
+      "openclaw-control-ui",
+      { view: "configured", agentId: "private-agent", preparedOnly: true },
+      { view: "configured", scope: "agent", preparedOnly: true, refresh: false },
+    ],
+    [
+      "models.list",
+      "openclaw-macos",
+      { sessionKey: "private-session", agentId: "private-agent", refresh: true },
+      { view: "default", scope: "session", preparedOnly: false, refresh: true },
+    ],
+    [
+      "models.list",
+      "gateway-client",
+      { view: "provider-config", authProfileId: "private-profile" },
+      { view: "provider-config", scope: "auth-profile", preparedOnly: false, refresh: false },
+    ],
+    [
+      "models.list",
+      "cli",
+      { view: "private-view", refresh: "private-refresh" },
+      { view: "other", scope: "global", preparedOnly: false, refresh: false },
+    ],
+  ])(
+    "attributes %s receipt without private values (%s)",
+    async (method, clientKind, params, shape) => {
+      const fixture = createRequest(respondOk, method);
+      await fixture.run(params, privateClient(clientKind));
+      expect(fixture.phase("received")).toEqual([
+        expect.objectContaining({
+          method,
+          [method === "cron.list" ? "cronList" : "modelsList"]: {
+            clientKind,
+            source: "wire",
+            ...shape,
+          },
+        }),
+      ]);
+      expect(JSON.stringify(fixture.events)).not.toContain("private-");
     },
-    {
-      clientKind: "openclaw-macos",
-      params: { agentId: "private-agent", offset: 50 },
-      shape: { scope: "agent", compact: false, page: "append" },
-    },
-    {
-      clientKind: "gateway-client",
-      params: { compact: "private-invalid", offset: "private-invalid", query: "private-query" },
-      shape: { scope: "global", compact: false, page: "first" },
-    },
-  ])("attributes cron list receipt without private values ($clientKind)", async (query) => {
-    const fixture = createRequest(({ respond }) => respond(true, {}), "cron.list");
-    const client = createOperatorWsClient({
-      clientInfo: { id: query.clientKind, mode: "backend" },
-    });
-    await fixture.dispatch(query.params, client, { id: "private-request" });
-    await fixture.finished;
-    expect(fixture.phase("received")).toEqual([
-      expect.objectContaining({
-        method: "cron.list",
-        cronList: { clientKind: query.clientKind, source: "wire", ...query.shape },
-      }),
-    ]);
-    expect(JSON.stringify(fixture.events)).not.toContain("private-");
-  });
-
-  it.each([
-    {
-      clientKind: "openclaw-control-ui",
-      params: { view: "configured", agentId: "private-agent", preparedOnly: true },
-      shape: { view: "configured", scope: "agent", preparedOnly: true, refresh: false },
-    },
-    {
-      clientKind: "openclaw-macos",
-      params: { sessionKey: "private-session", agentId: "private-agent", refresh: true },
-      shape: { view: "default", scope: "session", preparedOnly: false, refresh: true },
-    },
-    {
-      clientKind: "gateway-client",
-      params: { view: "provider-config", authProfileId: "private-profile" },
-      shape: {
-        view: "provider-config",
-        scope: "auth-profile",
-        preparedOnly: false,
-        refresh: false,
-      },
-    },
-    {
-      clientKind: "cli",
-      params: { view: "private-view", refresh: "private-refresh" },
-      shape: { view: "other", scope: "global", preparedOnly: false, refresh: false },
-    },
-  ])("attributes model catalog receipt without private values ($clientKind)", async (query) => {
-    const fixture = createRequest(({ respond }) => respond(true, {}), "models.list");
-    const client = createOperatorWsClient({
-      clientInfo: { id: query.clientKind, mode: "backend" },
-    });
-    client.connect.userAgent = "private-user-agent";
-    client.connect.client.displayName = "private-display-name";
-    client.connect.client.instanceId = "private-instance";
-    await fixture.dispatch(query.params, client, { id: "private-request" });
-    await fixture.finished;
-    expect(fixture.phase("received")).toEqual([
-      expect.objectContaining({
-        method: "models.list",
-        modelsList: { clientKind: query.clientKind, source: "wire", ...query.shape },
-      }),
-    ]);
-    expect(JSON.stringify(fixture.events)).not.toContain("private-");
-  });
+  );
 
   it.each([
     { source: "dashboard", rowMode: "compact", bytes: 204_800, elapsed: 0 },
@@ -268,7 +313,7 @@ describe("authenticated Gateway RPC diagnostics", () => {
       respond(true, {});
     }, "sessions.list");
     fixture.send.mockReturnValue({ kind: "sent", bytes: query.bytes });
-    await fixture.dispatch({
+    await fixture.run({
       source: query.source,
       rowMode: query.rowMode,
       limit: 60,
@@ -276,7 +321,6 @@ describe("authenticated Gateway RPC diagnostics", () => {
       ownerId: "synthetic-private-owner",
       search: "synthetic-private-search",
     });
-    await fixture.finished;
     expect(fixture.send).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
     expect(fixture.phase("received")[0]).toMatchObject({
       sessionsList: {
@@ -306,13 +350,12 @@ describe("authenticated Gateway RPC diagnostics", () => {
     { params: { activeMinutes: 15 }, filter: "active" },
     { params: { activeOnly: false, agentId: "private-agent" }, filter: "general" },
   ])("bounds session list filter attribution ($filter)", async ({ params, filter }) => {
-    const fixture = createRequest(({ respond }) => respond(true, {}), "sessions.list");
-    await fixture.dispatch(
+    const fixture = createRequest(respondOk, "sessions.list");
+    await fixture.run(
       { ...params, source: "sidebar", rowMode: "private-invalid-mode" },
       fixture.client,
       { id: "private-request" },
     );
-    await fixture.finished;
     expect(fixture.phase("received")[0]).toMatchObject({
       sessionsList: {
         clientKind: fixture.client.connect.client.id,
@@ -329,11 +372,7 @@ describe("authenticated Gateway RPC diagnostics", () => {
     "records frame bytes and logs, sampling heap only on the main thread (main=%s)",
     async (main) => {
       thread.isMainThread = main;
-      let heapUsed = 4096;
-      const memory = process.memoryUsage();
-      const sample = vi
-        .spyOn(process, "memoryUsage")
-        .mockImplementation(() => ({ ...memory, heapUsed }));
+      const { memory, sample } = mockHeap(4096);
       let now = 1000;
       vi.spyOn(Date, "now").mockImplementation(() => now);
       const output = captureLogs("info");
@@ -343,12 +382,13 @@ describe("authenticated Gateway RPC diagnostics", () => {
         respond(true, { accepted: true });
         await completion.promise;
         respond(true, { final: true });
-        heapUsed = 2048;
+        memory.heapUsed = 2048;
         fixture.send.mockReturnValue({ kind: "unavailable" });
         respond(true);
       });
       fixture.send.mockReturnValue({ kind: "sent", bytes: 1234 });
       const dispatch = fixture.dispatch();
+      finishAfterTest(dispatch, completion);
       await fixture.awaitResponseFrame("private-request-id");
       fixture.send.mockReturnValue({ kind: "sent", bytes: 8192 });
       completion.resolve();
@@ -370,66 +410,51 @@ describe("authenticated Gateway RPC diagnostics", () => {
   it.each(["nested", "crossing", "unobserved"])(
     "discards entire overlapping handler windows (%s) and resumes after settlement",
     async (overlap) => {
-      const firstEntered = createDeferredCore();
-      const secondEntered = createDeferredCore();
-      const firstRelease = createDeferredCore();
-      const secondRelease = createDeferredCore();
-      let heapUsed = 1024;
-      const memory = process.memoryUsage();
-      vi.spyOn(process, "memoryUsage").mockImplementation(() => ({ ...memory, heapUsed }));
-      const first = createRequest(async () => {
-        firstEntered.resolve();
-        await firstRelease.promise;
-        heapUsed += 4096;
+      const { memory } = mockHeap(1024);
+      const first = createPausedRequest(() => {
+        memory.heapUsed += 4096;
       });
-      const second = createRequest(async () => {
-        secondEntered.resolve();
-        await secondRelease.promise;
-        heapUsed += 8192;
+      const second = createPausedRequest(() => {
+        memory.heapUsed += 8192;
       }, "cron.status");
       const firstDispatch = first.dispatch();
-      await firstEntered.promise;
+      await first.entered;
       if (overlap === "unobserved") {
         setDiagnosticsEnabledForProcess(false);
       }
       const secondDispatch = second.dispatch();
-      try {
-        await awaitGateBeforeSettlement(
-          secondEntered.promise,
-          secondDispatch,
-          "overlapping request settled before handler entry",
-        );
-        setDiagnosticsEnabledForProcess(true);
-        if (overlap === "crossing") {
-          firstRelease.resolve();
-          await firstDispatch;
-          secondRelease.resolve();
-        } else {
-          secondRelease.resolve();
-          await secondDispatch;
-          firstRelease.resolve();
-        }
-        await Promise.all([firstDispatch, secondDispatch]);
-        await waitForDiagnosticEventsDrained();
-        const handlers = first.phase("handler");
-        expect(handlers).toHaveLength(overlap === "unobserved" ? 1 : 2);
-        expect(
-          first.events.filter(
-            (event) => "heapDeltaBytes" in event && event.heapDeltaBytes !== undefined,
-          ),
-        ).toEqual([]);
-        first.events.length = 0;
-        await first.dispatch();
-        await waitForDiagnosticEventsDrained();
-        expect(first.phase("handler")[0]).toMatchObject({
-          heapDeltaBytes: 4096,
-        });
-      } finally {
-        setDiagnosticsEnabledForProcess(true);
-        firstRelease.resolve();
-        secondRelease.resolve();
-        await Promise.all([firstDispatch, secondDispatch]);
+      finishAfterTest(Promise.all([firstDispatch, secondDispatch]), first.release, second.release);
+      onTestFinished(() => setDiagnosticsEnabledForProcess(true));
+      await awaitGateBeforeSettlement(
+        second.entered,
+        secondDispatch,
+        "overlapping request settled before handler entry",
+      );
+      setDiagnosticsEnabledForProcess(true);
+      if (overlap === "crossing") {
+        first.release.resolve();
+        await firstDispatch;
+        second.release.resolve();
+      } else {
+        second.release.resolve();
+        await secondDispatch;
+        first.release.resolve();
       }
+      await Promise.all([firstDispatch, secondDispatch]);
+      await waitForDiagnosticEventsDrained();
+      const handlers = first.phase("handler");
+      expect(handlers).toHaveLength(overlap === "unobserved" ? 1 : 2);
+      expect(
+        first.events.filter(
+          (event) => "heapDeltaBytes" in event && event.heapDeltaBytes !== undefined,
+        ),
+      ).toEqual([]);
+      first.events.length = 0;
+      await first.dispatch();
+      await waitForDiagnosticEventsDrained();
+      expect(first.phase("handler")[0]).toMatchObject({
+        heapDeltaBytes: 4096,
+      });
     },
   );
 
@@ -437,21 +462,17 @@ describe("authenticated Gateway RPC diagnostics", () => {
     "keeps %s preparation separate from actual handler entry",
     async (preparation) => {
       let now = 100;
-      let heapUsed = 1024;
-      const memory = process.memoryUsage();
-      vi.spyOn(process, "memoryUsage").mockImplementation(() => ({ ...memory, heapUsed }));
+      const { memory } = mockHeap(1024);
       vi.spyOn(performance, "now").mockImplementation(() => now);
       const reached = createDeferredCore();
       const release = createDeferredCore();
       const handler: GatewayRequestHandler = ({ respond }) => {
-        heapUsed += 2048;
+        memory.heapUsed += 2048;
         now = 240;
         respond(true);
       };
-      const observed = observeRequests();
-      const client = createOperatorWsClient();
-      const harness = createDispatchTestHarness({
-        extraHandlers: createLazyCoreHandlers({
+      const fixture = createRequest(
+        createLazyCoreHandlers({
           methods: ["health"],
           loadHandlers: async () => {
             reached.resolve();
@@ -465,34 +486,25 @@ describe("authenticated Gateway RPC diagnostics", () => {
               : handlers;
           },
         }),
-      });
-      const dispatch = harness.dispatcher.dispatch(
-        { type: "req", id: "prepared", method: "health" },
-        client,
       );
-      try {
-        await reached.promise;
-        heapUsed += 8192;
-        now = 200;
-        release.resolve();
-        await observed.finished;
-        await waitForDiagnosticEventsDrained();
-        if (preparation === "family rejection") {
-          expect(observed.phase("handler").length > 0).toBe(false);
-          expect(observed.events.at(-1)).toMatchObject({ phase: "dispatch", outcome: "threw" });
-          return;
-        }
-        expect(observed.phase("handler")[0]).toMatchObject({
-          admissionMs: 100,
-          durationMs: 40,
-          outcome: "returned",
-          heapDeltaBytes: 2048,
-        });
-      } finally {
-        release.resolve();
-        await dispatch;
-        await observed.finished;
+      finishAfterTest(fixture.dispatch(), release);
+      await reached.promise;
+      memory.heapUsed += 8192;
+      now = 200;
+      release.resolve();
+      await fixture.finished;
+      await waitForDiagnosticEventsDrained();
+      if (preparation === "family rejection") {
+        expect(fixture.phase("handler").length > 0).toBe(false);
+        expect(fixture.events.at(-1)).toMatchObject({ phase: "dispatch", outcome: "threw" });
+        return;
       }
+      expect(fixture.phase("handler")[0]).toMatchObject({
+        admissionMs: 100,
+        durationMs: 40,
+        outcome: "returned",
+        heapDeltaBytes: 2048,
+      });
     },
   );
 
@@ -513,70 +525,50 @@ describe("authenticated Gateway RPC diagnostics", () => {
       respond(true, { final: true });
     });
     const dispatch = fixture.dispatch();
-    try {
-      await queued.promise;
-      now = 120;
-      queue.resolve();
-      expect(await fixture.awaitResponseFrame("private-request-id")).toMatchObject({
-        payload: { accepted: true },
-      });
-      await waitForDiagnosticEventsDrained();
-      expect(fixture.phase("response")).toMatchObject([{ outcome: "ok", durationMs: 50 }]);
-      expect(fixture.phase("handler").length > 0).toBe(false);
-      now = 220;
-      completion.resolve();
-      await fixture.finished;
-      expect(fixture.phase("handler")).toMatchObject([
-        { outcome: "returned", durationMs: 100, admissionMs: 20 },
-      ]);
-      expect(fixture.phase("dispatch")).toMatchObject([
-        { outcome: "returned", durationMs: 120, queueWaitMs: 20, response: "sent" },
-      ]);
-      expect(fixture.phase("received")).toHaveLength(1);
-      expect(fixture.phase("response")).toHaveLength(1);
-      expect(JSON.stringify(fixture.events)).not.toContain("private-request-id");
-    } finally {
-      queue.resolve();
-      completion.resolve();
-      await dispatch;
-      await fixture.finished;
-    }
-  });
-
-  it("records a first response after handler return without reopening dispatch", async () => {
-    let retainedRespond: RespondFn | undefined;
-    const fixture = createRequest(({ respond }) => {
-      retainedRespond = respond;
+    finishAfterTest(dispatch, queue, completion);
+    await queued.promise;
+    now = 120;
+    queue.resolve();
+    expect(await fixture.awaitResponseFrame("private-request-id")).toMatchObject({
+      payload: { accepted: true },
     });
-    await fixture.run();
-    expect(fixture.events.at(-1)).toMatchObject({ phase: "dispatch", response: "none" });
-    retainedRespond?.(true, { late: true });
-    retainedRespond?.(true, { later: true });
     await waitForDiagnosticEventsDrained();
-    expect(fixture.phase("response")).toHaveLength(1);
-    expect(fixture.phase("handler")).toHaveLength(1);
-    expect(fixture.phase("dispatch")).toHaveLength(1);
+    expect(fixture.phase("response")).toMatchObject([{ outcome: "ok", durationMs: 50 }]);
+    expect(fixture.phase("handler").length > 0).toBe(false);
+    now = 220;
+    completion.resolve();
+    await fixture.finished;
+    expect(fixture.phase("handler")).toMatchObject([
+      { outcome: "returned", durationMs: 100, admissionMs: 20 },
+    ]);
+    expect(fixture.phase("dispatch")).toMatchObject([
+      { outcome: "returned", durationMs: 120, queueWaitMs: 20, response: "sent" },
+    ]);
+    expectPhaseCounts(fixture, "received", "response");
+    expect(JSON.stringify(fixture.events)).not.toContain("private-request-id");
   });
 
   it.each([true, false])(
-    "preserves captured trace presence for late responses (trace=%s)",
+    "keeps late responses single and trace-bound (trace=%s)",
     async (hasTrace) => {
       let retainedRespond: RespondFn | undefined;
       const fixture = createRequest(({ respond }) => {
         retainedRespond = respond;
       });
-      const traceId = "11111111111111111111111111111111";
       await fixture.dispatch({}, fixture.client, {
         id: "trace-request",
-        ...(hasTrace ? { traceparent: `00-${traceId}-1111111111111111-01` } : {}),
+        ...(hasTrace ? { traceparent: `00-${traceId}-${parentSpanId}-01` } : {}),
       });
       await fixture.finished;
+      expect(fixture.events.at(-1)).toMatchObject({ phase: "dispatch", response: "none" });
       const unrelated = createDiagnosticTraceContext({ parentSpanId: "2222222222222222" });
       runWithDiagnosticTraceContext(unrelated, () => {
-        retainedRespond?.(true);
+        retainedRespond?.(true, { late: true });
+        retainedRespond?.(true, { later: true });
         expect(getActiveDiagnosticTraceContext()).toEqual(unrelated);
       });
       await waitForDiagnosticEventsDrained();
+      expectPhaseCounts(fixture, "response", "handler", "dispatch");
       expect(
         fixture.events
           .filter((event) => event.phase !== "received")
@@ -586,32 +578,24 @@ describe("authenticated Gateway RPC diagnostics", () => {
   );
 
   it.each(
-    (["shared-auth", "runtime"] as const).flatMap((reason) => [
-      {
-        reason,
-        parent: "valid",
-        traceparent: "00-11111111111111111111111111111111-1111111111111111-01",
-      },
-      {
-        reason,
-        parent: "invalid",
-        traceparent: "00-00000000000000000000000000000000-1111111111111111-01",
-      },
-      { reason, parent: "absent", traceparent: undefined },
-    ]),
+    (["shared-auth", "runtime"] as const).flatMap((reason) =>
+      [
+        { parent: "valid", traceparent: `00-${traceId}-${parentSpanId}-01` },
+        { parent: "invalid", traceparent: `00-${"0".repeat(32)}-${parentSpanId}-01` },
+        { parent: "absent", traceparent: undefined },
+      ].map((parent) => Object.assign(parent, { reason })),
+    ),
   )(
     "preserves supplied parent semantics through early $reason denial (parent=$parent)",
     async ({ reason, parent, traceparent }) => {
-      const { events, finished } = observeRequests();
       const handler = vi.fn<GatewayRequestHandler>(({ respond }) => respond(true));
-      const client = createOperatorWsClient();
       const ambient = createDiagnosticTraceContext();
       const authority = vi.fn(() => false);
-      const harness = createDispatchTestHarness({
-        extraHandlers: { health: handler },
+      const fixture = createRequest(handler, "health", {
         getRequiredSharedGatewaySessionGeneration: () => "new-generation",
         buildRequestContext: () => ({ validateAgentRuntimeApprovalAuthority: authority }),
       });
+      const { client } = fixture;
       if (reason === "shared-auth") {
         client.usesSharedGatewayAuth = true;
         client.sharedGatewaySessionGeneration = "previous-generation";
@@ -633,36 +617,26 @@ describe("authenticated Gateway RPC diagnostics", () => {
         };
       }
       await runWithDiagnosticTraceContext(ambient, () =>
-        harness.dispatcher.dispatch(
-          { type: "req", id: "early-denial", method: "health", params: {}, traceparent },
-          client,
-        ),
+        fixture.run({}, client, { id: "early-denial", traceparent }),
       );
-      await finished;
       expect(handler).not.toHaveBeenCalled();
-      const phases = events.filter((event) => event.phase !== "received");
+      const phases = fixture.events.filter((event) => event.phase !== "received");
       expect(phases.map((event) => event.phase)).toEqual(
         reason === "runtime" ? ["response", "dispatch"] : ["dispatch"],
       );
       expect(phases.at(-1)).toMatchObject({ phase: "dispatch", outcome: "rejected" });
-      if (parent === "valid") {
-        expect(
-          phases.every((event) => event.trace?.traceId === "11111111111111111111111111111111"),
-        ).toBe(true);
-        expect(phases.every((event) => event.trace?.parentSpanId === "1111111111111111")).toBe(
-          true,
-        );
-      } else {
-        expect(phases.every((event) => event.trace?.traceId === ambient.traceId)).toBe(true);
-        expect(phases.every((event) => event.trace?.parentSpanId === undefined)).toBe(true);
-      }
+      expect(phases.map((event) => [event.trace?.traceId, event.trace?.parentSpanId])).toEqual(
+        phases.map(() =>
+          parent === "valid" ? [traceId, parentSpanId] : [ambient.traceId, undefined],
+        ),
+      );
       if (reason === "runtime") {
         expect(authority).toHaveBeenCalledWith(client.internal?.agentRuntimeIdentity);
-        expect(harness.send).toHaveBeenCalledWith(expect.objectContaining({ ok: false }));
+        expect(fixture.send).toHaveBeenCalledWith(expect.objectContaining({ ok: false }));
       } else {
-        expect(harness.send).not.toHaveBeenCalled();
+        expect(fixture.send).not.toHaveBeenCalled();
       }
-      expect(harness.close).toHaveBeenCalledWith(4001, expect.any(String));
+      expect(fixture.close).toHaveBeenCalledWith(4001, expect.any(String));
       expect(getActiveDiagnosticTraceContext()).toBeUndefined();
     },
   );
@@ -704,41 +678,40 @@ describe("authenticated Gateway RPC diagnostics", () => {
     },
   );
 
-  it("keeps disconnected ordinary work alive and records unavailable delivery separately", async () => {
-    const entered = createDeferredCore();
-    const completion = createDeferredCore();
-    const fixture = createRequest(async ({ respond, signal }) => {
-      expect(signal).toBeUndefined();
-      entered.resolve();
-      await completion.promise;
-      respond(true, { done: true });
-      respond(true, { duplicate: true });
-    });
-    const dispatch = fixture.dispatch();
-    try {
-      await entered.promise;
-      expect(fixture.socket.listenerCount("close")).toBe(0);
-      fixture.socket.emit("close");
-      fixture.send.mockReturnValue({ kind: "unavailable" });
-      completion.resolve();
-      await fixture.finished;
-      expect(fixture.phase("response")).toMatchObject([{ outcome: "unavailable" }]);
+  it.each(["unavailable", "suppressed"] as const)(
+    "records %s delivery independently of settlement",
+    async (outcome) => {
+      const fixture = createPausedRequest(({ respond, signal }) => {
+        expect(signal).toBeUndefined();
+        respond(true, { private: "must not send after revocation" });
+        respond(true, { duplicate: true });
+      });
+      await fixture.start();
+      if (outcome === "unavailable") {
+        expect(fixture.socket.listenerCount("close")).toBe(0);
+        fixture.socket.emit("close");
+        fixture.send.mockReturnValue({ kind: "unavailable" });
+      } else {
+        fixture.client.invalidated = true;
+      }
+      await fixture.finish();
+      expect(fixture.phase("response")).toMatchObject([{ outcome }]);
       expect(fixture.events.at(-1)).toMatchObject({
         phase: "dispatch",
         outcome: "returned",
-        response: "unavailable",
+        response: outcome,
       });
-    } finally {
-      completion.resolve();
-      await dispatch;
-      await fixture.finished;
-    }
-  });
+      expectEventSubset(fixture.events, [{ phase: "handler", outcome: "returned" }]);
+      if (outcome === "suppressed") {
+        expect(fixture.send).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it.each(["sent", "unavailable"] as const)(
     "measures serialization fallback only when its send is %s",
     async (fallback) => {
-      const fixture = createRequest(({ respond }) => respond(true, {}));
+      const fixture = createRequest();
       fixture.send
         .mockReturnValueOnce({
           kind: "serialization",
@@ -757,33 +730,6 @@ describe("authenticated Gateway RPC diagnostics", () => {
       ]);
     },
   );
-
-  it("records suppressed delivery after authority revocation without changing handler settlement", async () => {
-    const entered = createDeferredCore();
-    const completion = createDeferredCore();
-    const fixture = createRequest(async ({ respond }) => {
-      entered.resolve();
-      await completion.promise;
-      respond(true, { private: "must not send" });
-    });
-    const dispatch = fixture.dispatch();
-    try {
-      await entered.promise;
-      fixture.client.invalidated = true;
-      completion.resolve();
-      await fixture.finished;
-      expect(fixture.send).not.toHaveBeenCalled();
-      expectEventSubset(fixture.events, [
-        { phase: "response", outcome: "suppressed" },
-        { phase: "handler", outcome: "returned" },
-        { phase: "dispatch", response: "suppressed" },
-      ]);
-    } finally {
-      completion.resolve();
-      await dispatch;
-      await fixture.finished;
-    }
-  });
 
   it("reports request-owned cancellation separately from transport delivery failure", async () => {
     const entered = createDeferredCore();

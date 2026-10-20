@@ -1,19 +1,10 @@
-// Shared fixture for tests driving createGatewayAuthenticatedRequestDispatcher.
 import { vi } from "vitest";
-import type { WebSocket } from "ws";
+import type { ResponseFrame } from "../../../../packages/gateway-protocol/src/schema/frames.js";
 import { createDeferredCore, type Deferred } from "../../../shared/deferred.js";
 import { GatewayClientRegistry } from "../client-registry.js";
 import type { GatewayWsClient } from "../ws-types.js";
 import { createGatewayAuthenticatedRequestDispatcher } from "./authenticated-request-dispatch.js";
-import type { GatewayWsMessageHandlerParams } from "./message-handler-types.js";
-
-export type GatewayTestResponseFrame = {
-  type: "res";
-  id: string;
-  ok: boolean;
-  payload?: unknown;
-  error?: { code?: string; message?: string } & Record<string, unknown>;
-};
+import type { GatewayWsMessageHandlerParams as Handler } from "./message-handler-types.js";
 
 export function createOperatorWsClient(
   overrides: {
@@ -24,7 +15,7 @@ export function createOperatorWsClient(
   } = {},
 ): GatewayWsClient {
   return {
-    socket: (overrides.socket ?? {}) as WebSocket,
+    socket: overrides.socket ?? {},
     connId: overrides.connId ?? "dispatch-test-connection",
     usesSharedGatewayAuth: false,
     connect: {
@@ -45,35 +36,33 @@ export function createOperatorWsClient(
 export function createDispatchTestHarness(
   options: {
     connId?: string;
-    extraHandlers?: GatewayWsMessageHandlerParams["extraHandlers"];
+    extraHandlers?: Handler["extraHandlers"];
     buildRequestContext?: () => unknown;
     isClosed?: () => boolean;
     getRequiredSharedGatewaySessionGeneration?: () => string | undefined;
   } = {},
 ) {
   const clients = new GatewayClientRegistry();
-  const sentResponses: GatewayTestResponseFrame[] = [];
-  const responseWaiters: { id: string; deferred: Deferred<GatewayTestResponseFrame> }[] = [];
-  const send = vi.fn<GatewayWsMessageHandlerParams["send"]>(() => ({ kind: "sent" }));
-  // Recording lives outside the spy so tests may replace send's implementation
-  // (to observe call context) without silently breaking awaitResponseFrame.
+  const responses = new Map<string, Deferred<ResponseFrame>>();
+  const responseFor = (id: string) => {
+    const response = responses.get(id) ?? createDeferredCore<ResponseFrame>();
+    responses.set(id, response);
+    return response;
+  };
+  const send = vi.fn<Handler["send"]>(() => ({ kind: "sent" }));
+  // Record before the replaceable spy; one promise per id retains its first response.
   const sendForDispatcher = (frame: unknown) => {
-    const response = frame as GatewayTestResponseFrame;
+    const response = frame as ResponseFrame;
     if (response?.type === "res") {
-      sentResponses.push(response);
-      for (let index = responseWaiters.length - 1; index >= 0; index -= 1) {
-        const waiter = responseWaiters[index];
-        if (waiter && waiter.id === response.id) {
-          responseWaiters.splice(index, 1);
-          waiter.deferred.resolve(response);
-        }
-      }
+      responseFor(response.id).resolve(response);
     }
     return send(frame) ?? ({ kind: "sent" } as const);
   };
-  const close = vi.fn();
-  const setCloseCause = vi.fn();
-  const logGateway = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  const effects = {
+    close: vi.fn(),
+    setCloseCause: vi.fn(),
+    logGateway: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  };
   const config = {};
   const context = { broadcast: vi.fn(), getRuntimeConfig: () => config };
   const dispatcher = createGatewayAuthenticatedRequestDispatcher({
@@ -84,46 +73,24 @@ export function createDispatchTestHarness(
       extraHandlers: options.extraHandlers ?? {},
       buildRequestContext: () => (options.buildRequestContext?.() ?? context) as never,
       send: sendForDispatcher,
-      close,
+      ...effects,
       isClosed: options.isClosed ?? (() => false),
       getRequiredSharedGatewaySessionGeneration: options.getRequiredSharedGatewaySessionGeneration,
-      setCloseCause,
-      logGateway,
-    } as unknown as GatewayWsMessageHandlerParams,
+    } as unknown as Handler,
     isWebchatConnect: () => false,
   });
-  // A response can precede handler completion. Tests driving ongoing work wait
-  // for this event, then release their gates and join the original dispatch.
-  const awaitResponseFrame = (id: string): Promise<GatewayTestResponseFrame> => {
-    const already = sentResponses.find((frame) => frame.id === id);
-    if (already) {
-      return Promise.resolve(already);
-    }
-    const deferred = createDeferredCore<GatewayTestResponseFrame>();
-    responseWaiters.push({ id, deferred });
-    return deferred.promise;
-  };
   return {
     clients,
-    awaitResponseFrame,
-    close,
+    awaitResponseFrame: (id: string) => responseFor(id).promise,
+    ...effects,
     dispatcher: {
       dispatch: (
         frame: unknown,
         client: GatewayWsClient,
-        admission?: "continuation",
-        sendResponse?: GatewayWsMessageHandlerParams["send"],
+        ...delivery: [admission?: "continuation", sendResponse?: Handler["send"]]
       ) =>
-        dispatcher.dispatch(
-          frame,
-          client,
-          Buffer.byteLength(JSON.stringify(frame)),
-          admission,
-          sendResponse,
-        ),
+        dispatcher.dispatch(frame, client, Buffer.byteLength(JSON.stringify(frame)), ...delivery),
     },
-    logGateway,
     send,
-    setCloseCause,
   };
 }

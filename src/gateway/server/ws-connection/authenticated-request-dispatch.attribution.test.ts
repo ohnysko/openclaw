@@ -21,14 +21,18 @@ const revision = "private-revision";
 const unchanged = { rowsUnchanged: true };
 const delta = { rowsDelta: { baseRevision: revision } };
 const full = { sessions: [] };
-function sessionCase(
-  rowMode: string,
-  ifRowsRevision: string | undefined,
-  payload: unknown,
-  rowsOutcome: string,
+function expectWireResponse(
+  events: unknown[],
+  field: "sessionsList" | "chatHistory",
+  details: Record<string, unknown>,
+  copies = 1,
 ) {
-  const params = { rowMode, ...(ifRowsRevision !== undefined ? { ifRowsRevision } : {}) };
-  return { params, payload, rowsOutcome };
+  const expected = {
+    responseBytes: 1234,
+    [field]: { clientKind: "openclaw-control-ui", source: "wire", ...details },
+  };
+  expect(events).toMatchObject(Array.from({ length: copies }, () => expected));
+  expect(JSON.stringify(events)).not.toContain("private-");
 }
 
 async function dispatch(
@@ -124,38 +128,31 @@ it.each(["wire", "shared", "internal"] as const)(
 );
 
 it.each([
-  sessionCase("sidebar", revision, unchanged, "unchanged"),
-  sessionCase("sidebar", `delta:${revision}`, delta, "delta"),
-  sessionCase("sidebar", undefined, full, "full-no-base"),
-  sessionCase("sidebar", `delta:${revision}`, full, "full-with-base"),
-  sessionCase("sidebar", revision, full, "full-with-base"),
-  sessionCase("compact", undefined, full, "not-sidebar"),
-  sessionCase("compact", "", full, "full-no-base"),
-  sessionCase("compact", revision, unchanged, "unchanged"),
-  sessionCase("compact", `delta:${revision}`, delta, "delta"),
-])(
-  "attributes session response bytes as $rowsOutcome",
-  async ({ params, payload, rowsOutcome }) => {
+  ["sidebar", revision, unchanged, "unchanged"],
+  ["sidebar", `delta:${revision}`, delta, "delta"],
+  ["sidebar", undefined, full, "full-no-base"],
+  ["sidebar", `delta:${revision}`, full, "full-with-base"],
+  ["sidebar", revision, full, "full-with-base"],
+  ["compact", undefined, full, "not-sidebar"],
+  ["compact", "", full, "full-no-base"],
+  ["compact", revision, unchanged, "unchanged"],
+  ["compact", `delta:${revision}`, delta, "delta"],
+] as const)(
+  "attributes session response bytes (%s, %s, %j, %s)",
+  async (rowMode, ifRowsRevision, payload, rowsOutcome) => {
     for (const delivery of ["wire", "shared"] as const) {
       const events = await dispatch(
         "sessions.list",
-        { ...params, source: "sidebar" },
+        { rowMode, ...(ifRowsRevision !== undefined ? { ifRowsRevision } : {}), source: "sidebar" },
         payload,
         delivery,
       );
-      const expected = {
-        responseBytes: 1234,
-        sessionsList: {
-          clientKind: "openclaw-control-ui",
-          source: "wire",
-          callerSource: "sidebar",
-          rowMode: params.rowMode,
-          filter: "general",
-          rowsOutcome,
-        },
-      };
-      expect(events).toMatchObject(delivery === "shared" ? [expected, expected] : [expected]);
-      expect(JSON.stringify(events)).not.toContain("private-");
+      expectWireResponse(
+        events,
+        "sessionsList",
+        { callerSource: "sidebar", rowMode, filter: "general", rowsOutcome },
+        delivery === "shared" ? 2 : 1,
+      );
     }
   },
 );
@@ -181,19 +178,7 @@ it.each([
       { sessionKey: "private-session", ...params },
       { kind },
     );
-    expect(events).toMatchObject([
-      {
-        responseBytes: 1234,
-        chatHistory: {
-          clientKind: "openclaw-control-ui",
-          source: "wire",
-          shape,
-          limitBucket,
-          outcome: kind ?? "page",
-        },
-      },
-    ]);
-    expect(JSON.stringify(events)).not.toContain("private-");
+    expectWireResponse(events, "chatHistory", { shape, limitBucket, outcome: kind ?? "page" });
   },
 );
 

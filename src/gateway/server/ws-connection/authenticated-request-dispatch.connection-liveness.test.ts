@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { beforeEach, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import { createTestGatewayScheduler } from "../../../test-utils/gateway-scheduler-clock.js";
 import { createGatewayConnectionState } from "../../server-connection-state.js";
@@ -31,52 +31,25 @@ vi.mock("./authenticated-request-dispatch.server-methods.runtime.js", async () =
   };
 });
 
-describe("authenticated request connection liveness", { concurrent: false }, () => {
-  beforeEach(() => {
-    runtime.beforeHandler.mockReset();
-  });
+beforeEach(() => runtime.beforeHandler.mockReset());
 
-  it.each([
-    {
-      method: "sessions.subscribe",
-      params: {},
-      expectedResponse: { ok: true },
-      assertEmpty: (state: ReturnType<typeof createGatewayConnectionState>) =>
-        expect(state.sessionEventSubscribers.getAll()).toEqual(new Set()),
-    },
-    {
-      method: "sessions.messages.subscribe",
-      params: { key: "agent:main:main" },
-      expectedResponse: { ok: true },
-      assertEmpty: (state: ReturnType<typeof createGatewayConnectionState>) =>
-        expect(state.sessionMessageSubscribers.get("agent:main:main")).toEqual(new Set()),
-    },
-    {
-      method: "sessions.observer.visibility",
-      params: { visible: true },
-      expectedResponse: { ok: false, error: { code: "FORBIDDEN" } },
-      assertEmpty: (
-        _state: ReturnType<typeof createGatewayConnectionState>,
-        setConnectionVisibility: ReturnType<typeof vi.fn>,
-      ) => expect(setConnectionVisibility).not.toHaveBeenCalled(),
-    },
-  ])("rejects a late $method mutation after disconnect cleanup", async (testCase) => {
+it.each(["sessions.subscribe", "sessions.messages.subscribe", "sessions.observer.visibility"])(
+  "rejects a late %s mutation after disconnect cleanup",
+  { concurrent: false },
+  async (method) => {
+    const visibility = method === "sessions.observer.visibility";
+    const messages = method === "sessions.messages.subscribe";
+    const params = visibility ? { visible: true } : messages ? { key: "agent:main:main" } : {};
     const held = createDeferredCore();
     const started = createDeferredCore();
     runtime.beforeHandler.mockImplementation(() => {
       started.resolve();
       return held.promise;
     });
-    const state = createGatewayConnectionState({
-      scheduler: createTestGatewayScheduler(),
-      bootId: "late-subscription",
-      cfg: {},
-    });
+    const scheduler = createTestGatewayScheduler();
+    const state = createGatewayConnectionState({ scheduler, bootId: "late", cfg: {} });
     onTestFinished(() => state.mentionInbox.dispose());
-    const client = createOperatorWsClient({
-      connId: "late-subscription-connection",
-      scopes: ["operator.read"],
-    });
+    const client = createOperatorWsClient({ scopes: ["operator.read"] });
     state.clients.add(client);
     const setConnectionVisibility = vi.fn();
     const harness = createDispatchTestHarness({
@@ -90,9 +63,8 @@ describe("authenticated request connection liveness", { concurrent: false }, () 
         sessionObserver: { setConnectionVisibility },
       }),
     });
-
     const dispatch = harness.dispatcher.dispatch(
-      { type: "req", id: testCase.method, method: testCase.method, params: testCase.params },
+      { type: "req", id: method, method, params },
       client,
     );
     try {
@@ -105,10 +77,13 @@ describe("authenticated request connection liveness", { concurrent: false }, () 
       held.resolve();
       await dispatch;
     }
-
-    expect(await harness.awaitResponseFrame(testCase.method)).toMatchObject(
-      testCase.expectedResponse,
+    expect(await harness.awaitResponseFrame(method)).toMatchObject(
+      visibility ? { ok: false, error: { code: "FORBIDDEN" } } : { ok: true },
     );
-    testCase.assertEmpty(state, setConnectionVisibility);
-  });
-});
+    expect([
+      state.sessionEventSubscribers.getAll(),
+      state.sessionMessageSubscribers.get("agent:main:main"),
+      setConnectionVisibility.mock.calls,
+    ]).toEqual([new Set(), new Set(), []]);
+  },
+);
