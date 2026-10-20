@@ -222,12 +222,15 @@ async function runCli(args: string[]) {
   return result.stdout;
 }
 
-async function capture(
-  page: Page,
-  bubble: Locator,
-  name: string,
-  diagnostic?: Awaited<ReturnType<typeof observeManagedMediaCapture>>,
-) {
+async function callGateway(method: string, params: Record<string, unknown>) {
+  return asOptionalRecord(
+    JSON.parse(
+      await runCli(["gateway", "call", method, "--json", "--params", JSON.stringify(params)]),
+    ),
+  );
+}
+
+async function capture(page: Page, bubble: Locator, name: string) {
   const body = (await page.locator("body").textContent()) ?? "";
   // oxlint-disable-next-line unicorn/prefer-dom-node-text-content -- Distinguish rendered disclosure from hidden DOM text.
   const renderedBody = await page.locator("body").innerText();
@@ -253,18 +256,30 @@ async function capture(
     bubble.locator("img.chat-message-image").nth(1),
     bubble.getByText(closing, { exact: true }),
   ];
-  const releaseTargets = diagnostic?.observeTargets([bubble, ...content]);
+  const frame = await takeControlUiScreenshotFrame(page, bubble, content, {
+    animations: "disabled",
+    scrollTo: bubble,
+    elements: [bubble],
+  });
+  await writeFile(path.join(suite.artifactDir, `${name}.png`), frame.png);
+  await writeFile(path.join(suite.artifactDir, `${name}-message.png`), frame.elements[0]!.png);
+}
+
+async function captureOrder(page: Page, bubble: Locator, phase: "live" | "reloaded") {
+  const diagnostic = await observeManagedMediaCapture(page, bubble, intro, phase);
   try {
-    const frame = await takeControlUiScreenshotFrame(page, bubble, content, {
-      animations: "disabled",
-      scrollTo: bubble,
-      elements: [bubble],
+    await capture(page, bubble, phase === "live" ? "01-live" : "02-reloaded");
+    return await assertRenderedOrder(bubble);
+  } catch (error) {
+    await diagnostic.report().catch((captureError: unknown) => {
+      console.error(
+        "[control-ui-e2e] managed image order diagnostics failed",
+        captureError instanceof Error ? captureError.name : "UnknownError",
+      );
     });
-    await writeFile(path.join(suite.artifactDir, `${name}.png`), frame.png);
-    await writeFile(path.join(suite.artifactDir, `${name}-message.png`), frame.elements[0]!.png);
+    throw error;
   } finally {
-    await diagnostic?.finishCapture();
-    releaseTargets?.();
+    await diagnostic.stop();
   }
 }
 
@@ -373,19 +388,12 @@ suite.define(() => {
       await suite.runScenario(test, {
         retainedState: () => instance.stateDir,
         run: async () => {
-          await runCli([
-            "gateway",
-            "call",
-            "sessions.create",
-            "--json",
-            "--params",
-            JSON.stringify({
-              key: sessionKey,
-              agentId: "main",
-              label: "Managed image ordering",
-              permissionMode: "full",
-            }),
-          ]);
+          await callGateway("sessions.create", {
+            key: sessionKey,
+            agentId: "main",
+            label: "Managed image ordering",
+            permissionMode: "full",
+          });
           await suite.withPage(
             { locale: "en-US", serviceWorkers: "block", colorScheme: "dark", viewport },
             async ({ page }) => {
@@ -477,18 +485,7 @@ suite.define(() => {
                   .toEqual([true, true]);
               };
               // Read persisted history through its real owner, never pre-seed ordered content.
-              const history = asOptionalRecord(
-                JSON.parse(
-                  await runCli([
-                    "gateway",
-                    "call",
-                    "chat.history",
-                    "--json",
-                    "--params",
-                    JSON.stringify({ sessionKey, limit: 20 }),
-                  ]),
-                ),
-              );
+              const history = await callGateway("chat.history", { sessionKey, limit: 20 });
               const messages = Array.isArray(history?.messages) ? history.messages : [];
               const assistants = messages
                 .map(asOptionalRecord)
@@ -622,27 +619,7 @@ suite.define(() => {
                 .filter({ hasText: intro })
                 .locator(".chat-turn-recap")
                 .waitFor({ state: "visible" });
-              const diagnostic = await observeManagedMediaCapture(page, bubble, intro, "live");
-              let liveOrder: string[];
-              try {
-                // Capture before the order assertion so an unfixed run retains the actual flattening.
-                // Running this unchanged scenario on the repaired build yields the comparable After.
-                await capture(page, bubble, "01-live", diagnostic);
-                // History reconciliation can replace decoded images across the screenshot await.
-                liveOrder = await assertRenderedOrder(bubble);
-              } catch (error) {
-                try {
-                  await diagnostic.report();
-                } catch (captureError) {
-                  console.error(
-                    "[control-ui-e2e] managed image order diagnostics failed",
-                    captureError instanceof Error ? captureError.name : "UnknownError",
-                  );
-                }
-                throw error;
-              } finally {
-                await diagnostic.stop();
-              }
+              const liveOrder = await captureOrder(page, bubble, "live");
               expect(await bubble.textContent()).not.toContain("MEDIA:");
               expect(sends).toEqual([prompt]);
               expect(provider.requests.filter((model) => model === "echo")).toHaveLength(1);
@@ -652,29 +629,7 @@ suite.define(() => {
               await waitForControlUiGatewayReady(page);
               await bubble.getByText(closing, { exact: true }).waitFor();
               await assertDecoded();
-              const reloadedDiagnostic = await observeManagedMediaCapture(
-                page,
-                bubble,
-                intro,
-                "reloaded",
-              );
-              let reloadedOrder: string[];
-              try {
-                await capture(page, bubble, "02-reloaded", reloadedDiagnostic);
-                reloadedOrder = await assertRenderedOrder(bubble);
-              } catch (error) {
-                try {
-                  await reloadedDiagnostic.report();
-                } catch (captureError) {
-                  console.error(
-                    "[control-ui-e2e] managed image reload diagnostics failed",
-                    captureError instanceof Error ? captureError.name : "UnknownError",
-                  );
-                }
-                throw error;
-              } finally {
-                await reloadedDiagnostic.stop();
-              }
+              const reloadedOrder = await captureOrder(page, bubble, "reloaded");
               expect(await page.locator(".chat-group.assistant .chat-bubble").count()).toBe(1);
               expect(sends).toEqual([prompt]);
               expect(provider.requests.filter((model) => model === "echo")).toHaveLength(1);

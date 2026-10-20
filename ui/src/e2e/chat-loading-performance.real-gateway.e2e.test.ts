@@ -193,14 +193,9 @@ suite.define(() => {
       }
       return JSON.parse(result.stdout) as Record<string, unknown>;
     };
-    const syntheticViewer = await cliJson([
-      "gateway",
-      "call",
-      "users.list",
-      "--params",
-      "{}",
-      "--json",
-    ]);
+    const call = (method: string, params: Record<string, unknown> = {}) =>
+      cliJson(["gateway", "call", method, "--params", JSON.stringify(params), "--json"]);
+    const syntheticViewer = await call("users.list");
     expect(
       Array.isArray(syntheticViewer.profiles) &&
         syntheticViewer.profiles.some(
@@ -220,14 +215,11 @@ suite.define(() => {
       })),
     ];
     for (const session of sessions) {
-      const created = await cliJson([
-        "gateway",
-        "call",
-        "sessions.create",
-        "--params",
-        JSON.stringify({ key: session.key, agentId: "main", label: session.label }),
-        "--json",
-      ]);
+      const created = await call("sessions.create", {
+        key: session.key,
+        agentId: "main",
+        label: session.label,
+      });
       expect(created.ok).toBe(true);
       await appendTranscriptMessages(
         {
@@ -275,6 +267,11 @@ suite.define(() => {
         ...(captureUiProof ? { recordVideo: { dir: artifactDir, size: viewport } } : {}),
       },
       async ({ page, context }) => {
+        const capture = async (name: string) => {
+          if (captureUiProof) {
+            await page.screenshot({ path: path.join(artifactDir, name + ".png") });
+          }
+        };
         await installChatLoadingReadinessObserver(page);
         await page.addInitScript(() => {
           // Measure short-link resolution, not cached-roster route recovery. Keep
@@ -442,47 +439,41 @@ suite.define(() => {
             ),
           )
           .toBe(selectedKey);
-        await selectedPane
-          .locator(".chat-thread", {
-            hasText: "Synthetic loading proof message 900.",
-          })
-          .waitFor();
-        await selectedPane.locator(".agent-chat__composer-combobox textarea").waitFor();
+        const waitForTail = () =>
+          selectedPane
+            .locator(".chat-thread", {
+              hasText: "Synthetic loading proof message 900.",
+            })
+            .waitFor();
+        const composer = selectedPane.locator(".agent-chat__composer-combobox textarea");
+        const home = page.locator("openclaw-assistant-panel");
+        const waitForHome = () =>
+          home
+            .locator(".chat-thread")
+            .getByText("Synthetic Home message 900.", { exact: false })
+            .waitFor();
+        await waitForTail();
+        await composer.waitFor();
         await page.locator(".sidebar-footer-bar__home").click();
-        await page
-          .locator("openclaw-assistant-panel .chat-thread")
-          .getByText("Synthetic Home message 900.", { exact: false })
-          .waitFor();
-        if (captureUiProof) {
-          await page.screenshot({ path: path.join(artifactDir, "01-restored-home-fixture.png") });
-        }
+        await waitForHome();
+        await capture("01-restored-home-fixture");
 
         startedAt = Date.now();
         measuring = true;
         await page.reload();
         await waitForControlUiGatewayReady(page);
         const selectedCommitted = waitForStartupCommit(selectedKey, selectedPane);
-        const homeCommitted = waitForStartupCommit(
-          homeKey,
-          page.locator("openclaw-assistant-panel openclaw-chat-pane"),
-        );
-        await selectedPane
-          .locator(".chat-thread", {
-            hasText: "Synthetic loading proof message 900.",
-          })
-          .waitFor();
+        const homeCommitted = waitForStartupCommit(homeKey, home.locator("openclaw-chat-pane"));
+        await waitForTail();
         const selectedVisibleMs = Date.now() - startedAt;
-        await selectedPane.locator(".agent-chat__composer-combobox textarea").waitFor();
+        await composer.waitFor();
         const composerVisibleMs = Date.now() - startedAt;
         const entryScripts = await page
           .locator("script[src]")
           .evaluateAll((elements) =>
             elements.map((element) => new URL((element as HTMLScriptElement).src).pathname),
           );
-        await page
-          .locator("openclaw-assistant-panel .chat-thread")
-          .getByText("Synthetic Home message 900.", { exact: false })
-          .waitFor();
+        await waitForHome();
         const homeVisibleMs = Date.now() - startedAt;
         const [selectedAuthoritativeMs, homeAuthoritativeMs] = await Promise.all([
           selectedCommitted,
@@ -494,9 +485,7 @@ suite.define(() => {
             (image) => image.complete && image.naturalWidth > 0,
           ),
         );
-        if (captureUiProof) {
-          await page.screenshot({ path: path.join(artifactDir, "02-selected-and-home-ready.png") });
-        }
+        await capture("02-selected-and-home-ready");
         // Transcript and roster avatars can render before the dedicated identity reply.
         // Freeze only completed payloads; keep the earlier visibility timings unchanged.
         await waitForStartupResponses();
@@ -657,9 +646,7 @@ suite.define(() => {
             hasText: "Synthetic loading proof message 1.",
           })
           .waitFor();
-        if (captureUiProof) {
-          await page.screenshot({ path: path.join(artifactDir, "03-older-history-loaded.png") });
-        }
+        await capture("03-older-history-loaded");
         const paginationMetrics = structuredClone(rpc.slice(startupMetrics.length));
         const olderPages = olderHistoryRequests(paginationMetrics);
         const captureNarrowReload = async (stage: string, homeOpen: boolean) => {
@@ -676,25 +663,14 @@ suite.define(() => {
             requestStart,
           );
           const narrowHomeCommitted = homeOpen
-            ? waitForStartupCommit(
-                homeKey,
-                page.locator("openclaw-assistant-panel openclaw-chat-pane"),
-                requestStart,
-              )
+            ? waitForStartupCommit(homeKey, home.locator("openclaw-chat-pane"), requestStart)
             : Promise.resolve(null);
-          await selectedPane
-            .locator(".chat-thread", {
-              hasText: "Synthetic loading proof message 900.",
-            })
-            .waitFor();
+          await waitForTail();
           const selectedMs = Date.now() - startedAt;
-          await selectedPane.locator(".agent-chat__composer-combobox textarea").waitFor();
+          await composer.waitFor();
           const composerMs = Date.now() - startedAt;
           if (homeOpen) {
-            await page
-              .locator("openclaw-assistant-panel .chat-thread")
-              .getByText("Synthetic Home message 900.", { exact: false })
-              .waitFor();
+            await waitForHome();
           }
           const homeMs = homeOpen ? Date.now() - startedAt : null;
           const [narrowSelectedAuthoritativeMs, narrowHomeAuthoritativeMs] = await Promise.all([
@@ -702,9 +678,7 @@ suite.define(() => {
             narrowHomeCommitted,
           ]);
           const performance = await readPerformanceSample(page);
-          if (captureUiProof) {
-            await page.screenshot({ path: path.join(artifactDir, `${stage}.png`) });
-          }
+          await capture(stage);
           await waitForStartupResponses(requestStart);
           return {
             width: 1050,
@@ -815,16 +789,17 @@ suite.define(() => {
           );
           expect(selected).toHaveLength(1);
           const startup = selected[0]!;
-          expect(identity.connects).toBe(1);
-          expect(identity.observerAttached).toBe(true);
+          expect(identity).toMatchObject({ connects: 1, observerAttached: true });
           const observations = identity.startups.filter(
             (entry) => entry.requestId === startup.requestId,
           );
           expect(observations).toHaveLength(1);
           const observed = observations[0]!;
-          expect(observed.sessionKey).toBe(selectedKey);
+          expect(observed).toMatchObject({
+            sessionKey: selectedKey,
+            resolutionRequestId: resolved.requestId,
+          });
           expect(observed.agentId ?? "main").toBe("main");
-          expect(observed.resolutionRequestId).toBe(resolved.requestId);
           if (startup.sentMs >= (resolved.receivedMs ?? Infinity)) {
             expect(observed.resolutionSourceCurrent).toBe(true);
           } else {
@@ -863,10 +838,9 @@ suite.define(() => {
         expect(images.some((image) => image.width === 128 && image.height === 128)).toBe(true);
         expect(avatarResource).toBeDefined();
         expect(resources.filter((resource) => resource.path === "/avatar/main")).toHaveLength(1);
-        expect(cache.status).toBe(200);
+        expect(cache).toMatchObject({ status: 200, revalidatedStatus: 304 });
         expect(cache.bytes).toBeLessThan(originalAvatarBytes / 10);
         expect(cache.control).toContain("immutable");
-        expect(cache.revalidatedStatus).toBe(304);
 
         // Change identity only after the loading sample is frozen; exercise each
         // format through the same authenticated HTTP loader used by the sidebar.
@@ -888,14 +862,7 @@ suite.define(() => {
             height: 2,
           },
         ]) {
-          const updated = await cliJson([
-            "gateway",
-            "call",
-            "agents.update",
-            "--params",
-            JSON.stringify({ agentId: "main", avatar: fixture.dataUrl }),
-            "--json",
-          ]);
+          const updated = await call("agents.update", { agentId: "main", avatar: fixture.dataUrl });
           expect(updated.ok).toBe(true);
           let versionedAvatarUrl = "";
           await expect
@@ -954,9 +921,7 @@ suite.define(() => {
             contentType: response.headers()["content-type"],
             ...dimensions,
           });
-          if (captureUiProof) {
-            await page.screenshot({ path: path.join(artifactDir, `${fixture.stage}.png`) });
-          }
+          await capture(fixture.stage);
           await writeFile(
             path.join(artifactDir, "avatar-format-evidence.json"),
             JSON.stringify(avatarFormats, null, 2),

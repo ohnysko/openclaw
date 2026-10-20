@@ -28,6 +28,19 @@ const source = `{
 let browser: Browser;
 let server: ControlUiE2eServer;
 
+const contextOptions = {
+  locale: "en-US",
+  serviceWorkers: "block",
+  viewport: { width: 1280, height: 1000 },
+} as const;
+const history = (...entries: [role: "user" | "assistant", id: string, content: string][]) =>
+  entries.map(([role, id, content], index) => ({
+    role,
+    content,
+    timestamp: (index + 1) * 1000,
+    __openclaw: { id, seq: index + 1 },
+  }));
+
 suite("Control UI JSON tree and source views", () => {
   beforeAll(async () => {
     if (!available) {
@@ -45,10 +58,8 @@ suite("Control UI JSON tree and source views", () => {
     "shares lossless JSON controls for bare messages and fences in %s mode",
     async (theme) => {
       const context = await browser.newContext({
+        ...contextOptions,
         colorScheme: theme,
-        locale: "en-US",
-        serviceWorkers: "block",
-        viewport: { width: 1280, height: 1000 },
       });
       const page = await context.newPage();
       const proofDir =
@@ -56,36 +67,24 @@ suite("Control UI JSON tree and source views", () => {
           ? createControlUiE2eArtifactDir("chat-json-tree")
           : undefined;
       const stage = process.env.OPENCLAW_CODE_FENCE_PROOF_STAGE ?? "after";
+      const capture = async (view: string) => {
+        if (proofDir) {
+          await page.screenshot({
+            animations: "disabled",
+            path: path.join(proofDir, `${stage}-${theme}-${view}.png`),
+          });
+        }
+      };
       await context.grantPermissions(["clipboard-read", "clipboard-write"], {
         origin: new URL(server.baseUrl).origin,
       });
       await installMockGateway(page, {
-        historyMessages: [
-          {
-            role: "user",
-            content: "Inspect this deployment receipt in tree and raw views.",
-            timestamp: 1000,
-            __openclaw: { id: "json-request", seq: 1 },
-          },
-          {
-            role: "assistant",
-            content: source,
-            timestamp: 2000,
-            __openclaw: { id: "json-bare", seq: 2 },
-          },
-          {
-            role: "user",
-            content: "And the same JSON inside a code fence.",
-            timestamp: 3000,
-            __openclaw: { id: "json-fence-request", seq: 3 },
-          },
-          {
-            role: "assistant",
-            content: "```json\n" + source + "\n```",
-            timestamp: 4000,
-            __openclaw: { id: "json-fenced", seq: 4 },
-          },
-        ],
+        historyMessages: history(
+          ["user", "json-request", "Inspect this deployment receipt in tree and raw views."],
+          ["assistant", "json-bare", source],
+          ["user", "json-fence-request", "And the same JSON inside a code fence."],
+          ["assistant", "json-fenced", "```json\n" + source + "\n```"],
+        ),
       });
       try {
         await page.goto(`${server.baseUrl}chat`);
@@ -98,12 +97,7 @@ suite("Control UI JSON tree and source views", () => {
           root.dataset.themeResolved = mode;
           root.style.colorScheme = mode;
         }, theme);
-        if (proofDir) {
-          await page.screenshot({
-            animations: "disabled",
-            path: path.join(proofDir, `${stage}-${theme}-tree.png`),
-          });
-        }
+        await capture("tree");
         for (const message of [bare, fenced]) {
           const tree = message.locator(".code-block-json-tree");
           await expect.poll(() => tree.count()).toBe(1);
@@ -131,10 +125,7 @@ suite("Control UI JSON tree and source views", () => {
         await bare.getByRole("button", { name: "Raw", exact: true }).click();
         if (proofDir) {
           await bare.scrollIntoViewIfNeeded();
-          await page.screenshot({
-            animations: "disabled",
-            path: path.join(proofDir, `${stage}-${theme}-raw.png`),
-          });
+          await capture("raw");
         }
         await page.setViewportSize({ width: 400, height: 900 });
         await bare.getByRole("button", { name: "Tree", exact: true }).click();
@@ -143,24 +134,14 @@ suite("Control UI JSON tree and source views", () => {
             () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
           ),
         ).toBe(true);
-        if (proofDir) {
-          await page.screenshot({
-            animations: "disabled",
-            path: path.join(proofDir, `${stage}-${theme}-mobile.png`),
-          });
-        }
+        await capture("mobile");
       } finally {
         await context.close();
       }
     },
   );
   it("bounds long user JSON with message disclosure and no JSON controls", async () => {
-    const context = await browser.newContext({
-      colorScheme: "dark",
-      locale: "en-US",
-      serviceWorkers: "block",
-      viewport: { width: 1280, height: 1000 },
-    });
+    const context = await browser.newContext({ ...contextOptions, colorScheme: "dark" });
     try {
       const page = await context.newPage();
       const text = JSON.stringify(
@@ -175,20 +156,10 @@ suite("Control UI JSON tree and source views", () => {
         2,
       );
       const gateway = await installMockGateway(page, {
-        historyMessages: [
-          {
-            role: "user",
-            content: text,
-            timestamp: 1000,
-            __openclaw: { id: "long-json-user", seq: 1 },
-          },
-          {
-            role: "assistant",
-            content: "Ready to inspect the JSON.",
-            timestamp: 2000,
-            __openclaw: { id: "long-json-reply", seq: 2 },
-          },
-        ],
+        historyMessages: history(
+          ["user", "long-json-user", text],
+          ["assistant", "long-json-reply", "Ready to inspect the JSON."],
+        ),
       });
       await page.goto(server.baseUrl + "chat");
       await gateway.waitForRequest("chat.startup");
@@ -208,6 +179,14 @@ suite("Control UI JSON tree and source views", () => {
       }
       const toggle = bubble.locator(".chat-message-disclosure__toggle");
       const content = bubble.locator(".chat-message-disclosure__content");
+      const expectDisclosure = async (expanded: boolean) => {
+        await expect.poll(() => toggle.getAttribute("aria-expanded")).toBe(String(expanded));
+        await expect
+          .poll(() =>
+            content.evaluate((element) => element.scrollHeight > element.clientHeight + 1),
+          )
+          .toBe(!expanded);
+      };
       await expect.poll(() => toggle.isVisible()).toBe(true);
       expect(await toggle.getAttribute("aria-expanded")).toBe("false");
       await expect
@@ -221,16 +200,10 @@ suite("Control UI JSON tree and source views", () => {
           .count(),
       ).toBe(0);
       await toggle.click();
-      await expect.poll(() => toggle.getAttribute("aria-expanded")).toBe("true");
-      await expect
-        .poll(() => content.evaluate((element) => element.scrollHeight <= element.clientHeight + 1))
-        .toBe(true);
+      await expectDisclosure(true);
       expect(await bubble.locator("pre code").textContent()).toBe(text);
       await toggle.click();
-      await expect.poll(() => toggle.getAttribute("aria-expanded")).toBe("false");
-      await expect
-        .poll(() => content.evaluate((element) => element.scrollHeight > element.clientHeight + 1))
-        .toBe(true);
+      await expectDisclosure(false);
     } finally {
       await context.close();
     }
