@@ -1,62 +1,54 @@
-// WebSocket auth-context state tests cover shared-auth fallback and device-token candidate selection.
 import { describe, expect, it, vi } from "vitest";
 import { createTestGatewayScheduler } from "../../../test-utils/gateway-scheduler-clock.js";
 import { createGatewayAuthRateLimiter, type AuthRateLimiter } from "../../auth-rate-limit.js";
-import type { ResolvedGatewayAuth } from "../../auth.js";
 import { resolveConnectAuthDecision, resolveConnectAuthState } from "./auth-context.js";
 
 type ResolveConnectAuthStateParams = Parameters<typeof resolveConnectAuthState>[0];
-type TestRateLimiter = AuthRateLimiter & {
-  check: ReturnType<typeof vi.fn<AuthRateLimiter["check"]>>;
-  reset: ReturnType<typeof vi.fn<AuthRateLimiter["reset"]>>;
-  recordFailure: ReturnType<typeof vi.fn<AuthRateLimiter["recordFailure"]>>;
-  recordFailureAndDelay: ReturnType<typeof vi.fn<AuthRateLimiter["recordFailureAndDelay"]>>;
-};
-
 const CLIENT_IP = "203.0.113.20";
 
-function createLimiter(params?: { allowed?: boolean; retryAfterMs?: number }): TestRateLimiter {
-  const allowed = params?.allowed ?? true;
-  const retryAfterMs = params?.retryAfterMs ?? 5_000;
-  const check = vi.fn<AuthRateLimiter["check"]>(() => ({ allowed, remaining: 10, retryAfterMs }));
-  const reset = vi.fn<AuthRateLimiter["reset"]>();
+function createLimiter({ allowed = true, retryAfterMs = 5_000 } = {}) {
   const recordFailure = vi.fn<AuthRateLimiter["recordFailure"]>();
-  const recordFailureAndDelay = vi.fn<AuthRateLimiter["recordFailureAndDelay"]>(
-    async (ip, scope) => {
-      recordFailure(ip, scope);
-    },
-  );
   return {
-    check,
-    reset,
+    check: vi.fn<AuthRateLimiter["check"]>(() => ({ allowed, remaining: 10, retryAfterMs })),
+    reset: vi.fn<AuthRateLimiter["reset"]>(),
     recordFailure,
-    recordFailureAndDelay,
+    recordFailureAndDelay: vi.fn<AuthRateLimiter["recordFailureAndDelay"]>(async (ip, scope) => {
+      recordFailure(ip, scope);
+    }),
     size: vi.fn(() => 0),
     prune: vi.fn(),
     dispose: vi.fn(),
   };
 }
 
-async function resolveTokenAuthState(params: {
-  connectAuth: ResolveConnectAuthStateParams["connectAuth"];
-  hasDeviceIdentity: boolean;
-  rateLimiter: AuthRateLimiter;
-}) {
+async function resolveTokenAuthState(params: Partial<ResolveConnectAuthStateParams>) {
   return await resolveConnectAuthState({
-    resolvedAuth: {
-      mode: "token",
-      token: "correct-secret",
-      allowTailscale: false,
-    } satisfies ResolvedGatewayAuth,
-    connectAuth: params.connectAuth,
-    hasDeviceIdentity: params.hasDeviceIdentity,
-    req: {
-      headers: {},
-      socket: { remoteAddress: CLIENT_IP },
-    } as never,
+    resolvedAuth: { mode: "token", token: "correct-secret", allowTailscale: false },
+    connectAuth: {},
+    hasDeviceIdentity: true,
+    req: { headers: {}, socket: { remoteAddress: CLIENT_IP } } as never,
     trustedProxies: [],
     allowRealIpFallback: false,
-    rateLimiter: params.rateLimiter,
+    rateLimiter: createLimiter(),
+    clientIp: CLIENT_IP,
+    ...params,
+  });
+}
+
+function resolveDeviceAuth(
+  state: Parameters<typeof resolveConnectAuthDecision>[0]["state"],
+  rateLimiter: AuthRateLimiter,
+) {
+  return resolveConnectAuthDecision({
+    state,
+    hasDeviceIdentity: true,
+    deviceId: "dev-1",
+    publicKey: "pub-1",
+    role: "operator",
+    scopes: ["operator.read"],
+    verifyBootstrapToken: async () => ({ ok: false, reason: "bootstrap_token_invalid" }),
+    verifyDeviceToken: async () => ({ ok: true }),
+    rateLimiter,
     clientIp: CLIENT_IP,
   });
 }
@@ -69,13 +61,14 @@ describe("resolveConnectAuthState", () => {
         token: "wrong-secret",
         deviceToken: "fake-device-token",
       },
-      hasDeviceIdentity: true,
       rateLimiter,
     });
 
-    expect(state.authOk).toBe(false);
-    expect(state.authResult.reason).toBe("token_mismatch");
-    expect(state.pendingSharedAuthFailure).toBe(true);
+    expect(state).toMatchObject({
+      authOk: false,
+      authResult: { reason: "token_mismatch" },
+      pendingSharedAuthFailure: true,
+    });
     expect(rateLimiter.recordFailure).not.toHaveBeenCalled();
   });
 
@@ -86,7 +79,6 @@ describe("resolveConnectAuthState", () => {
       connectAuth: {
         deviceToken: "device-token-only",
       },
-      hasDeviceIdentity: true,
       rateLimiter,
     });
 
@@ -98,35 +90,19 @@ describe("resolveConnectAuthState", () => {
 
 describe("resolveConnectAuthDecision", () => {
   it("sets sharedAuthOk false when auth mode is none (no shared secret provided)", async () => {
-    const state = await resolveConnectAuthState({
-      resolvedAuth: {
-        mode: "none",
-        allowTailscale: false,
-      } satisfies ResolvedGatewayAuth,
-      connectAuth: {},
+    const state = await resolveTokenAuthState({
+      resolvedAuth: { mode: "none", allowTailscale: false },
       hasDeviceIdentity: false,
-      req: {
-        headers: {},
-        socket: { remoteAddress: "127.0.0.1" },
-      } as never,
-      trustedProxies: [],
-      allowRealIpFallback: false,
-      rateLimiter: createLimiter(),
+      req: { headers: {}, socket: { remoteAddress: "127.0.0.1" } } as never,
       clientIp: "127.0.0.1",
     });
-
-    expect(state.authOk).toBe(true);
-    expect(state.authMethod).toBe("none");
-    // auth:none does NOT set sharedAuthOk globally — it's not a shared secret.
-    // Only shouldSkipLocalBackendSelfPairing treats auth:none as shared-auth-scoped
-    // for local backend connections specifically.
-    expect(state.sharedAuthOk).toBe(false);
+    expect(state).toMatchObject({ authOk: true, authMethod: "none", sharedAuthOk: false });
   });
 
   it("does not reset the shared-secret limiter after device-token auth succeeds", async () => {
     const rateLimiter = createLimiter();
-    await resolveConnectAuthDecision({
-      state: {
+    await resolveDeviceAuth(
+      {
         authResult: { ok: false, reason: "token_mismatch" },
         authOk: false,
         authMethod: "token",
@@ -135,16 +111,8 @@ describe("resolveConnectAuthDecision", () => {
         deviceTokenCandidate: "device-token",
         deviceTokenCandidateSource: "explicit-device-token",
       },
-      hasDeviceIdentity: true,
-      deviceId: "dev-1",
-      publicKey: "pub-1",
-      role: "operator",
-      scopes: ["operator.read"],
-      verifyBootstrapToken: async () => ({ ok: false, reason: "bootstrap_token_invalid" }),
-      verifyDeviceToken: async () => ({ ok: true }),
       rateLimiter,
-      clientIp: CLIENT_IP,
-    });
+    );
 
     expect(rateLimiter.reset).not.toHaveBeenCalledWith(CLIENT_IP, "shared-secret");
     expect(rateLimiter.reset).toHaveBeenCalledWith(CLIENT_IP, "device-token");
@@ -165,24 +133,9 @@ describe("resolveConnectAuthDecision", () => {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const state = await resolveTokenAuthState({
           connectAuth: { token: "device", deviceToken: "device" },
-          hasDeviceIdentity: true,
           rateLimiter: limiter,
         });
-        const decision = await resolveConnectAuthDecision({
-          state,
-          hasDeviceIdentity: true,
-          deviceId: "dev-1",
-          publicKey: "pub-1",
-          role: "operator",
-          scopes: ["operator.read"],
-          verifyBootstrapToken: async () => ({
-            ok: false,
-            reason: "bootstrap_token_invalid",
-          }),
-          verifyDeviceToken: async () => ({ ok: true }),
-          rateLimiter: limiter,
-          clientIp: CLIENT_IP,
-        });
+        const decision = await resolveDeviceAuth(state, limiter);
         expect(decision.authOk).toBe(true);
       }
 

@@ -63,6 +63,24 @@ afterEach(() => {
   resetDiagnosticEventsForTest();
 });
 
+function captureLogs(consoleLevel: "info" | "debug") {
+  const output = vi.fn();
+  setLoggerOverride({ level: "silent", consoleLevel });
+  loggingState.rawConsole = { log: output, info: output, warn: output, error: output };
+  onTestFinished(() => {
+    setLoggerOverride(null);
+    loggingState.rawConsole = null;
+    resetLogger();
+  });
+  return output;
+}
+
+function expectEventSubset(events: unknown[], expected: Record<string, unknown>[]) {
+  expect(events).toEqual(
+    expect.arrayContaining(expected.map((event) => expect.objectContaining(event))),
+  );
+}
+
 function observeRequests() {
   const events: Extract<DiagnosticEventPayload, { type: "gateway.rpc" }>[] = [];
   const finished = createDeferredCore();
@@ -78,7 +96,12 @@ function observeRequests() {
     { include: ["gateway.rpc"] },
   );
   onTestFinished(unsubscribe);
-  return { events, finished: finished.promise };
+  return {
+    events,
+    finished: finished.promise,
+    phase: (phase: (typeof events)[number]["phase"]) =>
+      events.filter((event) => event.phase === phase),
+  };
 }
 
 function createRequest(handler: GatewayRequestHandler, method = "health") {
@@ -86,16 +109,25 @@ function createRequest(handler: GatewayRequestHandler, method = "health") {
   const socket = new EventEmitter();
   const client = createOperatorWsClient({ socket });
   const harness = createDispatchTestHarness({ extraHandlers: { [method]: handler } });
+  const dispatch = (
+    params: Record<string, unknown> = {},
+    connection = client,
+    frame: { id?: string; traceparent?: string } = {},
+  ) =>
+    harness.dispatcher.dispatch(
+      { type: "req", id: "private-request-id", method, params, ...frame },
+      connection,
+    );
   return {
     ...observed,
     ...harness,
     client,
     socket,
-    dispatch: () =>
-      harness.dispatcher.dispatch(
-        { type: "req", id: "private-request-id", method, params: {} },
-        client,
-      ),
+    dispatch,
+    run: async () => {
+      await dispatch();
+      await observed.finished;
+    },
   };
 }
 
@@ -138,12 +170,9 @@ describe("authenticated Gateway RPC diagnostics", () => {
     client.connect.client.displayName = "private-display-name";
     client.connect.client.instanceId = "private-instance";
     client.connect.client.platform = "private-platform";
-    await fixture.dispatcher.dispatch(
-      { type: "req", id: "private-request", method: "health", params: {} },
-      client,
-    );
+    await fixture.dispatch({}, client, { id: "private-request" });
     await fixture.finished;
-    expect(fixture.events.find((event) => event.phase === "received")).toMatchObject({
+    expect(fixture.phase("received")[0]).toMatchObject({
       method: "health",
       clientKind,
     });
@@ -171,12 +200,9 @@ describe("authenticated Gateway RPC diagnostics", () => {
     const client = createOperatorWsClient({
       clientInfo: { id: query.clientKind, mode: "backend" },
     });
-    await fixture.dispatcher.dispatch(
-      { type: "req", id: "private-request", method: "cron.list", params: query.params },
-      client,
-    );
+    await fixture.dispatch(query.params, client, { id: "private-request" });
     await fixture.finished;
-    expect(fixture.events.filter((event) => event.phase === "received")).toEqual([
+    expect(fixture.phase("received")).toEqual([
       expect.objectContaining({
         method: "cron.list",
         cronList: { clientKind: query.clientKind, source: "wire", ...query.shape },
@@ -219,12 +245,9 @@ describe("authenticated Gateway RPC diagnostics", () => {
     client.connect.userAgent = "private-user-agent";
     client.connect.client.displayName = "private-display-name";
     client.connect.client.instanceId = "private-instance";
-    await fixture.dispatcher.dispatch(
-      { type: "req", id: "private-request", method: "models.list", params: query.params },
-      client,
-    );
+    await fixture.dispatch(query.params, client, { id: "private-request" });
     await fixture.finished;
-    expect(fixture.events.filter((event) => event.phase === "received")).toEqual([
+    expect(fixture.phase("received")).toEqual([
       expect.objectContaining({
         method: "models.list",
         modelsList: { clientKind: query.clientKind, source: "wire", ...query.shape },
@@ -239,38 +262,23 @@ describe("authenticated Gateway RPC diagnostics", () => {
   ])("attributes session list diagnostics without private filters ($source)", async (query) => {
     let now = 1_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
-    const output = vi.fn();
-    setLoggerOverride({ level: "silent", consoleLevel: "debug" });
-    loggingState.rawConsole = { log: output, info: output, warn: output, error: output };
-    onTestFinished(() => {
-      setLoggerOverride(null);
-      loggingState.rawConsole = null;
-      resetLogger();
-    });
+    const output = captureLogs("debug");
     const fixture = createRequest(({ respond }) => {
       now += query.elapsed;
       respond(true, {});
     }, "sessions.list");
     fixture.send.mockReturnValue({ kind: "sent", bytes: query.bytes });
-    await fixture.dispatcher.dispatch(
-      {
-        type: "req",
-        id: "private-request-id",
-        method: "sessions.list",
-        params: {
-          source: query.source,
-          rowMode: query.rowMode,
-          limit: 60,
-          offset: 120,
-          ownerId: "synthetic-private-owner",
-          search: "synthetic-private-search",
-        },
-      },
-      fixture.client,
-    );
+    await fixture.dispatch({
+      source: query.source,
+      rowMode: query.rowMode,
+      limit: 60,
+      offset: 120,
+      ownerId: "synthetic-private-owner",
+      search: "synthetic-private-search",
+    });
     await fixture.finished;
     expect(fixture.send).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
-    expect(fixture.events.find((event) => event.phase === "received")).toMatchObject({
+    expect(fixture.phase("received")[0]).toMatchObject({
       sessionsList: {
         clientKind: fixture.client.connect.client.id,
         source: "wire",
@@ -299,17 +307,13 @@ describe("authenticated Gateway RPC diagnostics", () => {
     { params: { activeOnly: false, agentId: "private-agent" }, filter: "general" },
   ])("bounds session list filter attribution ($filter)", async ({ params, filter }) => {
     const fixture = createRequest(({ respond }) => respond(true, {}), "sessions.list");
-    await fixture.dispatcher.dispatch(
-      {
-        type: "req",
-        id: "private-request",
-        method: "sessions.list",
-        params: { ...params, source: "sidebar", rowMode: "private-invalid-mode" },
-      },
+    await fixture.dispatch(
+      { ...params, source: "sidebar", rowMode: "private-invalid-mode" },
       fixture.client,
+      { id: "private-request" },
     );
     await fixture.finished;
-    expect(fixture.events.find((event) => event.phase === "received")).toMatchObject({
+    expect(fixture.phase("received")[0]).toMatchObject({
       sessionsList: {
         clientKind: fixture.client.connect.client.id,
         source: "wire",
@@ -332,14 +336,7 @@ describe("authenticated Gateway RPC diagnostics", () => {
         .mockImplementation(() => ({ ...memory, heapUsed }));
       let now = 1000;
       vi.spyOn(Date, "now").mockImplementation(() => now);
-      const output = vi.fn();
-      setLoggerOverride({ level: "silent", consoleLevel: "info" });
-      loggingState.rawConsole = { log: output, info: output, warn: output, error: output };
-      onTestFinished(() => {
-        setLoggerOverride(null);
-        loggingState.rawConsole = null;
-        resetLogger();
-      });
+      const output = captureLogs("info");
       const completion = createDeferredCore();
       const fixture = createRequest(async ({ respond }) => {
         now = 2000;
@@ -357,12 +354,12 @@ describe("authenticated Gateway RPC diagnostics", () => {
       completion.resolve();
       await dispatch;
       await fixture.finished;
-      expect(fixture.events.find((event) => event.phase === "handler")).toMatchObject({
+      expect(fixture.phase("handler")[0]).toMatchObject({
         heapDeltaBytes: main ? -2048 : undefined,
       });
       expect(sample).toHaveBeenCalledTimes(main ? 2 : 0);
       expect(output).toHaveBeenCalledWith(expect.stringMatching(/res.*health.*1000ms.*bytes=1234/));
-      expect(fixture.events.filter((event) => event.phase === "response")).toMatchObject([
+      expect(fixture.phase("response")).toMatchObject([
         { responseBytes: 1234, firstResponse: true },
         { responseBytes: 8192, firstResponse: false },
         { outcome: "unavailable", firstResponse: undefined, responseBytes: undefined },
@@ -414,7 +411,7 @@ describe("authenticated Gateway RPC diagnostics", () => {
         }
         await Promise.all([firstDispatch, secondDispatch]);
         await waitForDiagnosticEventsDrained();
-        const handlers = first.events.filter((event) => event.phase === "handler");
+        const handlers = first.phase("handler");
         expect(handlers).toHaveLength(overlap === "unobserved" ? 1 : 2);
         expect(
           first.events.filter(
@@ -424,7 +421,7 @@ describe("authenticated Gateway RPC diagnostics", () => {
         first.events.length = 0;
         await first.dispatch();
         await waitForDiagnosticEventsDrained();
-        expect(first.events.find((event) => event.phase === "handler")).toMatchObject({
+        expect(first.phase("handler")[0]).toMatchObject({
           heapDeltaBytes: 4096,
         });
       } finally {
@@ -481,11 +478,11 @@ describe("authenticated Gateway RPC diagnostics", () => {
         await observed.finished;
         await waitForDiagnosticEventsDrained();
         if (preparation === "family rejection") {
-          expect(observed.events.some((event) => event.phase === "handler")).toBe(false);
+          expect(observed.phase("handler").length > 0).toBe(false);
           expect(observed.events.at(-1)).toMatchObject({ phase: "dispatch", outcome: "threw" });
           return;
         }
-        expect(observed.events.find((event) => event.phase === "handler")).toMatchObject({
+        expect(observed.phase("handler")[0]).toMatchObject({
           admissionMs: 100,
           durationMs: 40,
           outcome: "returned",
@@ -524,21 +521,19 @@ describe("authenticated Gateway RPC diagnostics", () => {
         payload: { accepted: true },
       });
       await waitForDiagnosticEventsDrained();
-      expect(fixture.events.filter((event) => event.phase === "response")).toMatchObject([
-        { outcome: "ok", durationMs: 50 },
-      ]);
-      expect(fixture.events.some((event) => event.phase === "handler")).toBe(false);
+      expect(fixture.phase("response")).toMatchObject([{ outcome: "ok", durationMs: 50 }]);
+      expect(fixture.phase("handler").length > 0).toBe(false);
       now = 220;
       completion.resolve();
       await fixture.finished;
-      expect(fixture.events.filter((event) => event.phase === "handler")).toMatchObject([
+      expect(fixture.phase("handler")).toMatchObject([
         { outcome: "returned", durationMs: 100, admissionMs: 20 },
       ]);
-      expect(fixture.events.filter((event) => event.phase === "dispatch")).toMatchObject([
+      expect(fixture.phase("dispatch")).toMatchObject([
         { outcome: "returned", durationMs: 120, queueWaitMs: 20, response: "sent" },
       ]);
-      expect(fixture.events.filter((event) => event.phase === "received")).toHaveLength(1);
-      expect(fixture.events.filter((event) => event.phase === "response")).toHaveLength(1);
+      expect(fixture.phase("received")).toHaveLength(1);
+      expect(fixture.phase("response")).toHaveLength(1);
       expect(JSON.stringify(fixture.events)).not.toContain("private-request-id");
     } finally {
       queue.resolve();
@@ -553,15 +548,14 @@ describe("authenticated Gateway RPC diagnostics", () => {
     const fixture = createRequest(({ respond }) => {
       retainedRespond = respond;
     });
-    await fixture.dispatch();
-    await fixture.finished;
+    await fixture.run();
     expect(fixture.events.at(-1)).toMatchObject({ phase: "dispatch", response: "none" });
     retainedRespond?.(true, { late: true });
     retainedRespond?.(true, { later: true });
     await waitForDiagnosticEventsDrained();
-    expect(fixture.events.filter((event) => event.phase === "response")).toHaveLength(1);
-    expect(fixture.events.filter((event) => event.phase === "handler")).toHaveLength(1);
-    expect(fixture.events.filter((event) => event.phase === "dispatch")).toHaveLength(1);
+    expect(fixture.phase("response")).toHaveLength(1);
+    expect(fixture.phase("handler")).toHaveLength(1);
+    expect(fixture.phase("dispatch")).toHaveLength(1);
   });
 
   it.each([true, false])(
@@ -572,16 +566,10 @@ describe("authenticated Gateway RPC diagnostics", () => {
         retainedRespond = respond;
       });
       const traceId = "11111111111111111111111111111111";
-      await fixture.dispatcher.dispatch(
-        {
-          type: "req",
-          id: "trace-request",
-          method: "health",
-          params: {},
-          ...(hasTrace ? { traceparent: `00-${traceId}-1111111111111111-01` } : {}),
-        },
-        fixture.client,
-      );
+      await fixture.dispatch({}, fixture.client, {
+        id: "trace-request",
+        ...(hasTrace ? { traceparent: `00-${traceId}-1111111111111111-01` } : {}),
+      });
       await fixture.finished;
       const unrelated = createDiagnosticTraceContext({ parentSpanId: "2222222222222222" });
       runWithDiagnosticTraceContext(unrelated, () => {
@@ -691,16 +679,13 @@ describe("authenticated Gateway RPC diagnostics", () => {
       } else {
         scheduling.start.mockRejectedValue(new GatewayRequestStartTimeoutError());
       }
-      await fixture.dispatch();
-      await fixture.finished;
+      await fixture.run();
       expect(handler).not.toHaveBeenCalled();
-      expect(fixture.events.some((event) => event.phase === "handler")).toBe(false);
-      expect(fixture.events).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ phase: "response", outcome: "error" }),
-          expect.objectContaining({ phase: "dispatch", outcome: "rejected" }),
-        ]),
-      );
+      expect(fixture.phase("handler").length > 0).toBe(false);
+      expectEventSubset(fixture.events, [
+        { phase: "response", outcome: "error" },
+        { phase: "dispatch", outcome: "rejected" },
+      ]);
       if (reason === "capacity") {
         expect(fixture.events.at(-1)).not.toHaveProperty("queueWaitMs");
       } else if (reason === "timeout") {
@@ -737,9 +722,7 @@ describe("authenticated Gateway RPC diagnostics", () => {
       fixture.send.mockReturnValue({ kind: "unavailable" });
       completion.resolve();
       await fixture.finished;
-      expect(fixture.events.filter((event) => event.phase === "response")).toMatchObject([
-        { outcome: "unavailable" },
-      ]);
+      expect(fixture.phase("response")).toMatchObject([{ outcome: "unavailable" }]);
       expect(fixture.events.at(-1)).toMatchObject({
         phase: "dispatch",
         outcome: "returned",
@@ -764,10 +747,9 @@ describe("authenticated Gateway RPC diagnostics", () => {
         .mockReturnValueOnce(
           fallback === "sent" ? { kind: "sent", bytes: 256 } : { kind: "unavailable" },
         );
-      await fixture.dispatch();
-      await fixture.finished;
+      await fixture.run();
       expect(fixture.send).toHaveBeenCalledTimes(2);
-      expect(fixture.events.filter((event) => event.phase === "response")).toMatchObject([
+      expect(fixture.phase("response")).toMatchObject([
         {
           outcome: fallback === "sent" ? "error" : "unavailable",
           responseBytes: fallback === "sent" ? 256 : undefined,
@@ -791,13 +773,11 @@ describe("authenticated Gateway RPC diagnostics", () => {
       completion.resolve();
       await fixture.finished;
       expect(fixture.send).not.toHaveBeenCalled();
-      expect(fixture.events).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ phase: "response", outcome: "suppressed" }),
-          expect.objectContaining({ phase: "handler", outcome: "returned" }),
-          expect.objectContaining({ phase: "dispatch", response: "suppressed" }),
-        ]),
-      );
+      expectEventSubset(fixture.events, [
+        { phase: "response", outcome: "suppressed" },
+        { phase: "handler", outcome: "returned" },
+        { phase: "dispatch", response: "suppressed" },
+      ]);
     } finally {
       completion.resolve();
       await dispatch;
@@ -824,7 +804,7 @@ describe("authenticated Gateway RPC diagnostics", () => {
         outcome: "cancelled",
         response: "none",
       });
-      expect(fixture.events.some((event) => event.phase === "response")).toBe(false);
+      expect(fixture.phase("response").length > 0).toBe(false);
       expect(fixture.socket.listenerCount("close")).toBe(0);
     } finally {
       fixture.socket.emit("close");
@@ -836,15 +816,12 @@ describe("authenticated Gateway RPC diagnostics", () => {
     const fixture = createRequest(() => {
       throw new Error("synthetic handler failure");
     });
-    await fixture.dispatch();
-    await fixture.finished;
-    expect(fixture.events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ phase: "handler", outcome: "threw" }),
-        expect.objectContaining({ phase: "response", outcome: "error" }),
-        expect.objectContaining({ phase: "dispatch", outcome: "threw" }),
-      ]),
-    );
+    await fixture.run();
+    expectEventSubset(fixture.events, [
+      { phase: "handler", outcome: "threw" },
+      { phase: "response", outcome: "error" },
+      { phase: "dispatch", outcome: "threw" },
+    ]);
     expect(JSON.stringify(fixture.events)).not.toContain("synthetic handler failure");
   });
 
@@ -859,17 +836,12 @@ describe("authenticated Gateway RPC diagnostics", () => {
     expect(captureGatewayRpcReceivedAt()).toEqual(expect.any(Number));
     await fixture.dispatch();
     expect(fixture.send).toHaveBeenCalledOnce();
-    expect(events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ operation: "health.received" }),
-        expect.objectContaining({
-          operation: "health.response",
-          durationMs: expect.any(Number),
-        }),
-        expect.objectContaining({ operation: "health.handler", admissionMs: expect.any(Number) }),
-        expect.objectContaining({ operation: "health.dispatch", durationMs: expect.any(Number) }),
-      ]),
-    );
+    expectEventSubset(events, [
+      { operation: "health.received" },
+      { operation: "health.response", durationMs: expect.any(Number) },
+      { operation: "health.handler", admissionMs: expect.any(Number) },
+      { operation: "health.dispatch", durationMs: expect.any(Number) },
+    ]);
     expect(JSON.stringify(events)).not.toContain("private");
     expect(JSON.stringify(events)).not.toContain("response content");
   });

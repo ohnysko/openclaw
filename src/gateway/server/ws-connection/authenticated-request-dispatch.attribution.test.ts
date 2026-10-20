@@ -17,6 +17,20 @@ import {
 beforeEach(() => resetDiagnosticEventsForTest());
 afterEach(() => resetDiagnosticEventsForTest());
 
+const revision = "private-revision";
+const unchanged = { rowsUnchanged: true };
+const delta = { rowsDelta: { baseRevision: revision } };
+const full = { sessions: [] };
+function sessionCase(
+  rowMode: string,
+  ifRowsRevision: string | undefined,
+  payload: unknown,
+  rowsOutcome: string,
+) {
+  const params = { rowMode, ...(ifRowsRevision !== undefined ? { ifRowsRevision } : {}) };
+  return { params, payload, rowsOutcome };
+}
+
 async function dispatch(
   method: string,
   params: Record<string, unknown>,
@@ -110,43 +124,15 @@ it.each(["wire", "shared", "internal"] as const)(
 );
 
 it.each([
-  {
-    params: { rowMode: "sidebar", ifRowsRevision: "private-revision" },
-    payload: { rowsUnchanged: true },
-    rowsOutcome: "unchanged",
-  },
-  {
-    params: { rowMode: "sidebar", ifRowsRevision: "delta:private-revision" },
-    payload: { rowsDelta: { baseRevision: "private-revision" } },
-    rowsOutcome: "delta",
-  },
-  { params: { rowMode: "sidebar" }, payload: { sessions: [] }, rowsOutcome: "full-no-base" },
-  {
-    params: { rowMode: "sidebar", ifRowsRevision: "delta:private-revision" },
-    payload: { sessions: [] },
-    rowsOutcome: "full-with-base",
-  },
-  {
-    params: { rowMode: "sidebar", ifRowsRevision: "private-revision" },
-    payload: { sessions: [] },
-    rowsOutcome: "full-with-base",
-  },
-  { params: { rowMode: "compact" }, payload: { sessions: [] }, rowsOutcome: "not-sidebar" },
-  {
-    params: { rowMode: "compact", ifRowsRevision: "" },
-    payload: { sessions: [] },
-    rowsOutcome: "full-no-base",
-  },
-  {
-    params: { rowMode: "compact", ifRowsRevision: "private-revision" },
-    payload: { rowsUnchanged: true },
-    rowsOutcome: "unchanged",
-  },
-  {
-    params: { rowMode: "compact", ifRowsRevision: "delta:private-revision" },
-    payload: { rowsDelta: { baseRevision: "private-revision" } },
-    rowsOutcome: "delta",
-  },
+  sessionCase("sidebar", revision, unchanged, "unchanged"),
+  sessionCase("sidebar", `delta:${revision}`, delta, "delta"),
+  sessionCase("sidebar", undefined, full, "full-no-base"),
+  sessionCase("sidebar", `delta:${revision}`, full, "full-with-base"),
+  sessionCase("sidebar", revision, full, "full-with-base"),
+  sessionCase("compact", undefined, full, "not-sidebar"),
+  sessionCase("compact", "", full, "full-no-base"),
+  sessionCase("compact", revision, unchanged, "unchanged"),
+  sessionCase("compact", `delta:${revision}`, delta, "delta"),
 ])(
   "attributes session response bytes as $rowsOutcome",
   async ({ params, payload, rowsOutcome }) => {
@@ -175,36 +161,21 @@ it.each([
 );
 
 it.each([
-  {
-    params: { cursor: "private-cursor", limit: 20 },
-    kind: "delta",
-    shape: "cursor",
-    limitBucket: "<=20",
-  },
-  { params: { offset: 1, limit: 21 }, kind: undefined, shape: "older", limitBucket: "<=80" },
-  {
-    params: { pendingBefore: 2, offset: 1, limit: 80 },
-    kind: undefined,
-    shape: "pending",
-    limitBucket: "<=80",
-  },
-  {
-    params: { inputRunIds: ["private-run"], cursor: "private-cursor", pendingBefore: 2, limit: 81 },
-    kind: "reset",
-    shape: "receipt",
-    limitBucket: "<=200",
-  },
-  { params: { offset: 0 }, kind: undefined, shape: "tail", limitBucket: "<=200" },
-  {
-    params: { messageId: "private-anchor", sessionId: "private-archive" },
-    kind: undefined,
-    shape: "anchor",
-    limitBucket: "<=200",
-  },
-  { params: { limit: 201 }, kind: undefined, shape: "tail", limitBucket: ">200" },
-])(
-  "attributes validated history response shape $shape/$limitBucket",
-  async ({ params, kind, shape, limitBucket }) => {
+  [{ cursor: "private-cursor", limit: 20 }, "delta", "cursor", "<=20"],
+  [{ offset: 1, limit: 21 }, undefined, "older", "<=80"],
+  [{ pendingBefore: 2, offset: 1, limit: 80 }, undefined, "pending", "<=80"],
+  [
+    { inputRunIds: ["private-run"], cursor: "private-cursor", pendingBefore: 2, limit: 81 },
+    "reset",
+    "receipt",
+    "<=200",
+  ],
+  [{ offset: 0 }, undefined, "tail", "<=200"],
+  [{ messageId: "private-anchor", sessionId: "private-archive" }, undefined, "anchor", "<=200"],
+  [{ limit: 201 }, undefined, "tail", ">200"],
+] as const)(
+  "attributes validated history response shape (%j, %s, %s, %s)",
+  async (params, kind, shape, limitBucket) => {
     const events = await dispatch(
       "chat.history",
       { sessionKey: "private-session", ...params },

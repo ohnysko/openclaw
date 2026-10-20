@@ -98,22 +98,61 @@ const TUI_CLIENT = {
   mode: GATEWAY_CLIENT_MODES.CLI,
 } as const;
 
+function guestRoles() {
+  return {
+    default: "guest",
+    definitions: {
+      guest: { sessions: { others: "none" }, agents: ["guest"], scopes: ["operator.read"] },
+    },
+  } satisfies NonNullable<OpenClawConfig["gateway"]>["roles"];
+}
+
+async function configureGateway(
+  auth: GatewayAuthConfig,
+  origin: string,
+  overrides: NonNullable<OpenClawConfig["gateway"]> = {},
+) {
+  const config: OpenClawConfig = {
+    gateway: { auth, controlUi: { allowedOrigins: [origin] }, ...overrides },
+  };
+  testState.gatewayAuth = auth;
+  testState.gatewayControlUi = config.gateway?.controlUi;
+  await replaceConfigFile({ nextConfig: config, afterWrite: { mode: "auto" } });
+  return config;
+}
+
+function controlUiOptions(
+  port: number,
+  origin: string,
+  identity: GatewayClientOptions["deviceIdentity"],
+) {
+  return {
+    url: `ws://127.0.0.1:${port}`,
+    origin,
+    deviceIdentity: identity,
+    clientName: CONTROL_UI_CLIENT.id,
+    clientVersion: CONTROL_UI_CLIENT.version,
+    platform: CONTROL_UI_CLIENT.platform,
+    mode: CONTROL_UI_CLIENT.mode,
+    role: "operator",
+  } satisfies GatewayClientOptions;
+}
+
+async function stopServer(
+  started: Pick<Awaited<ReturnType<typeof startServer>>, "server" | "envSnapshot"> & {
+    ws?: { close(): void };
+  },
+) {
+  started.ws?.close();
+  await started.server.close();
+  started.envSnapshot.restore();
+}
+
 describe("gateway connect pairing exemptions", () => {
   test("keeps approved connects off recovery reads and checks current authority", async () => {
     const origin = "https://pairing.example.test";
     const auth = { mode: "token", token: "concurrent-pairing-secret" } as const;
-    testState.gatewayAuth = auth;
-    testState.gatewayControlUi = { allowedOrigins: [origin] };
-    await replaceConfigFile({
-      nextConfig: {
-        gateway: {
-          auth,
-          controlUi: { allowedOrigins: [origin] },
-          nodes: { pairing: { autoApproveLocal: false } },
-        },
-      },
-      afterWrite: { mode: "auto" },
-    });
+    await configureGateway(auth, origin, { nodes: { pairing: { autoApproveLocal: false } } });
     const started = await startServerWithClient(undefined, { auth });
     const readPairing = devicePairing.listDevicePairing;
     const readPaired = devicePairing.getPairedDevice;
@@ -261,30 +300,14 @@ describe("gateway connect pairing exemptions", () => {
         }
       }
     } finally {
-      started.ws.close();
-      await started.server.close();
-      started.envSnapshot.restore();
+      await stopServer(started);
     }
   });
 
   test("keeps a merged owner unidentified until Doctor repairs it before reconnect", async () => {
     const origin = "https://localhost";
     const auth = { mode: "token", token: "merged-owner-secret" } as const;
-    const config: OpenClawConfig = {
-      gateway: {
-        auth,
-        controlUi: { allowedOrigins: [origin] },
-        roles: {
-          default: "guest",
-          definitions: {
-            guest: { sessions: { others: "none" }, agents: ["guest"], scopes: ["operator.read"] },
-          },
-        },
-      },
-    };
-    testState.gatewayAuth = auth;
-    testState.gatewayControlUi = config.gateway?.controlUi;
-    await replaceConfigFile({ nextConfig: config, afterWrite: { mode: "auto" } });
+    const config = await configureGateway(auth, origin, { roles: guestRoles() });
     const started = await startServerWithClient(undefined, {
       auth,
       controlUiEnabled: true,
@@ -502,21 +525,14 @@ describe("gateway connect pairing exemptions", () => {
       listPreparation.mockRestore();
       setLoggerOverride({ level: "silent", consoleLevel: "silent" });
       reconnect?.close();
-      started.ws.close();
-      await started.server.close();
-      started.envSnapshot.restore();
+      await stopServer(started);
     }
   });
 
   test("keeps the owner's renamed profile across shared-token and cached device-token connections", async () => {
     const origin = "https://localhost";
     const auth = { mode: "token", token: "local-owner-secret" } as const;
-    testState.gatewayAuth = auth;
-    testState.gatewayControlUi = { allowedOrigins: [origin] };
-    await replaceConfigFile({
-      nextConfig: { gateway: { auth, controlUi: { allowedOrigins: [origin] } } },
-      afterWrite: { mode: "auto" },
-    });
+    await configureGateway(auth, origin);
     const started = await startServer(undefined, { auth, controlUiEnabled: true });
     const loaded = loadDeviceIdentity("durable-gateway-owner");
     const clients: GatewayClient[] = [];
@@ -524,15 +540,8 @@ describe("gateway connect pairing exemptions", () => {
     const connect = (token?: string) =>
       new Promise<{ client: GatewayClient; hello: HelloOk }>((resolve, reject) => {
         const client = new GatewayClient({
-          url: `ws://127.0.0.1:${started.port}`,
-          origin,
+          ...controlUiOptions(started.port, origin, loaded.identity),
           token,
-          deviceIdentity: loaded.identity,
-          clientName: CONTROL_UI_CLIENT.id,
-          clientVersion: CONTROL_UI_CLIENT.version,
-          platform: CONTROL_UI_CLIENT.platform,
-          mode: CONTROL_UI_CLIENT.mode,
-          role: "operator",
           scopes,
           onHelloOk: (hello) => resolve({ client, hello }),
           onConnectError: reject,
@@ -601,18 +610,7 @@ describe("gateway connect pairing exemptions", () => {
       const auth = { mode: "token", token: "local-pairing-policy-token" } as const;
       const origin = "https://browser.example.test";
       const browser = revokedPolicy === "browser origin";
-      testState.gatewayAuth = auth;
-      testState.gatewayControlUi = { allowedOrigins: [origin] };
-      await replaceConfigFile({
-        nextConfig: {
-          gateway: {
-            auth,
-            nodes: { pairing: { autoApproveLocal: true } },
-            controlUi: { allowedOrigins: [origin] },
-          },
-        },
-        afterWrite: { mode: "auto" },
-      });
+      await configureGateway(auth, origin, { nodes: { pairing: { autoApproveLocal: true } } });
       const started = await startServerWithClient(undefined, {
         auth,
         ...(browser ? { wsHeaders: { origin } } : {}),
@@ -672,9 +670,7 @@ describe("gateway connect pairing exemptions", () => {
         );
       } finally {
         approval.mockRestore();
-        started.ws.close();
-        await started.server.close();
-        started.envSnapshot.restore();
+        await stopServer(started);
       }
     },
   );
@@ -682,27 +678,7 @@ describe("gateway connect pairing exemptions", () => {
   test("returns terminal identity details and pauses a rejected real device-token client", async () => {
     const origin = "https://localhost";
     const auth = { mode: "token", token: "local-secret" } as const;
-    testState.gatewayAuth = auth;
-    testState.gatewayControlUi = { allowedOrigins: [origin] };
-    await replaceConfigFile({
-      nextConfig: {
-        gateway: {
-          auth,
-          controlUi: { allowedOrigins: [origin] },
-          roles: {
-            default: "guest",
-            definitions: {
-              guest: {
-                sessions: { others: "none" },
-                agents: ["guest"],
-                scopes: ["operator.read"],
-              },
-            },
-          },
-        },
-      },
-      afterWrite: { mode: "auto" },
-    });
+    await configureGateway(auth, origin, { roles: guestRoles() });
     const started = await startServerWithClient(undefined, {
       auth,
       controlUiEnabled: true,
@@ -738,14 +714,7 @@ describe("gateway connect pairing exemptions", () => {
 
       const loaded = loadDeviceIdentity("roles-device-token-owner");
       const baseClientOptions = {
-        url: `ws://127.0.0.1:${started.port}`,
-        origin,
-        deviceIdentity: loaded.identity,
-        clientName: CONTROL_UI_CLIENT.id,
-        clientVersion: CONTROL_UI_CLIENT.version,
-        platform: CONTROL_UI_CLIENT.platform,
-        mode: CONTROL_UI_CLIENT.mode,
-        role: "operator",
+        ...controlUiOptions(started.port, origin, loaded.identity),
         scopes: ["operator.read"],
       } satisfies GatewayClientOptions;
       const provisioned = new Promise<void>((resolve, reject) => {
@@ -809,9 +778,7 @@ describe("gateway connect pairing exemptions", () => {
         clearTimeout(pauseTimeout);
       }
       await Promise.all([client?.stopAndWait(), provisionClient?.stopAndWait()]);
-      started.ws.close();
-      await started.server.close();
-      started.envSnapshot.restore();
+      await stopServer(started);
     }
   });
 
@@ -886,9 +853,7 @@ describe("gateway connect pairing exemptions", () => {
       } finally {
         metadata.mockRestore();
         pairedWs?.close();
-        started.ws.close();
-        await started.server.close();
-        started.envSnapshot.restore();
+        await stopServer(started);
       }
     },
   );
@@ -948,9 +913,7 @@ describe("gateway connect pairing exemptions", () => {
         expect.arrayContaining(["operator.pairing", "operator.write"]),
       );
     } finally {
-      started.ws.close();
-      await started.server.close();
-      started.envSnapshot.restore();
+      await stopServer(started);
     }
   });
 
@@ -961,19 +924,8 @@ describe("gateway connect pairing exemptions", () => {
       token: "secret",
       allowTailscale: true,
     } satisfies GatewayAuthConfig;
-    testState.gatewayAuth = auth;
-    testState.gatewayControlUi = { allowedOrigins: [tailscaleOrigin] };
     testTailscaleWhois.value = { login: "peter", name: "Peter" };
-    await replaceConfigFile({
-      nextConfig: {
-        gateway: {
-          auth,
-          tailscale: { mode: "serve" },
-          controlUi: { allowedOrigins: [tailscaleOrigin] },
-        },
-      },
-      afterWrite: { mode: "auto" },
-    });
+    await configureGateway(auth, tailscaleOrigin, { tailscale: { mode: "serve" } });
     const started = await startServer(undefined, { auth, controlUiEnabled: true });
     const identityName = "tailscale-control-ui-scope-cap";
     const paired = await pairDeviceIdentity({
