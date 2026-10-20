@@ -1,15 +1,16 @@
 import type { Locator } from "playwright";
 import { expect, it } from "vitest";
 import {
+  button,
+  paletteAnchors,
   expectForegroundUnchanged,
-  openFromForeground,
+  openMockPalette,
   scenario,
 } from "./command-palette.test-support.ts";
 import {
   createControlUiE2eContextOptions,
   createControlUiE2eSuite,
 } from "./control-ui-e2e-suite.test-support.ts";
-import { installMockGateway } from "./new-session-page.test-support.ts";
 
 const suite = createControlUiE2eSuite({ name: "command palette pasted images" });
 
@@ -32,24 +33,6 @@ async function pasteImages(input: Locator, count = 1) {
   }, count);
 }
 
-function anchors(palette: Locator) {
-  return palette.evaluate((element) =>
-    [
-      ".cmd-palette",
-      ".cmd-palette__input",
-      ".cmd-palette__create",
-      'button[aria-label="New session settings"]',
-    ].map((selector) => {
-      const node = element.querySelector(selector);
-      if (!node) {
-        throw new Error("Missing anchor: " + selector);
-      }
-      const { x, y } = node.getBoundingClientRect();
-      return { selector, x, y };
-    }),
-  );
-}
-
 suite.define(() => {
   it.each([1280, 390])(
     "keeps the input and actions anchored through paste and removal at %s px",
@@ -57,14 +40,10 @@ suite.define(() => {
       await suite.withPage(
         { ...createControlUiE2eContextOptions(), viewport: { width, height: 900 } },
         async ({ page }) => {
-          await installMockGateway(page, scenario());
-          const { palette, input } = await openFromForeground(page, suite.server.baseUrl);
+          const { palette, input } = await openMockPalette(page, suite.server.baseUrl);
           await page.evaluate(() => document.fonts.ready);
           const images = palette.locator(".chat-attachment-thumb img");
-          const start = palette.getByRole("button", {
-            name: "Start new session in background",
-            exact: true,
-          });
+          const start = button(palette, "Start new session in background");
           const remove = palette.getByRole("button", { name: /^Remove image-/ });
           for (const message of [
             "",
@@ -73,13 +52,13 @@ suite.define(() => {
           ]) {
             await input.fill(message);
             await expect.poll(() => start.isEnabled()).toBe(Boolean(message));
-            const initial = await anchors(palette);
+            const initial = await paletteAnchors(palette);
             await pasteImages(input, 2);
             await expect.poll(() => images.count()).toBe(2);
-            expect(await anchors(palette)).toEqual(initial);
+            expect(await paletteAnchors(palette)).toEqual(initial);
             await pasteImages(input, 10);
             await expect.poll(() => images.count()).toBe(12);
-            expect(await anchors(palette)).toEqual(initial);
+            expect(await paletteAnchors(palette)).toEqual(initial);
             expect(
               await palette
                 .locator(".chat-attachments-preview")
@@ -87,13 +66,13 @@ suite.define(() => {
             ).toBe(true);
             await remove.first().click();
             await expect.poll(() => images.count()).toBe(11);
-            expect(await anchors(palette)).toEqual(initial);
+            expect(await paletteAnchors(palette)).toEqual(initial);
             for (let index = 0; index < 11; index += 1) {
               await remove.first().click();
             }
             await expect.poll(() => images.count()).toBe(0);
             expect(await start.isEnabled()).toBe(Boolean(message));
-            expect(await anchors(palette)).toEqual(initial);
+            expect(await paletteAnchors(palette)).toEqual(initial);
           }
         },
       );
@@ -102,8 +81,9 @@ suite.define(() => {
 
   it("submits an image-only prompt once and retries the same images after creation fails", async () => {
     await suite.withPage(createControlUiE2eContextOptions(), async ({ page }) => {
-      const gateway = await installMockGateway(
+      const { gateway, palette, input, composer, url } = await openMockPalette(
         page,
+        suite.server.baseUrl,
         scenario({
           "sessions.create": {
             key: "agent:main:dashboard:palette-image-created",
@@ -111,16 +91,9 @@ suite.define(() => {
           },
         }),
       );
-      const { palette, input, composer, url } = await openFromForeground(
-        page,
-        suite.server.baseUrl,
-      );
       const attachments = await pasteImages(input, 2);
       const images = palette.locator(".chat-attachment-thumb img");
-      const start = palette.getByRole("button", {
-        name: "Start new session in background",
-        exact: true,
-      });
+      const start = button(palette, "Start new session in background");
       await expect.poll(() => start.isEnabled()).toBe(true);
       await gateway.deferNext("sessions.create");
       await input.press("ControlOrMeta+Enter");

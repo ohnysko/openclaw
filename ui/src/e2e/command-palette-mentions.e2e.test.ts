@@ -1,8 +1,9 @@
 import type { Locator } from "playwright";
 import { expect, it } from "vitest";
 import {
+  paletteAnchors,
   expectForegroundUnchanged,
-  openFromForeground,
+  openMockPalette,
   scenario,
 } from "./command-palette.test-support.ts";
 import { controlUiE2eBuiltModuleRequest } from "./control-ui-built-module.test-support.ts";
@@ -51,19 +52,6 @@ function mentionScenario() {
       },
     ],
   };
-}
-async function anchors(palette: Locator) {
-  return palette.evaluate((element) =>
-    [
-      ".cmd-palette",
-      ".cmd-palette__input",
-      ".cmd-palette__create",
-      'button[aria-label="New session settings"]',
-    ].map((selector) => {
-      const rect = element.querySelector(selector)!.getBoundingClientRect();
-      return { x: rect.x, y: rect.y };
-    }),
-  );
 }
 async function selectPerson(input: Locator, palette: Locator, index: number) {
   await input.press("@");
@@ -119,13 +107,13 @@ suite.define(() => {
       await suite.withPage(
         { ...createControlUiE2eContextOptions(), viewport: { width, height: 900 } },
         async ({ page }) => {
-          const gateway = await installMockGateway(page, mentionScenario());
-          const { palette, input, composer, url } = await openFromForeground(
+          const { gateway, palette, input, composer, url } = await openMockPalette(
             page,
             suite.server.baseUrl,
+            mentionScenario(),
           );
           await page.evaluate(() => document.fonts.ready);
-          const before = await anchors(palette);
+          const before = await paletteAnchors(palette);
           const mentions = [];
           for (let index = 0; index < people.length; index++) {
             const start = (await input.inputValue()).length;
@@ -136,7 +124,7 @@ suite.define(() => {
               end: start + people[index]!.displayName.length + 1,
             });
             if ([1, 2, 10].includes(index + 1)) {
-              expect(await anchors(palette)).toEqual(before);
+              expect(await paletteAnchors(palette)).toEqual(before);
               expect(await palette.locator(".composer-context-strip__person").count()).toBe(
                 index + 1,
               );

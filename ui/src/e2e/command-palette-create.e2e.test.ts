@@ -9,10 +9,13 @@ import {
 } from "./command-palette-settings.test-support.ts";
 import {
   appearanceKey,
+  button,
+  isFocused,
+  option,
   foregroundKey,
   foregroundDraft,
   scenario,
-  openFromForeground,
+  openMockPalette,
   expectForegroundUnchanged,
 } from "./command-palette.test-support.ts";
 import { controlUiE2eBuiltModuleRequest } from "./control-ui-built-module.test-support.ts";
@@ -84,13 +87,13 @@ function captureAfter(page: Page, name: string) {
 suite.define(() => {
   it("preserves manual prompt scrolling when background destination discovery finishes", async () => {
     await suite.withPage(createControlUiE2eContextOptions(), async ({ page }) => {
-      const gateway = await installMockGateway(page, {
-        ...scenario(),
-        deferredMethods: ["environments.list"],
-      });
-      const { composer, url, palette, input } = await openFromForeground(
+      const { gateway, composer, url, palette, input } = await openMockPalette(
         page,
         suite.server.baseUrl,
+        {
+          ...scenario(),
+          deferredMethods: ["environments.list"],
+        },
       );
       await gateway.waitForRequest("environments.list");
       const hints = palette.locator(".cmd-palette__hint");
@@ -176,13 +179,10 @@ suite.define(() => {
           viewport: { width: options.width, height: 900 },
         },
         async ({ page }) => {
-          const gateway = await installMockGateway(
-            page,
-            scenario({ "models.list": { models: [], refreshFailed: true } }),
-          );
-          const { palette, input, composer, url } = await openFromForeground(
+          const { gateway, palette, input, composer, url } = await openMockPalette(
             page,
             suite.server.baseUrl,
+            scenario({ "models.list": { models: [], refreshFailed: true } }),
           );
           await input.fill("appearance");
           await palette.getByRole("option", { name: /^Appearance audit/ }).waitFor();
@@ -260,7 +260,7 @@ suite.define(() => {
           expect(await palette.getByRole("option").count()).toBe(0);
           expect(await input.getAttribute("aria-controls")).toBeNull();
           expect(await input.getAttribute("aria-activedescendant")).toBeNull();
-          expect(await input.evaluate((element) => document.activeElement === element)).toBe(true);
+          expect(await isFocused(input)).toBe(true);
           await input.press("ArrowDown");
           await input.press("Enter");
           expect(await input.inputValue()).toBe(prompt);
@@ -303,7 +303,7 @@ suite.define(() => {
           await expect
             .poll(() => search.evaluate((element: HTMLElement) => element.inert))
             .toBe(false);
-          await palette.getByRole("option", { name: "New session", exact: true }).waitFor();
+          await option(palette, "New session").waitFor();
           await input.fill("appearance");
           await palette.getByRole("option", { name: /^Appearance audit/ }).waitFor();
           expect(await gateway.getRequests("sessions.search")).toHaveLength(requestCount + 3);
@@ -328,11 +328,10 @@ suite.define(() => {
           deviceScaleFactor: 2,
         },
         async ({ page }) => {
-          await installMockGateway(page, scenario());
-          const { palette } = await openFromForeground(page, suite.server.baseUrl);
+          const { palette } = await openMockPalette(page, suite.server.baseUrl);
           const popup = palette.locator(".oc-popover.palette-session-settings");
           await changePicker(popup, "overlay-after-show", () =>
-            palette.getByRole("button", { name: "New session settings", exact: true }).click(),
+            button(palette, "New session settings").click(),
           );
           const directory =
             process.env.OPENCLAW_CAPTURE_UI_PROOF === "1"
@@ -371,24 +370,20 @@ suite.define(() => {
           // Pointer entry keeps focus inside the nested view without summoning a
           // text caret (or a touch keyboard). Tab still reaches its search field.
           await page.keyboard.press("Tab");
-          expect
-            .soft(await search.evaluate((element) => document.activeElement === element))
-            .toBe(true);
+          expect.soft(await isFocused(search)).toBe(true);
           await search.press("Escape");
           expect(await remember.isVisible()).toBe(true);
-          expect(
-            await workspaceButton.evaluate((element) => document.activeElement === element),
-          ).toBe(true);
+          expect(await isFocused(workspaceButton)).toBe(true);
           await workspaceButton.press("Enter");
           await search.waitFor({ state: "visible" });
-          expect(await search.evaluate((element) => document.activeElement === element)).toBe(true);
+          expect(await isFocused(search)).toBe(true);
           expect(await search.evaluate((element) => getComputedStyle(element).outlineStyle)).toBe(
             "solid",
           );
           await capture("keyboard-projects");
           await search.fill("no-such-workspace");
           expect(await popup.locator("[data-machine]").count()).toBe(0);
-          await popup.getByRole("button", { name: "Back", exact: true }).click();
+          await button(popup, "Back").click();
           expect(await remember.isVisible()).toBe(true);
           await workspaceButton.press("Enter");
           expect(await search.inputValue()).toBe("");
@@ -407,23 +402,20 @@ suite.define(() => {
           "users.prefs.get": { status: "ok", entries: { "new-session.migration.v1": true } },
           "users.prefs.set": { status: "ok" },
         });
-        const gateway = await installMockGateway(page, {
-          ...base,
-          featureMethods: [...(base.featureMethods ?? []), "users.prefs.get", "users.prefs.set"],
-          presenceUsers: [{ self: true, id: "palette-user", name: "Example User" }],
-        });
-        const { composer, url, palette, input } = await openFromForeground(
+        const { gateway, composer, url, palette, input } = await openMockPalette(
           page,
           suite.server.baseUrl,
+          {
+            ...base,
+            featureMethods: [...(base.featureMethods ?? []), "users.prefs.get", "users.prefs.set"],
+            presenceUsers: [{ self: true, id: "palette-user", name: "Example User" }],
+          },
         );
         const capture = captureAfter(page, "palette-remember");
         const prompt = "Keep this prompt and its caret while changing preferences.";
         await input.fill(prompt);
         const popup = palette.locator(".oc-popover.palette-session-settings");
-        const trigger = palette.getByRole("button", {
-          name: "New session settings",
-          exact: true,
-        });
+        const trigger = button(palette, "New session settings");
         const openSettings = () => changePicker(popup, "overlay-after-show", () => trigger.click());
         await openSettings();
         const remember = popup.getByRole("checkbox", { name: /Remember settings for/ });
@@ -567,16 +559,17 @@ suite.define(() => {
 
   it("keeps settings and session results as launcher actions instead of sending the query", async () => {
     await suite.withPage(createControlUiE2eContextOptions(), async ({ page }) => {
-      const gateway = await installMockGateway(page, scenario());
-      const { palette, input } = await openFromForeground(page, suite.server.baseUrl);
+      const { gateway, palette, input } = await openMockPalette(
+        page,
+        suite.server.baseUrl,
+        scenario(),
+      );
       const capture = captureAfter(page, "palette-mixed-results");
       await input.fill("appearance");
       const results = palette.locator(".cmd-palette__results");
       await expect.poll(() => results.getAttribute("aria-busy")).toBe("false");
       await palette.getByRole("option", { name: /^Appearance audit/ }).waitFor();
-      await palette
-        .getByRole("option", { name: "Appearance Theme and UI settings.", exact: true })
-        .waitFor();
+      await option(palette, "Appearance Theme and UI settings.").waitFor();
       await capture("mixed-settings-and-session-results");
       await input.press("Enter");
       await expect
@@ -609,8 +602,9 @@ suite.define(() => {
         { ...createControlUiE2eContextOptions(), viewport: { width, height: 900 } },
         async ({ page }) => {
           const sessionKey = "agent:reviewer:dashboard:palette-created-" + destination;
-          const gateway = await installMockGateway(
+          const { gateway, composer, url, palette, input } = await openMockPalette(
             page,
+            suite.server.baseUrl,
             scenario({
               "sessions.create": {
                 key: sessionKey,
@@ -626,10 +620,6 @@ suite.define(() => {
               },
               "sessions.send": { runId: "palette-device-run", status: "started" },
             }),
-          );
-          const { composer, url, palette, input } = await openFromForeground(
-            page,
-            suite.server.baseUrl,
           );
           const capture = captureAfter(page, "palette-create-" + destination);
           await capture("empty-launcher");
@@ -679,7 +669,7 @@ suite.define(() => {
 
           const settings = palette.locator(".oc-popover.palette-session-settings");
           await changePicker(settings, "overlay-after-show", () =>
-            palette.getByRole("button", { name: "New session settings", exact: true }).click(),
+            button(palette, "New session settings").click(),
           );
           const agent = palette.locator("openclaw-agent-select");
           await changePicker(agent.locator(".agent-select__menu"), "overlay-after-show", () =>
@@ -723,10 +713,7 @@ suite.define(() => {
           await changePicker(settings, "overlay-after-hide", () =>
             settings.locator(".palette-session-settings__workspace").press("Escape"),
           );
-          const start = palette.getByRole("button", {
-            name: "Start new session in background",
-            exact: true,
-          });
+          const start = button(palette, "Start new session in background");
           await expect.poll(() => start.isEnabled()).toBe(true);
           expect(await palette.locator(".agent-chat__composer-shell").count()).toBe(0);
           expect(await palette.locator(".chat-composer-model-control").count()).toBe(0);
@@ -783,8 +770,9 @@ suite.define(() => {
   it("opens persistent rejected-turn recovery with the keyboard after dismissing its toast", async () => {
     await suite.withPage(createControlUiE2eContextOptions(), async ({ page }) => {
       const key = "agent:main:dashboard:palette-rejected-turn";
-      const gateway = await installMockGateway(
+      const { gateway, composer, url, palette, input } = await openMockPalette(
         page,
+        suite.server.baseUrl,
         scenario({
           "sessions.create": {
             key,
@@ -792,16 +780,9 @@ suite.define(() => {
           },
         }),
       );
-      const { composer, url, palette, input } = await openFromForeground(
-        page,
-        suite.server.baseUrl,
-      );
       const prompt = "Keep this accepted session recoverable.\nDo not send the same request twice.";
       await input.fill(prompt);
-      const start = palette.getByRole("button", {
-        name: "Start new session in background",
-        exact: true,
-      });
+      const start = button(palette, "Start new session in background");
       await expect.poll(() => start.isEnabled()).toBe(true);
       await input.press("ControlOrMeta+Enter");
       await gateway.waitForRequest("sessions.create");
@@ -809,23 +790,23 @@ suite.define(() => {
         .poll(() => palette.getByRole("alert").textContent())
         .toContain("Initial turn rejected");
       const toast = page.locator(".app-toast");
-      await toast.getByRole("button", { name: "Dismiss", exact: true }).click();
+      await button(toast, "Dismiss").click();
       await toast.waitFor({ state: "hidden" });
       expect(await input.inputValue()).toBe(prompt);
       expect(page.url()).toBe(url);
       expect(await composer.inputValue()).toBe(foregroundDraft);
       await input.press("ControlOrMeta+Enter");
       expect(await gateway.getRequests("sessions.create")).toHaveLength(1);
-      const recovery = palette.getByRole("button", { name: "Open session", exact: true });
+      const recovery = button(palette, "Open session");
       await recovery.waitFor({ state: "visible" });
       await input.focus();
       for (let step = 0; step < 10; step += 1) {
         await page.keyboard.press("Tab");
-        if (await recovery.evaluate((element) => document.activeElement === element)) {
+        if (await isFocused(recovery)) {
           break;
         }
       }
-      expect(await recovery.evaluate((element) => document.activeElement === element)).toBe(true);
+      expect(await isFocused(recovery)).toBe(true);
       await page.keyboard.press("Enter");
       await expect.poll(() => new URL(page.url()).pathname).toBe(controlUiSessionPath(key));
       await input.waitFor({ state: "hidden" });
@@ -836,23 +817,17 @@ suite.define(() => {
 
   it("keeps a rejected creation visible and retries the same prompt without touching chat", async () => {
     await suite.withPage(createControlUiE2eContextOptions(), async ({ page }) => {
-      const gateway = await installMockGateway(
+      const { gateway, composer, url, palette, input } = await openMockPalette(
         page,
+        suite.server.baseUrl,
         scenario({
           "sessions.create": { key: "agent:main:dashboard:palette-retried", runStarted: true },
         }),
       );
-      const { composer, url, palette, input } = await openFromForeground(
-        page,
-        suite.server.baseUrl,
-      );
       const capture = captureAfter(page, "palette-create-retry");
       const prompt = "Preserve this task when creation is denied.\nRetry only after I ask.";
       await input.fill(prompt);
-      const start = palette.getByRole("button", {
-        name: "Start new session in background",
-        exact: true,
-      });
+      const start = button(palette, "Start new session in background");
       await expect.poll(() => start.isEnabled()).toBe(true);
       await gateway.deferNext("sessions.create");
       await input.press("ControlOrMeta+Enter");
