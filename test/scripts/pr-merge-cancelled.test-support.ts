@@ -1,4 +1,6 @@
 import { writeFileSync } from "node:fs";
+import { expect } from "vitest";
+import { expectExit } from "./pr-merge-assertions.test-support.js";
 import type { createPriorCiCandidateFactory } from "./pr-merge-prior-ci.test-support.js";
 
 type Candidate = ReturnType<
@@ -36,4 +38,25 @@ export function cancelledFailure(
   f.save(state);
   writeFileSync(f.path, JSON.stringify(evidence));
   return { ...f, evidence };
+}
+
+export function verifyFailure(
+  f: Candidate,
+  failedStep: Record<string, unknown>,
+  onlyFailure = false,
+) {
+  const proof = JSON.parse(expectExit(f.verifyPriorCi(f.path)).stdout);
+  expect(proof.failures[0].failedStep.steps).toEqual(f.state().priorCi.jobs![0]!.steps);
+  expect(proof.failures[0].deadline).toBeUndefined();
+  expect(proof.cancelledJobIds).toEqual([604]);
+  expect(f.state().mutations).toBe(0);
+  const expected = {
+    jobId: 601,
+    failedStep: { checkRunId: 601, conclusion: "cancelled", ...failedStep },
+  };
+  if (onlyFailure) {
+    expect(proof.failures).toMatchObject([expected]);
+  } else {
+    expect(proof.failures[0]).toMatchObject(expected);
+  }
 }

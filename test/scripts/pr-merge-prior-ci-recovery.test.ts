@@ -1,7 +1,12 @@
 import { existsSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, it } from "vitest";
-import { configureMerge, expectExit } from "./pr-merge-assertions.test-support.js";
+import {
+  applyFault,
+  configureMerge,
+  expectExit,
+  pendingGates,
+} from "./pr-merge-assertions.test-support.js";
 import { createMergeOutcomeFixtureHarness } from "./pr-merge-outcome.test-support.js";
 import { createPriorCiCandidateFactory } from "./pr-merge-prior-ci.test-support.js";
 
@@ -22,6 +27,11 @@ function mergeRequests(f: RecoveryFixture) {
     );
 }
 
+function expectAttempt(f: RecoveryFixture, oid: string, requests = 1) {
+  expect(mergeRequests(f)).toHaveLength(requests);
+  expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
+}
+
 const rejectedAttempt = reuseCompletedSetup(function (response: string = refusal) {
   const f = preExistingCandidate();
   configureMerge(f, { restMergeRefusal: response });
@@ -37,7 +47,7 @@ const rejectedAttempt = reuseCompletedSetup(function (response: string = refusal
   const oid = f.git(["rev-parse", outcomeRef]);
   const record = f.record();
   const capture = `merge-output.${record.attempt}.log`;
-  expect(readFileSync(join(f.worktree, ".local", capture), "utf8")).toBe(response);
+  expect(readLocal(f, capture)).toBe(response);
   expect(f.recover()).toBe(false);
   configureMerge(f, { restMergeRefusal: "" });
   return { f, oid, record, capture };
@@ -68,11 +78,10 @@ function rewriteRecord(f: RecoveryFixture, changes: Record<string, unknown>) {
 }
 
 describePosix("explicit prior-CI provider rejection recovery", () => {
-  it("recovers the exact rejected request and retains its intent and bytes through cleanup", () => {
+  it("recovers exact rejection and retains its evidence", () => {
     const { f, oid, record, capture } = rejectedAttempt();
     expectExit(f.run(), 1);
-    expect(mergeRequests(f)).toHaveLength(1);
-    expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
+    expectAttempt(f, oid);
     f.recover();
 
     expectExit(f.adminPriorCi(f.path, true, oid));
@@ -101,11 +110,10 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
     expect(existsSync(f.worktree)).toBe(false);
     const complete = f.git(["rev-parse", outcomeRef]);
     expectExit(f.adminPriorCi(f.path, true, oid), 1);
-    expect(mergeRequests(f)).toHaveLength(2);
-    expect(f.git(["rev-parse", outcomeRef])).toBe(complete);
+    expectAttempt(f, complete, 2);
   });
 
-  it("requires a separate decision for each rejection and retains both captures after success", () => {
+  it("requires consent per rejection and retains captures", () => {
     const first = rejectedAttempt();
     const { f } = first;
     configureMerge(f, { restMergeRefusal: refusal });
@@ -121,8 +129,7 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
     expect(f.recover()).toBe(false);
 
     expectExit(f.adminPriorCi(f.path, true, first.oid), 1);
-    expect(mergeRequests(f)).toHaveLength(2);
-    expect(f.git(["rev-parse", outcomeRef])).toBe(secondOid);
+    expectAttempt(f, secondOid, 2);
     f.recover();
     configureMerge(f, { restMergeRefusal: "" });
     expectExit(f.adminPriorCi(f.path, true, secondOid));
@@ -158,37 +165,32 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
     ["5xx", refusal.replaceAll("405", "502")],
     ["truncated", refusal.slice(0, -20)],
     ["mixed success", refusal + '{"merged":true}\n'],
-  ])("does not authorize a retry from %s capture bytes", (_name, response) => {
+  ])("refuses retry from %s bytes", (_name, response) => {
     const { f, oid, capture } = rejectedAttempt(response);
     const result = expectExit(f.adminPriorCi(f.path, true, oid), 1);
     expect(result.output).toContain("complete exact GitHub base-modified HTTP 405 rejection");
-    expect(mergeRequests(f)).toHaveLength(1);
-    expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
+    expectAttempt(f, oid);
     expect(readFileSync(join(f.worktree, ".local", capture), "utf8")).toBe(response);
   });
 
-  it.each(["symlink", "extra capture"])(
-    "refuses %s without consuming the retained intent",
-    (fault) => {
-      const { f, oid, capture } = rejectedAttempt();
-      const target = join(f.root, "original-capture.txt");
-      writeFileSync(target, refusal);
-      if (fault === "symlink") {
-        const path = join(f.worktree, ".local", capture);
-        rmSync(path);
-        symlinkSync(target, path);
-      } else {
-        writeFileSync(join(f.worktree, ".local/merge-output.unknown.log"), refusal);
-      }
-      expectExit(f.adminPriorCi(f.path, true, oid), 1);
-      expect(mergeRequests(f)).toHaveLength(1);
-      expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
-      expect(readFileSync(target, "utf8")).toBe(refusal);
-    },
-  );
+  it.each(["symlink", "extra capture"])("preserves intent on %s refusal", (fault) => {
+    const { f, oid, capture } = rejectedAttempt();
+    const target = join(f.root, "original-capture.txt");
+    writeFileSync(target, refusal);
+    if (fault === "symlink") {
+      const path = join(f.worktree, ".local", capture);
+      rmSync(path);
+      symlinkSync(target, path);
+    } else {
+      writeLocal(f, "merge-output.unknown.log", refusal);
+    }
+    expectExit(f.adminPriorCi(f.path, true, oid), 1);
+    expectAttempt(f, oid);
+    expect(readFileSync(target, "utf8")).toBe(refusal);
+  });
 
   it.each(["accepted", "ordinary route", "unconfirmed"])(
-    "refuses %s recovery authority even with exact provider bytes",
+    "refuses %s despite exact rejection bytes",
     (fault) => {
       const { f, oid } = rejectedAttempt();
       const expected =
@@ -204,49 +206,32 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
             );
       const result = f.adminPriorCi(f.path, fault !== "unconfirmed", expected);
       expect(result.status, result.output).not.toBe(0);
-      expect(mergeRequests(f)).toHaveLength(1);
-      expect(f.git(["rev-parse", outcomeRef])).toBe(expected);
+      expectAttempt(f, expected);
     },
   );
 
   it.each(["head", "gates", "review", "admin", "security", "CI attempt", "evidence"])(
-    "revalidates current %s before a recovery request",
+    "revalidates %s before recovery",
     (fault) => {
       const { f, oid } = rejectedAttempt();
       const state = f.state();
-      if (fault === "head") {
-        state.pr.headRefOid = f.base;
-      }
-      if (fault === "gates") {
-        writeFileSync(
-          join(f.worktree, ".local/gates.env"),
-          `PR_NUMBER=123\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${f.base}\n`,
-        );
-      }
-      if (fault === "review") {
-        state.priorCi.reviewDecision = "REVIEW_REQUIRED";
-      }
-      if (fault === "admin") {
-        state.priorCi.membership = "member";
-      }
-      if (fault === "security") {
-        state.priorCi.security.fault = "failed-guard";
-      }
-      if (fault === "CI attempt") {
-        state.priorCi.latestAttempt = 3;
-      }
-      if (fault === "evidence") {
-        state.priorCi.mutateEvidence = true;
-      }
+      applyFault(fault, {
+        head: () => Object.assign(state.pr, { headRefOid: f.base }),
+        gates: () => pendingGates(f, f.base),
+        review: () => Object.assign(state.priorCi, { reviewDecision: "REVIEW_REQUIRED" }),
+        admin: () => Object.assign(state.priorCi, { membership: "member" }),
+        security: () => Object.assign(state.priorCi.security, { fault: "failed-guard" }),
+        "CI attempt": () => Object.assign(state.priorCi, { latestAttempt: 3 }),
+        evidence: () => Object.assign(state.priorCi, { mutateEvidence: true }),
+      });
       f.save(state);
       expectExit(f.adminPriorCi(f.path, true, oid), 1);
-      expect(mergeRequests(f)).toHaveLength(1);
-      expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
+      expectAttempt(f, oid);
       expect(f.state().pr.mergeCommit).toBeNull();
     },
   );
 
-  it("rechecks rejection bytes after the final awaited metadata read", () => {
+  it("rechecks bytes after final metadata read", () => {
     const { f, oid } = rejectedAttempt();
     configureMerge(f, {
       observationReads: 0,
@@ -255,11 +240,10 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
     const result = expectExit(f.adminPriorCi(f.path, true, oid), 1);
     expect(f.state().providerCaptureTampered).toBe(true);
     expect(result.output).toContain("provider rejection");
-    expect(mergeRequests(f)).toHaveLength(1);
-    expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
+    expectAttempt(f, oid);
   });
 
-  it("does not overwrite a competing outcome at the recovery intent CAS", () => {
+  it("preserves successor at recovery CAS", () => {
     const { f, oid, capture } = rejectedAttempt();
     configureMerge(f, { crash: "successor" });
     expectExit(f.adminPriorCi(f.path, true, oid), 1);
@@ -269,7 +253,7 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
     expect(JSON.parse(f.git(["show", `${oid}:outcome.json`])).accepted).toBe(false);
   });
 
-  it("reconciles an already merged PR without submitting the rejected request again", () => {
+  it("reconciles merged PR without redispatch", () => {
     const { f, oid } = rejectedAttempt();
     const landed = f.commit(f.git(["merge-tree", "--write-tree", f.base, f.head]), [f.base]);
     f.git(["push", "-q", "origin", `${landed}:refs/heads/main`]);

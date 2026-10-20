@@ -1,8 +1,12 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import { expect, it } from "vitest";
+import { it } from "vitest";
 import { stringify } from "yaml";
-import { applyFault, completedStep, expectExit } from "./pr-merge-assertions.test-support.js";
-import { cancelledFailure } from "./pr-merge-cancelled.test-support.js";
+import {
+  applyFault,
+  completedStep,
+  expectPriorCiRefusal,
+} from "./pr-merge-assertions.test-support.js";
+import { cancelledFailure, verifyFailure } from "./pr-merge-cancelled.test-support.js";
 import { createMergeOutcomeFixtureHarness } from "./pr-merge-outcome.test-support.js";
 import { createPriorCiCandidateFactory } from "./pr-merge-prior-ci.test-support.js";
 
@@ -25,6 +29,13 @@ const prelude = [
   "Mount extension boundary sticky disk",
   "Restore extension boundary artifacts from sticky disk",
   "Run changed lint",
+];
+
+const ownerFaults = [
+  "different command",
+  "wrong task binding",
+  "ignored job failure",
+  "changed step condition",
 ];
 
 function staticRootCandidate(fault = "") {
@@ -74,27 +85,12 @@ function staticRootCandidate(fault = "") {
 }
 
 describePosix("attributed production type failure in a cancelled job", () => {
-  it("retains the failed static step and unrun collateral without dispatching", () => {
-    const f = staticRootCandidate();
-    const result = expectExit(f.verifyPriorCi(f.path));
-    const proof = JSON.parse(result.stdout);
-    expect(proof.failures).toMatchObject([
-      {
-        jobId: 601,
-        failedStep: { checkRunId: 601, conclusion: "cancelled", number: 16, workflowJob },
-      },
-    ]);
-    expect(proof.failures[0].failedStep.steps).toEqual(f.state().priorCi.jobs![0]!.steps);
-    expect(proof.failures[0].deadline).toBeUndefined();
-    expect(proof.cancelledJobIds).toEqual([604]);
-    expect(f.state().mutations).toBe(0);
+  it("retains failed step and unrun collateral", () => {
+    verifyFailure(staticRootCandidate(), { number: 16, workflowJob }, true);
   });
 
   it.each([
-    "different command",
-    "wrong task binding",
-    "ignored job failure",
-    "changed step condition",
+    ...ownerFaults,
     "different job",
     "missing source step",
     "missing prelude timestamp",
@@ -127,18 +123,11 @@ describePosix("attributed production type failure in a cancelled job", () => {
     });
     f.save(state);
     writeFileSync(f.path, JSON.stringify(f.evidence));
-    const result = f.verifyPriorCi(f.path);
-    expect(result.status, result.output).not.toBe(0);
-    expect(result.output).toContain(
-      [
-        "different command",
-        "wrong task binding",
-        "ignored job failure",
-        "changed step condition",
-      ].includes(fault)
+    expectPriorCiRefusal(
+      f,
+      ownerFaults.includes(fault)
         ? "canonical production-type workflow owner"
         : "Prior-CI admin admission:",
     );
-    expect(f.state().mutations).toBe(0);
   });
 });

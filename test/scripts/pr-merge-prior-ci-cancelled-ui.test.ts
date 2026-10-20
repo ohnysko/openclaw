@@ -1,8 +1,12 @@
 import { readFileSync, writeFileSync } from "node:fs";
-import { expect, it } from "vitest";
+import { it } from "vitest";
 import { stringify } from "yaml";
-import { applyFault, completedStep, expectExit } from "./pr-merge-assertions.test-support.js";
-import { cancelledFailure } from "./pr-merge-cancelled.test-support.js";
+import {
+  applyFault,
+  completedStep,
+  expectPriorCiRefusal,
+} from "./pr-merge-assertions.test-support.js";
+import { cancelledFailure, verifyFailure } from "./pr-merge-cancelled.test-support.js";
 import { createMergeOutcomeFixtureHarness } from "./pr-merge-outcome.test-support.js";
 import { createPriorCiCandidateFactory } from "./pr-merge-prior-ci.test-support.js";
 
@@ -28,6 +32,15 @@ const uploads = [
   "Upload sanitized desktop resize proof",
   "Upload model picker public observations",
   "Upload sanitized Control UI real-Gateway proof",
+];
+
+const ownerFaults = [
+  "different command",
+  "changed test condition",
+  "unbound test selection",
+  "unbound matrix",
+  "wrong build mode",
+  "ignored test failure",
 ];
 
 function uiRootCandidate(runnerPrelude: boolean, fault = "") {
@@ -90,33 +103,16 @@ function uiRootCandidate(runnerPrelude: boolean, fault = "") {
 }
 
 describePosix("attributed real-Gateway UI failure in a cancelled job", () => {
-  it.each([false, true])("retains the failed root with runner prelude %s", (runnerPrelude) => {
-    const f = uiRootCandidate(runnerPrelude);
-    const result = expectExit(f.verifyPriorCi(f.path));
-    const proof = JSON.parse(result.stdout);
-    expect(proof.failures[0]).toMatchObject({
-      jobId: 601,
-      failedStep: {
-        checkRunId: 601,
-        conclusion: "cancelled",
-        workflowJob,
-        number: runnerPrelude ? 9 : 8,
-        step: { name: stepName, conclusion: "failure" },
-      },
+  it.each([false, true])("retains failed root (runner prelude=%s)", (runnerPrelude) => {
+    verifyFailure(uiRootCandidate(runnerPrelude), {
+      workflowJob,
+      number: runnerPrelude ? 9 : 8,
+      step: { name: stepName, conclusion: "failure" },
     });
-    expect(proof.failures[0].failedStep.steps).toEqual(f.state().priorCi.jobs![0]!.steps);
-    expect(proof.failures[0].deadline).toBeUndefined();
-    expect(proof.cancelledJobIds).toEqual([604]);
-    expect(f.state().mutations).toBe(0);
   });
 
   it.each([
-    "different command",
-    "changed test condition",
-    "unbound test selection",
-    "unbound matrix",
-    "wrong build mode",
-    "ignored test failure",
+    ...ownerFaults,
     "different job",
     "unknown runner prelude",
     "extra cleanup step",
@@ -139,20 +135,11 @@ describePosix("attributed real-Gateway UI failure in a cancelled job", () => {
     });
     f.save(state);
     writeFileSync(f.path, JSON.stringify(f.evidence));
-    const result = f.verifyPriorCi(f.path);
-    expect(result.status, result.output).not.toBe(0);
-    expect(result.output).toContain(
-      [
-        "different command",
-        "changed test condition",
-        "unbound test selection",
-        "unbound matrix",
-        "wrong build mode",
-        "ignored test failure",
-      ].includes(fault)
+    expectPriorCiRefusal(
+      f,
+      ownerFaults.includes(fault)
         ? "canonical real-Gateway UI workflow owner"
         : "Prior-CI admin admission:",
     );
-    expect(f.state().mutations).toBe(0);
   });
 });
