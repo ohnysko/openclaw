@@ -262,7 +262,7 @@ describe("system agent greeting cache", () => {
         },
         cacheStore: cache.store,
       }),
-    ).resolves.toBe(HEALTHY_GREETING_TEMPLATE);
+    ).resolves.toBe(`${HEALTHY_GREETING_TEMPLATE}\nChannel health is not available yet.`);
     await acknowledgeSystemAgentGreetingDelivery({
       auditSequence: facts.auditSequence,
       cacheStore: cache.store,

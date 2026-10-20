@@ -613,7 +613,6 @@ describe("startGatewayService", () => {
           outcome: "repair-required",
           issues: [
             {
-              code: `${kind}-program`,
               message: `service command points at a ${kind} path: ${program}`,
             },
           ],
