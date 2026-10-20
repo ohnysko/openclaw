@@ -26,6 +26,10 @@ function present(row: GatewaySessionRow, isChild = false): SidebarRecentSession 
   } as SidebarRecentSession;
 }
 
+function makeRow(key: string, fields: Partial<GatewaySessionRow> = {}): GatewaySessionRow {
+  return { key, kind: "direct", ...fields };
+}
+
 function project(roots: GatewaySessionRow[], rows = roots) {
   return projectSessionTree({
     roots,
@@ -39,26 +43,18 @@ function project(roots: GatewaySessionRow[], rows = roots) {
 
 describe("Home-linked conversation placement", () => {
   it("reattaches a persistent session through hidden runs and reveals its visible ancestor", () => {
-    const parent: GatewaySessionRow = {
-      key: homeKey,
-      kind: "direct",
-      childSessions: [workerKey],
-    };
-    const run: GatewaySessionRow = {
-      key: workerKey,
-      kind: "direct",
+    const parent = makeRow(homeKey, { childSessions: [workerKey] });
+    const run = makeRow(workerKey, {
       spawnedBy: homeKey,
       childSessions: [conversationKey],
       hasActiveRun: true,
-    };
-    const child: GatewaySessionRow = {
-      key: conversationKey,
-      kind: "direct",
+    });
+    const child = makeRow(conversationKey, {
       parentSessionKey: workerKey,
       spawnedBy: workerKey,
       hasActiveRun: true,
       unread: true,
-    };
+    });
     const rows = [parent, run, child];
     const tree = project(rows);
     expect(tree.map((row) => row.key)).toEqual([homeKey]);
@@ -84,11 +80,7 @@ describe("Home-linked conversation placement", () => {
       expect(archivedAncestor.map((row) => row.key)).toEqual([homeKey, conversationKey]);
     }
 
-    const outer: GatewaySessionRow = {
-      key: "agent:main:outer",
-      kind: "direct",
-      childSessions: [homeKey],
-    };
+    const outer = makeRow("agent:main:outer", { childSessions: [homeKey] });
     const nestedParent = { ...parent, spawnedBy: outer.key };
     const nestedTree = project([outer, child], [outer, nestedParent, run, child]);
     expect(nestedTree.map((row) => row.key)).toEqual([outer.key]);
@@ -117,26 +109,18 @@ describe("Home-linked conversation placement", () => {
   });
 
   it("keeps independent conversations outside Home while a worker runs", () => {
-    const home: GatewaySessionRow = {
-      key: homeKey,
-      kind: "direct",
-      childSessions: [conversationKey, workerKey],
-    };
-    const conversation: GatewaySessionRow = {
-      key: conversationKey,
-      kind: "direct",
+    const home = makeRow(homeKey, { childSessions: [conversationKey, workerKey] });
+    const conversation = makeRow(conversationKey, {
       createdVia: "operator",
       spawnDepth: 0,
       parentSessionKey: homeKey,
-    };
-    const worker: GatewaySessionRow = {
-      key: workerKey,
-      kind: "direct",
+    });
+    const worker = makeRow(workerKey, {
       parentSessionKey: homeKey,
       spawnedBy: homeKey,
       spawnDepth: 1,
       status: "running",
-    };
+    });
     const tree = project([home, conversation, worker]);
     expect(tree.map((row) => row.key)).toEqual([homeKey, conversationKey]);
     expect(tree[0]?.children).toEqual([]);
@@ -147,24 +131,14 @@ describe("Home-linked conversation placement", () => {
 
 describe("independent persistent sessions", () => {
   it("promotes a child without rewriting origin or moving its own descendants", () => {
-    const parent: GatewaySessionRow = {
-      key: "parent",
-      kind: "direct",
-      childSessions: [conversationKey],
-    };
-    const child: GatewaySessionRow = {
-      key: conversationKey,
-      kind: "direct",
+    const parent = makeRow("parent", { childSessions: [conversationKey] });
+    const child = makeRow(conversationKey, {
       parentSessionKey: parent.key,
       spawnedBy: parent.key,
       sidebarRoot: true,
       childSessions: ["grandchild"],
-    };
-    const grandchild: GatewaySessionRow = {
-      key: "grandchild",
-      kind: "direct",
-      parentSessionKey: child.key,
-    };
+    });
+    const grandchild = makeRow("grandchild", { parentSessionKey: child.key });
     const tree = project([parent, child, grandchild]);
     expect(tree.map((row) => row.key)).toEqual([parent.key, child.key]);
     expect(tree[0]?.childSessionKeys).toEqual([]);

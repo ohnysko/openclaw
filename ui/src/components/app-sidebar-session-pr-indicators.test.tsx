@@ -23,48 +23,24 @@ const LIFECYCLE_HOST_TAG = "test-session-pr-indicators";
 
 class LifecycleTestHost extends HTMLElement {
   readRows: IndicatorOptions["getRows"] = () => [];
-  private gatewayValue!: ApplicationGateway;
-  private readSessions: IndicatorOptions["getSessions"] = () => undefined;
-  private rowOwner: SessionCapability | undefined;
-  private agentId = "main";
-  private visible = true;
+  gateway!: ApplicationGateway;
+  getSessions: IndicatorOptions["getSessions"] = () => undefined;
+  rowsSource: SessionCapability | undefined;
+  selectedAgentId = "main";
+  presented = true;
   private readonly listeners = new Set<() => void>();
   indicators!: ReturnType<typeof createSessionPullRequestIndicators>;
   private view?: ReturnType<typeof mountSolid>;
 
-  get gateway() {
-    return this.gatewayValue;
-  }
-  set gateway(value: ApplicationGateway) {
-    this.gatewayValue = value;
-    this.publishInputs();
-  }
-  get getSessions() {
-    return this.readSessions;
-  }
-  set getSessions(read: IndicatorOptions["getSessions"]) {
-    this.readSessions = read;
-    this.publishInputs();
-  }
-  get rowsSource() {
-    return this.rowOwner;
-  }
-  set rowsSource(value: SessionCapability | undefined) {
-    this.rowOwner = value;
-    this.publishInputs();
-  }
-  get selectedAgentId() {
-    return this.agentId;
-  }
-  set selectedAgentId(value: string) {
-    this.agentId = value;
-    this.publishInputs();
-  }
-  get presented() {
-    return this.visible;
-  }
-  set presented(value: boolean) {
-    this.visible = value;
+  setInputs(
+    values: Partial<
+      Pick<
+        LifecycleTestHost,
+        "gateway" | "getSessions" | "rowsSource" | "selectedAgentId" | "presented"
+      >
+    >,
+  ) {
+    Object.assign(this, values);
     this.publishInputs();
   }
   subscribe(listener: () => void) {
@@ -132,11 +108,19 @@ function mountLifecycleHost(
   getSessions: IndicatorOptions["getSessions"] = () => undefined,
 ): LifecycleTestHost {
   const host = new LifecycleTestHost();
-  host.gateway = gateway;
+  host.setInputs({ gateway, getSessions });
   host.readRows = readRows;
-  host.getSessions = getSessions;
   document.body.append(host);
   return host;
+}
+
+function sessionRow(key: string, worktreeId: string, fields: Partial<SidebarRecentSession> = {}) {
+  return { key, isChild: false, worktreeId, ...fields } as SidebarRecentSession;
+}
+
+async function settle(host: LifecycleTestHost) {
+  await host.updateComplete;
+  await vi.advanceTimersByTimeAsync(0);
 }
 
 function createGatewayHarness(scopes = ["operator.read"]) {
@@ -174,6 +158,11 @@ function createGatewayHarness(scopes = ["operator.read"]) {
   return {
     gateway,
     request,
+    publish(key: string, fields: Record<string, unknown> = {}) {
+      this.emit({
+        sessions: { [key]: { pullRequests: [], rateLimited: false, status: "ready", ...fields } },
+      });
+    },
     emit(payload: unknown, event = CONTROL_UI_SESSION_PULL_REQUESTS_CHANGED_EVENT) {
       for (const listener of eventListeners) {
         listener({
@@ -196,11 +185,7 @@ describe("Passive sidebar PR indicators", () => {
   it("does not subscribe to PR status for session-only sidebar viewers", async () => {
     vi.useFakeTimers();
     const harness = createGatewayHarness(["operator.sessions.read", "operator.sessions.write"]);
-    const row = {
-      key: "agent:main:demo",
-      isChild: false,
-      worktreeId: "wt-demo",
-    } as SidebarRecentSession;
+    const row = sessionRow("agent:main:demo", "wt-demo");
     const host = mountLifecycleHost(harness.gateway, () => [row]);
     await host.updateComplete;
     await vi.advanceTimersByTimeAsync(60_000);
@@ -215,11 +200,10 @@ describe("Passive sidebar PR indicators", () => {
     const harness = createGatewayHarness();
     const getRows = vi.fn(() => []);
     const host = mountLifecycleHost(harness.gateway, getRows);
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
+    await settle(host);
 
-    host.selectedAgentId = "work";
-    host.selectedAgentId = "main";
+    host.setInputs({ selectedAgentId: "work" });
+    host.setInputs({ selectedAgentId: "main" });
     expect(await host.updateComplete).toBe(true);
     await vi.advanceTimersByTimeAsync(0);
 
@@ -232,40 +216,31 @@ describe("Passive sidebar PR indicators", () => {
     async (state) => {
       vi.useFakeTimers();
       const harness = createGatewayHarness();
-      const row = {
-        key: "agent:main:demo",
-        isChild: false,
-        worktreeId: "wt-demo",
-      } as SidebarRecentSession;
+      const row = sessionRow("agent:main:demo", "wt-demo");
       const getRows = vi.fn(() => [row]);
       const host = mountLifecycleHost(harness.gateway, getRows);
-      await host.updateComplete;
-      await vi.advanceTimersByTimeAsync(0);
+      await settle(host);
       expect(harness.request).toHaveBeenLastCalledWith(
         SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD,
         { sessionKeys: [], passiveSessionKeys: [row.key] },
         { timeoutMs: 30_000, signal: expect.any(AbortSignal) },
       );
 
-      harness.emit({
-        sessions: {
-          [row.key]: {
-            pullRequests: [
-              { number: 2, state },
-              {
-                number: 1,
-                owner: "openclaw",
-                repo: "openclaw",
-                branch: "feature/demo",
-                title: "Demo",
-                url: "https://example.test/pr/1",
-                state,
-              },
-            ],
-            rateLimited: true,
-            status: "rate-limited",
+      harness.publish(row.key, {
+        pullRequests: [
+          { number: 2, state },
+          {
+            number: 1,
+            owner: "openclaw",
+            repo: "openclaw",
+            branch: "feature/demo",
+            title: "Demo",
+            url: "https://example.test/pr/1",
+            state,
           },
-        },
+        ],
+        rateLimited: true,
+        status: "rate-limited",
       });
       await host.updateComplete;
       expect(host.indicators.summary(row.key, row.worktreeId ?? "")).toEqual({
@@ -273,26 +248,14 @@ describe("Passive sidebar PR indicators", () => {
         state,
       });
 
-      harness.emit({
-        sessions: {
-          [row.key]: {
-            pullRequests: [],
-            rateLimited: true,
-            status: "rate-limited",
-          },
-        },
-      });
+      harness.publish(row.key, { rateLimited: true, status: "rate-limited" });
       await host.updateComplete;
       expect(host.indicators.summary(row.key, row.worktreeId ?? "")).toEqual({
         numbers: [1, 2],
         state,
       });
 
-      harness.emit({
-        sessions: {
-          [row.key]: { pullRequests: [], rateLimited: false, status: "ready" },
-        },
-      });
+      harness.publish(row.key);
       await host.updateComplete;
       expect(
         host.indicators.summary(row.key, row.worktreeId ?? "", { numbers: [99], state }),
@@ -306,8 +269,7 @@ describe("Passive sidebar PR indicators", () => {
     const harness = createGatewayHarness();
     const row = { key: "agent:main:task", isChild: false } as SidebarRecentSession;
     const host = mountLifecycleHost(harness.gateway, () => [row]);
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
+    await settle(host);
     const tasks = [41, 42, 43].map((number) => ({
       owner: "example",
       repo: "project",
@@ -317,31 +279,11 @@ describe("Passive sidebar PR indicators", () => {
       sourceSessionKey: "agent:main:child",
       sourceAgentId: "main",
     }));
-    harness.emit({
-      sessions: {
-        [row.key]: {
-          pullRequests: [],
-          taskPullRequests: tasks,
-          taskPullRequestCount: 3,
-          status: "ready",
-          rateLimited: false,
-        },
-      },
-    });
+    harness.publish(row.key, { taskPullRequests: tasks, taskPullRequestCount: 3 });
     await host.updateComplete;
     expect(host.indicators.count(row.key)).toBe(3);
     expect(host.indicators.summary(row.key, "")).toBeUndefined();
-    harness.emit({
-      sessions: {
-        [row.key]: {
-          pullRequests: [],
-          taskPullRequests: [],
-          taskPullRequestCount: 0,
-          status: "ready",
-          rateLimited: false,
-        },
-      },
-    });
+    harness.publish(row.key, { taskPullRequests: [], taskPullRequestCount: 0 });
     await host.updateComplete;
     expect(host.indicators.count(row.key)).toBe(0);
   });
@@ -349,27 +291,15 @@ describe("Passive sidebar PR indicators", () => {
   it("preserves catalog branch facts only while receipt-only hydration leaves the branch unread", async () => {
     vi.useFakeTimers();
     const harness = createGatewayHarness();
-    const row = {
-      key: "agent:main:task",
-      isChild: false,
-      worktreeId: "wt",
-    } as SidebarRecentSession;
+    const row = sessionRow("agent:main:task", "wt");
     const initial = { numbers: [40], state: "open" as const };
     const host = mountLifecycleHost(harness.gateway, () => [row]);
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
+    await settle(host);
     for (const [index, branchRead] of [false, undefined, false].entries()) {
-      harness.emit({
-        sessions: {
-          [row.key]: {
-            ...(branchRead === false ? { branchRead } : {}),
-            pullRequests: [],
-            taskPullRequests: [],
-            taskPullRequestCount: 0,
-            rateLimited: false,
-            status: "ready",
-          },
-        },
+      harness.publish(row.key, {
+        ...(branchRead === false ? { branchRead } : {}),
+        taskPullRequests: [],
+        taskPullRequestCount: 0,
       });
       await host.updateComplete;
       expect(host.indicators.summary(row.key, "wt", initial)).toEqual(
@@ -382,28 +312,21 @@ describe("Passive sidebar PR indicators", () => {
   it("clears alias indicators when the selected agent changes", async () => {
     vi.useFakeTimers();
     const harness = createGatewayHarness();
-    const row = { key: "global", isChild: false, worktreeId: "wt-global" } as SidebarRecentSession;
+    const row = sessionRow("global", "wt-global");
     const host = mountLifecycleHost(harness.gateway, () => [row]);
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
-    harness.emit({
-      sessions: {
-        "agent:main:global": {
-          pullRequests: [
-            {
-              number: 1,
-              owner: "openclaw",
-              repo: "openclaw",
-              branch: "feature/demo",
-              title: "Demo",
-              url: "https://example.test/pr/1",
-              state: "open",
-            },
-          ],
-          rateLimited: false,
-          status: "ready",
+    await settle(host);
+    harness.publish("agent:main:global", {
+      pullRequests: [
+        {
+          number: 1,
+          owner: "openclaw",
+          repo: "openclaw",
+          branch: "feature/demo",
+          title: "Demo",
+          url: "https://example.test/pr/1",
+          state: "open",
         },
-      },
+      ],
     });
     await host.updateComplete;
     expect(host.indicators.summary(row.key, row.worktreeId ?? "")).toEqual({
@@ -411,9 +334,8 @@ describe("Passive sidebar PR indicators", () => {
       state: "open",
     });
 
-    host.selectedAgentId = "work";
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
+    host.setInputs({ selectedAgentId: "work" });
+    await settle(host);
 
     await host.updateComplete;
     expect(host.indicators.summary(row.key, row.worktreeId ?? "")).toBeUndefined();
@@ -422,11 +344,7 @@ describe("Passive sidebar PR indicators", () => {
   it("clears a structural session's indicator while replacement data is pending", async () => {
     vi.useFakeTimers();
     const harness = createGatewayHarness();
-    const row = {
-      key: "agent:main:demo",
-      isChild: false,
-      worktreeId: "wt-demo",
-    } as SidebarRecentSession;
+    const row = sessionRow("agent:main:demo", "wt-demo");
     const epoch = {};
     const setPullRequestSummary = vi.fn();
     const host = mountLifecycleHost(
@@ -439,17 +357,8 @@ describe("Passive sidebar PR indicators", () => {
           setPullRequestSummary,
         }) as unknown as SessionCapability,
     );
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
-    harness.emit({
-      sessions: {
-        [row.key]: {
-          pullRequests: [{ number: 1, state: "open" }],
-          rateLimited: false,
-          status: "ready",
-        },
-      },
-    });
+    await settle(host);
+    harness.publish(row.key, { pullRequests: [{ number: 1, state: "open" }] });
     await host.updateComplete;
     expect(host.indicators.summary(row.key, row.worktreeId ?? "")).toEqual({
       numbers: [1],
@@ -470,39 +379,27 @@ describe("Passive sidebar PR indicator lifecycle", () => {
     async (change) => {
       const harness = createGatewayHarness();
       const sessions = createTestSessionCapability(harness.gateway);
-      const row = {
-        key: "global",
-        isChild: false,
-        worktreeId: "wt-global",
-      } as SidebarRecentSession;
+      const row = sessionRow("global", "wt-global");
       const host = mountLifecycleHost(
         harness.gateway,
         () => [row],
         () => sessions,
       );
       await host.updateComplete;
-      harness.emit({
-        sessions: {
-          "agent:main:global": {
-            pullRequests: [{ number: 7, state: "open" }],
-            rateLimited: false,
-            status: "ready",
-          },
-        },
-      });
+      harness.publish("agent:main:global", { pullRequests: [{ number: 7, state: "open" }] });
       await host.updateComplete;
       expect(host.textContent).toBe("7");
-      host.presented = false;
+      host.setInputs({ presented: false });
       await host.updateComplete;
 
       const currentSessions =
         change === "sessions" ? createTestSessionCapability(harness.gateway) : sessions;
       const clearSummary = vi.spyOn(currentSessions, "setPullRequestSummary");
       if (change === "sessions") {
-        host.getSessions = () => currentSessions;
+        host.setInputs({ getSessions: () => currentSessions });
       }
       if (change === "agent") {
-        host.selectedAgentId = "work";
+        host.setInputs({ selectedAgentId: "work" });
       }
       if (change === "client") {
         harness.gateway.snapshot.client = {
@@ -515,7 +412,7 @@ describe("Passive sidebar PR indicator lifecycle", () => {
           auth: { role: "operator", scopes: ["operator.sessions.read"] },
         };
       }
-      host.gateway = harness.gateway;
+      host.setInputs({ gateway: harness.gateway });
       await host.updateComplete;
       const store = sessionPullRequestsForGateway(harness.gateway);
       expect(store.get("agent:main:global")).toBeUndefined();
@@ -527,19 +424,16 @@ describe("Passive sidebar PR indicator lifecycle", () => {
         harness.request.mock.calls.every(([, params]) => params.sessionKeys.length === 0),
       ).toBe(true);
 
-      host.presented = true;
+      host.setInputs({ presented: true });
       await host.updateComplete;
       expect(host.textContent).toBe("");
     },
   );
   it("hides the row's saved PR summary after a same-client read-scope revocation", async () => {
     const harness = createGatewayHarness();
-    const row = {
-      key: "agent:main:demo",
-      isChild: false,
-      worktreeId: "wt-demo",
+    const row = sessionRow("agent:main:demo", "wt-demo", {
       pullRequest: { numbers: [42], state: "open" },
-    } as SidebarRecentSession;
+    });
     const host = mountLifecycleHost(harness.gateway, () => [row]);
     await host.updateComplete;
     expect(host.textContent).toContain("42");
@@ -549,7 +443,7 @@ describe("Passive sidebar PR indicator lifecycle", () => {
       ...snapshot.hello!,
       auth: { role: "operator", scopes: ["operator.sessions.read", "operator.sessions.write"] },
     };
-    host.gateway = harness.gateway;
+    host.setInputs({ gateway: harness.gateway });
     await host.updateComplete;
     expect(host.textContent).not.toContain("42");
     expect(host.indicators.summary(row.key, row.worktreeId!, row.pullRequest)).toBeUndefined();
@@ -558,7 +452,7 @@ describe("Passive sidebar PR indicator lifecycle", () => {
       ...snapshot.hello,
       auth: { role: "operator", scopes: ["operator.read"] },
     };
-    host.gateway = harness.gateway;
+    host.setInputs({ gateway: harness.gateway });
     await host.updateComplete;
     expect(host.textContent).toContain("42");
   });
@@ -573,8 +467,7 @@ describe("Passive sidebar PR indicator lifecycle", () => {
     })) as SidebarRecentSession[];
     const host = mountLifecycleHost(harness.gateway, () => rows);
 
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
+    await settle(host);
 
     expect(harness.request).toHaveBeenLastCalledWith(
       SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD,
@@ -598,15 +491,7 @@ describe("Passive sidebar PR indicator lifecycle", () => {
       },
       { timeoutMs: 30_000, signal: expect.any(AbortSignal) },
     );
-    harness.emit({
-      sessions: {
-        [key]: {
-          pullRequests: [{ number: 7, state: "open" }],
-          rateLimited: false,
-          status: "ready",
-        },
-      },
-    });
+    harness.publish(key, { pullRequests: [{ number: 7, state: "open" }] });
     store.unwatch(viewer);
     await vi.advanceTimersByTimeAsync(0);
     await host.updateComplete;
@@ -635,28 +520,12 @@ describe("Passive sidebar PR indicator lifecycle", () => {
     const setPullRequestSummary = vi.spyOn(sessions, "setPullRequestSummary");
     const host = mountLifecycleHost(
       harness.gateway,
-      () => [
-        {
-          key,
-          isChild: false,
-          worktreeId: "wt-demo",
-          pullRequest: sessions.pullRequestSummary(key),
-        } as SidebarRecentSession,
-      ],
+      () => [sessionRow(key, "wt-demo", { pullRequest: sessions.pullRequestSummary(key) })],
       () => sessions,
     );
-    host.rowsSource = sessions;
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
-    harness.emit({
-      sessions: {
-        [key]: {
-          pullRequests: [{ number: 7, state: "open" }],
-          rateLimited: false,
-          status: "ready",
-        },
-      },
-    });
+    host.setInputs({ rowsSource: sessions });
+    await settle(host);
+    harness.publish(key, { pullRequests: [{ number: 7, state: "open" }] });
     await host.updateComplete;
     expect(host.textContent?.trim()).toBe("7");
 
@@ -672,8 +541,7 @@ describe("Passive sidebar PR indicator lifecycle", () => {
         { foreground: true },
       );
       expect(store.get(key)).toBeUndefined();
-      await host.updateComplete;
-      await vi.advanceTimersByTimeAsync(0);
+      await settle(host);
       await host.updateComplete;
 
       expect(captureEpoch).toHaveBeenCalledExactlyOnceWith(key);
@@ -692,29 +560,22 @@ describe("Passive sidebar PR indicator lifecycle", () => {
   it("keeps sidebar watches passive across disconnect and reconnect", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const harness = createGatewayHarness();
-    const row = {
-      key: "agent:main:demo",
-      isChild: false,
-      worktreeId: "wt-demo",
-    } as SidebarRecentSession;
+    const row = sessionRow("agent:main:demo", "wt-demo");
     const host = mountLifecycleHost(harness.gateway, () => [row]);
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
+    await settle(host);
     expect(harness.request.mock.lastCall?.[1]).toEqual(
       host.isConnected ? { sessionKeys: [], passiveSessionKeys: [row.key] } : { sessionKeys: [] },
     );
 
     host.remove();
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
+    await settle(host);
 
     expect(harness.request.mock.lastCall?.[1]).toEqual(
       host.isConnected ? { sessionKeys: [], passiveSessionKeys: [row.key] } : { sessionKeys: [] },
     );
 
     document.body.append(host);
-    await host.updateComplete;
-    await vi.advanceTimersByTimeAsync(0);
+    await settle(host);
 
     expect(harness.request.mock.lastCall?.[1]).toEqual(
       host.isConnected ? { sessionKeys: [], passiveSessionKeys: [row.key] } : { sessionKeys: [] },

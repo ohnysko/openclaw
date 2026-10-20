@@ -33,12 +33,30 @@ function catalog(id: string, hostCount: number): SessionCatalog {
   };
 }
 
+function startLive() {
+  const live = new SessionCatalogLiveState();
+  const { progressId } = live.beginRequest(1);
+  return {
+    live,
+    apply: (
+      incoming: SessionCatalog,
+      catalogs: SessionCatalog[],
+      pageDepths = new Map<string, number>(),
+    ) =>
+      live.applyHost({
+        payload: { progressId, agentId: "main", catalog: incoming },
+        agentId: "main",
+        catalogs,
+        pageDepths,
+      }),
+  };
+}
+
 describe("SessionCatalogLiveState", () => {
   it.each(["final", "incremental"] as const)(
     "retains rows and cursors for a pending host in %s publications",
     async (publication) => {
-      const live = new SessionCatalogLiveState();
-      const { progressId } = live.beginRequest(1);
+      const { live, apply } = startLive();
       const current = catalog("codex", 2);
       current.hosts[0]!.nextCursor = "next-page";
       const pending = { ...current.hosts[0]!, pending: true, sessions: [], nextCursor: undefined };
@@ -46,12 +64,7 @@ describe("SessionCatalogLiveState", () => {
       const catalogs =
         publication === "final"
           ? live.mergeFinal([incoming], [current])
-          : live.applyHost({
-              payload: { progressId, agentId: "main", catalog: incoming },
-              agentId: "main",
-              catalogs: [current],
-              pageDepths: new Map(),
-            })!.catalogs;
+          : apply(incoming, [current])!.catalogs;
       expect(catalogs[0]?.hosts[0]).toMatchObject({
         pending: true,
         sessions: current.hosts[0]!.sessions,
@@ -76,24 +89,17 @@ describe("SessionCatalogLiveState", () => {
   );
 
   it("does not replace a settled progressive host with its pending final response", () => {
-    const live = new SessionCatalogLiveState();
-    const { progressId } = live.beginRequest(1);
+    const { live, apply } = startLive();
     const current = catalog("codex", 1);
     const pending: SessionCatalogHost = { ...current.hosts[0]!, pending: true, sessions: [] };
-    const published = live.applyHost({
-      payload: { progressId, agentId: "main", catalog: current },
-      agentId: "main",
-      catalogs: [{ ...current, hosts: [pending] }],
-      pageDepths: new Map(),
-    })!;
+    const published = apply(current, [{ ...current, hosts: [pending] }])!;
     expect(live.mergeFinal([{ ...current, hosts: [pending] }], published.catalogs)).toEqual([
       current,
     ]);
   });
 
   it("clears unavailable native readiness without losing another host or expanded rows", () => {
-    const live = new SessionCatalogLiveState();
-    const { progressId } = live.beginRequest(1);
+    const { apply } = startLive();
     const current = catalog("codex", 2);
     current.capabilities.startTerminal = true;
     current.hosts.forEach((host) => {
@@ -105,19 +111,17 @@ describe("SessionCatalogLiveState", () => {
       sessions: [],
       error: { code: "offline", message: "Offline" },
     };
-    const result = live.applyHost({
-      payload: { progressId, agentId: "main", catalog: { ...current, hosts: [changed] } },
-      agentId: "main",
-      catalogs: [current],
-      pageDepths: new Map([[sessionCatalogHostKey("codex", changed.hostId), 1]]),
-    });
+    const result = apply(
+      { ...current, hosts: [changed] },
+      [current],
+      new Map([[sessionCatalogHostKey("codex", changed.hostId), 1]]),
+    );
     expect(result?.catalogs[0]?.hosts.map((host) => host.canStartTerminal)).toEqual([false, true]);
     expect(result?.catalogs[0]?.hosts[1]).toEqual(current.hosts[1]);
     expect(result?.catalogs[0]?.hosts[0]?.sessions).toEqual(current.hosts[0]?.sessions);
   });
   it("compares a host event only with the catalog and host it can replace", () => {
-    const live = new SessionCatalogLiveState();
-    const { progressId } = live.beginRequest(1);
+    const { apply } = startLive();
     const changed = catalog("changed", 1);
     const unrelated = catalog("unrelated", 100);
     Object.defineProperty(unrelated, "toJSON", {
@@ -126,19 +130,6 @@ describe("SessionCatalogLiveState", () => {
       },
     });
 
-    let result: ReturnType<SessionCatalogLiveState["applyHost"]>;
-    expect(() => {
-      result = live.applyHost({
-        payload: {
-          progressId,
-          agentId: "main",
-          catalog: { ...changed, hosts: [changed.hosts[0]!] },
-        },
-        agentId: "main",
-        catalogs: [changed, unrelated],
-        pageDepths: new Map(),
-      });
-    }).not.toThrow();
-    expect(result!).toBeNull();
+    expect(apply({ ...changed, hosts: [changed.hosts[0]!] }, [changed, unrelated])).toBeNull();
   });
 });

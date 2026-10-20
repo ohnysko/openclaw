@@ -19,15 +19,18 @@ import "../test-helpers/app-sidebar-tool-activity-cases.ts";
 // Mirrors the protocol throttle; asserting through timers keeps the
 // constant unexported (production-only export policy).
 const SIDEBAR_NARRATION_THROTTLE_MS = 2_000;
+const runKey = "agent:main:run";
 
 function gatewayEvent(eventName: string, payload: unknown): GatewayEventFrame {
   return { type: "event", event: eventName, payload };
 }
 
+function runEvent(event: string, payload: Record<string, unknown>): GatewayEventFrame {
+  return gatewayEvent(event, { sessionKey: runKey, runId: "run-1", ...payload });
+}
+
 function chatDelta(text?: string, deltaText?: string, replace?: boolean): GatewayEventFrame {
-  return gatewayEvent("chat", {
-    sessionKey: "agent:main:run",
-    runId: "run-1",
+  return runEvent("chat", {
     state: "delta",
     deltaText,
     replace,
@@ -35,15 +38,35 @@ function chatDelta(text?: string, deltaText?: string, replace?: boolean): Gatewa
   });
 }
 
+const toolEvent = (name: string, fields: Record<string, unknown> = {}) =>
+  runEvent("agent", { stream: "tool", data: { name }, ...fields });
+const observer = (headline: string, fields: Record<string, unknown> = {}) =>
+  runEvent("session.observer", {
+    revision: 1,
+    updatedAt: 10_000,
+    health: "on-track",
+    headline,
+    ...fields,
+  });
+const chatSnapshot = (text: string, fields: Record<string, unknown> = {}) =>
+  chatFrame({
+    state: "delta",
+    deltaText: text,
+    message: { role: "assistant", content: text },
+    ...fields,
+  });
+
+const digest = (text: string) => runEvent("session.narration", { text });
+
 function narrationFixture() {
   return createRunningNarration({
-    subscribeMessages: vi.fn(() => Promise.resolve({ key: "agent:main:run", agentId: null })),
+    subscribeMessages: vi.fn(() => Promise.resolve({ key: runKey, agentId: null })),
     unsubscribeMessages: vi.fn(() => Promise.resolve()),
   });
 }
 
 function chatFrame(payload: Record<string, unknown>): GatewayEventFrame {
-  return gatewayEvent("chat", { sessionKey: "agent:main:run", runId: "run-1", ...payload });
+  return runEvent("chat", payload);
 }
 
 describe("createSidebarNarration", () => {
@@ -235,13 +258,13 @@ describe("createSidebarNarration", () => {
           },
         });
       }
-      const current = { key: "agent:main:run", agentId: null };
+      const current = { key: runKey, agentId: null };
       if (boundary !== "source") {
         expect(source.subscribeMessages).toHaveBeenCalledTimes(2);
         second.resolve(current);
         await second.promise;
       }
-      const stale = { key: "agent:main:run", agentId: null };
+      const stale = { key: runKey, agentId: null };
       first.resolve(stale);
       await first.promise;
       expect(source.unsubscribeMessages).toHaveBeenCalledExactlyOnceWith(stale);
@@ -271,7 +294,7 @@ describe("createSidebarNarration", () => {
       connected: true,
       connectionIdentity: {},
       source,
-      rows: [runningRow("agent:main:run")],
+      rows: [runningRow(runKey)],
       openSessionKey: "",
       agentId: "main",
     });
@@ -314,47 +337,37 @@ describe("createSidebarNarration", () => {
 
   it("renders paced digests immediately and keeps the final line after queued tool activity", async () => {
     const { narration } = narrationFixture();
-    const digest = (text: string) =>
-      gatewayEvent("session.narration", { sessionKey: "agent:main:run", runId: "run-1", text });
     const tool = () =>
-      gatewayEvent("session.tool", {
-        sessionKey: "agent:main:run",
-        runId: "run-1",
+      runEvent("session.tool", {
         stream: "tool",
         data: { phase: "start", name: "read" },
       });
 
     narration.handleEvent(tool());
     narration.handleEvent(digest("**Reading** the current implementation."));
-    expect(narration.read().lines.get("agent:main:run")).toBe(
-      "Reading the current implementation.",
-    );
+    expect(narration.read().lines.get(runKey)).toBe("Reading the current implementation.");
     await vi.advanceTimersByTimeAsync(SIDEBAR_NARRATION_THROTTLE_MS);
     narration.handleEvent(digest("Earlier paragraph.\n\nChecks are **passing**."));
-    expect(narration.read().lines.get("agent:main:run")).toBe("Checks are passing.");
+    expect(narration.read().lines.get(runKey)).toBe("Checks are passing.");
 
     narration.handleEvent(tool());
     await vi.advanceTimersByTimeAsync(100);
     narration.handleEvent(digest("Final result is correct."));
     narration.handleEvent(
-      gatewayEvent("chat", {
-        sessionKey: "agent:main:run",
-        runId: "run-1",
+      runEvent("chat", {
         state: "final",
         message: { role: "assistant", content: "Final result is correct." },
       }),
     );
-    expect(narration.read().lines.get("agent:main:run")).toBe("Final result is correct.");
+    expect(narration.read().lines.get(runKey)).toBe("Final result is correct.");
     expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(SIDEBAR_NARRATION_THROTTLE_MS);
-    expect(narration.read().lines.get("agent:main:run")).toBe("Final result is correct.");
+    expect(narration.read().lines.get(runKey)).toBe("Final result is correct.");
     narration.disconnect();
   });
 
   it("scopes digest replacements and retracts hidden content across run boundaries", () => {
     const { narration } = narrationFixture();
-    const digest = (text: string) =>
-      gatewayEvent("session.narration", { sessionKey: "agent:main:run", runId: "run-1", text });
 
     narration.handleEvent(digest("First visible progress."));
     narration.handleEvent(
@@ -365,59 +378,53 @@ describe("createSidebarNarration", () => {
       }),
     );
     narration.handleEvent(
-      gatewayEvent("session.narration", { sessionKey: "agent:main:run", text: "No run identity." }),
+      gatewayEvent("session.narration", { sessionKey: runKey, text: "No run identity." }),
     );
-    expect(narration.read().lines.get("agent:main:run")).toBe("First visible progress.");
+    expect(narration.read().lines.get(runKey)).toBe("First visible progress.");
 
     for (const text of ["", "HEARTBEAT_OK"]) {
       narration.handleEvent(digest("Visible draft."));
       narration.handleEvent(digest(text));
-      expect(narration.read().lines.has("agent:main:run")).toBe(false);
+      expect(narration.read().lines.has(runKey)).toBe(false);
     }
     narration.handleEvent(digest("Previous run result."));
     narration.handleEvent(
       gatewayEvent("agent", {
-        sessionKey: "agent:main:run",
+        sessionKey: runKey,
         runId: "run-2",
         stream: "lifecycle",
         data: { phase: "start" },
       }),
     );
-    expect(narration.read().lines.has("agent:main:run")).toBe(false);
+    expect(narration.read().lines.has(runKey)).toBe(false);
     narration.handleEvent(
       gatewayEvent("session.narration", {
-        sessionKey: "agent:main:run",
+        sessionKey: runKey,
         runId: "run-2",
         text: "New run progress.",
       }),
     );
-    expect(narration.read().lines.get("agent:main:run")).toBe("New run progress.");
+    expect(narration.read().lines.get(runKey)).toBe("New run progress.");
     narration.disconnect();
   });
 
   it.each(["final", "aborted", "error"])(
     "settles queued full-owner narration immediately on %s",
     (state) => {
-      const source = {
-        subscribeMessages: vi.fn(() => Promise.resolve({ key: "agent:main:run", agentId: null })),
-        unsubscribeMessages: vi.fn(() => Promise.resolve()),
-      };
-      const { narration } = createRunningNarration(source);
+      const { narration } = narrationFixture();
       narration.handleEvent(chatDelta("Initial work."));
       narration.handleEvent(chatDelta("Last visible result."));
-      expect(narration.read().lines.get("agent:main:run")).toBe("Initial work.");
+      expect(narration.read().lines.get(runKey)).toBe("Initial work.");
 
       narration.handleEvent(
-        gatewayEvent("chat", {
-          sessionKey: "agent:main:run",
-          runId: "run-1",
+        runEvent("chat", {
           state,
           ...(state === "final"
             ? { message: { role: "assistant", content: "Final corrected result." } }
             : {}),
         }),
       );
-      expect(narration.read().lines.get("agent:main:run")).toBe(
+      expect(narration.read().lines.get(runKey)).toBe(
         state === "final" ? "Final corrected result." : "Last visible result.",
       );
       expect(vi.getTimerCount()).toBe(0);
@@ -426,36 +433,16 @@ describe("createSidebarNarration", () => {
   );
 
   it("hands subtitle ownership only to a run-identified digest", async () => {
-    const source = {
-      subscribeMessages: vi.fn(() => Promise.resolve({ key: "agent:main:run", agentId: null })),
-      unsubscribeMessages: vi.fn(() => Promise.resolve()),
-    };
-    const narration = createSidebarNarration();
-    narration.sync({
-      enabled: true,
-      connected: true,
-      connectionIdentity: {},
-      source,
-      openSessionKey: "",
-      rows: [runningRow("agent:main:run")],
-      agentId: "main",
-    });
+    const { narration } = narrationFixture();
 
     narration.handleEvent(chatDelta("Reading source"));
-    narration.handleEvent(
-      gatewayEvent("agent", {
-        sessionKey: "agent:main:run",
-        runId: "run-1",
-        stream: "tool",
-        data: { name: "read" },
-      }),
-    );
-    expect(narration.read().tools.get("agent:main:run")?.name).toBe("read");
-    expect(narration.read().lines.get("agent:main:run")).toBe("Reading source");
+    narration.handleEvent(toolEvent("read"));
+    expect(narration.read().tools.get(runKey)?.name).toBe("read");
+    expect(narration.read().lines.get(runKey)).toBe("Reading source");
 
     narration.handleEvent(
       gatewayEvent("session.observer", {
-        sessionKey: "agent:main:run",
+        sessionKey: runKey,
         revision: 1,
         updatedAt: 10_000,
         headline: "Run-less digest",
@@ -464,76 +451,37 @@ describe("createSidebarNarration", () => {
     );
     expect(narration.read().observerDigests.size).toBe(0);
     await vi.advanceTimersByTimeAsync(SIDEBAR_NARRATION_THROTTLE_MS);
-    narration.handleEvent(
-      gatewayEvent("agent", {
-        sessionKey: "agent:main:run",
-        runId: "run-1",
-        stream: "tool",
-        data: { name: "list" },
-      }),
-    );
-    expect(narration.read().tools.get("agent:main:run")?.name).toBe("list");
-    expect(narration.read().lines.get("agent:main:run")).toBe("Reading source");
+    narration.handleEvent(toolEvent("list"));
+    expect(narration.read().tools.get(runKey)?.name).toBe("list");
+    expect(narration.read().lines.get(runKey)).toBe("Reading source");
 
-    narration.handleEvent(
-      gatewayEvent("session.observer", {
-        sessionKey: "agent:main:run",
-        runId: "run-1",
-        revision: 1,
-        updatedAt: 10_000,
-        headline: "Reviewing the current implementation",
-        health: "on-track",
-      }),
-    );
-    expect(narration.read().lines.has("agent:main:run")).toBe(false);
-    expect(narration.read().observerDigests.get("agent:main:run")?.headline).toBe(
+    narration.handleEvent(observer("Reviewing the current implementation"));
+    expect(narration.read().lines.has(runKey)).toBe(false);
+    expect(narration.read().observerDigests.get(runKey)?.headline).toBe(
       "Reviewing the current implementation",
     );
 
     const previousDigests = narration.read().observerDigests;
     narration.handleEvent(
-      gatewayEvent("session.observer", {
-        sessionKey: "agent:main:run",
-        runId: "run-2",
-        revision: 0,
-        updatedAt: 10_001,
-        headline: "Invalid replacement",
-        health: "on-track",
-      }),
+      observer("Invalid replacement", { runId: "run-2", revision: 0, updatedAt: 10_001 }),
     );
     expect(narration.read().observerDigests).toBe(previousDigests);
-    expect(narration.read().observerDigests.get("agent:main:run")?.headline).toBe(
+    expect(narration.read().observerDigests.get(runKey)?.headline).toBe(
       "Reviewing the current implementation",
     );
 
+    narration.handleEvent(toolEvent("test"));
     narration.handleEvent(
-      gatewayEvent("agent", {
-        sessionKey: "agent:main:run",
-        runId: "run-1",
-        stream: "tool",
-        data: { name: "test" },
-      }),
-    );
-    narration.handleEvent(
-      gatewayEvent("session.narration", {
-        sessionKey: "agent:main:run",
-        runId: "run-1",
+      runEvent("session.narration", {
         text: "Raw narration does not replace an observer headline.",
       }),
     );
-    expect(narration.read().lines.has("agent:main:run")).toBe(false);
+    expect(narration.read().lines.has(runKey)).toBe(false);
 
-    narration.handleEvent(
-      gatewayEvent("agent", {
-        sessionKey: "agent:main:run",
-        runId: "run-2",
-        stream: "tool",
-        data: { name: "test" },
-      }),
-    );
-    expect(narration.read().observerDigests.has("agent:main:run")).toBe(false);
-    expect(narration.read().tools.get("agent:main:run")?.name).toBe("test");
-    expect(narration.read().lines.get("agent:main:run")).toBeUndefined();
+    narration.handleEvent(toolEvent("test", { runId: "run-2" }));
+    expect(narration.read().observerDigests.has(runKey)).toBe(false);
+    expect(narration.read().tools.get(runKey)?.name).toBe("test");
+    expect(narration.read().lines.get(runKey)).toBeUndefined();
   });
 
   it("rebinds an active global session when the selected agent changes", async () => {
@@ -576,252 +524,167 @@ describe("createSidebarNarration", () => {
     expect(narration.read().lines.has("global")).toBe(false);
   });
 
+  type Step = [
+    event: GatewayEventFrame,
+    expected?: string | false | ((line: string) => void),
+    advance?: true,
+  ];
+  const scenario = (name: string, ...steps: Step[]): [string, Step[]] => [name, steps];
   const internal = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
   const internalEnd = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
   const preamble = `Preamble ${"x".repeat(20_000)}`;
-  it.each<
-    [
-      string,
-      Array<
-        [
-          event: GatewayEventFrame,
-          expected?: string | false | ((line: string) => void),
-          advance?: true,
-        ]
-      >,
-    ]
-  >([
-    [
-      "last prose paragraph",
-      [
-        [
-          chatDelta(
-            "# Plan\n\nFirst **check** finished.\n\n```ts\nconst answer = 1;\n```\nFinal _verification_ is running.",
-          ),
-          "Final verification is running.",
-        ],
-      ],
-    ],
-    [
-      "whitespace and ellipsis",
-      [
-        [
-          chatDelta(`Earlier.\n\n- ${"result ".repeat(30)}`),
-          (line) => {
-            expect(line).toHaveLength(120);
-            expect(line.endsWith("…")).toBe(true);
-            expect(line).not.toContain("  ");
-          },
-        ],
-      ],
-    ],
-    [
-      "mid-run cumulative snapshot",
-      [
-        [
-          chatFrame({
-            state: "delta",
-            deltaText: "les now.",
-            message: {
-              role: "assistant",
-              content: [{ type: "text", text: "Reading files now." }],
-            },
-          }),
-          "Reading files now.",
-        ],
-      ],
-    ],
-    [
+  it.each([
+    scenario("last prose paragraph", [
+      chatDelta(
+        "# Plan\n\nFirst **check** finished.\n\n```ts\nconst answer = 1;\n```\nFinal _verification_ is running.",
+      ),
+      "Final verification is running.",
+    ]),
+    scenario("whitespace and ellipsis", [
+      chatDelta(`Earlier.\n\n- ${"result ".repeat(30)}`),
+      (line) => {
+        expect(line).toHaveLength(120);
+        expect(line.endsWith("…")).toBe(true);
+        expect(line).not.toContain("  ");
+      },
+    ]),
+    scenario("mid-run cumulative snapshot", [
+      chatFrame({
+        state: "delta",
+        deltaText: "les now.",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Reading files now." }],
+        },
+      }),
+      "Reading files now.",
+    ]),
+    scenario(
       "overlapping agent and chat deltas",
+      [chatDelta("Reading"), undefined],
       [
-        [chatDelta("Reading"), undefined],
-        [
-          gatewayEvent("agent", {
-            sessionKey: "agent:main:run",
-            runId: "run-1",
-            stream: "assistant",
-            data: { delta: " files" },
-          }),
-          undefined,
-        ],
-        [chatDelta(undefined, " files"), "Reading files", true],
+        runEvent("agent", {
+          stream: "assistant",
+          data: { delta: " files" },
+        }),
+        undefined,
       ],
-    ],
-    [
-      "snapshot display normalization",
-      [
+      [chatDelta(undefined, " files"), "Reading files", true],
+    ),
+    scenario("snapshot display normalization", [
+      chatDelta(
         [
-          chatDelta(
-            [
-              "Visible work is complete.",
-              "<think>private reasoning</think>",
-              internal,
-              "private runtime details",
-              internalEnd,
-              "[[audio_as_voice]]",
-              "REPLY_SKIP",
-            ].join("\n"),
-          ),
+          "Visible work is complete.",
+          "<think>private reasoning</think>",
+          internal,
+          "private runtime details",
+          internalEnd,
+          "[[audio_as_voice]]",
           "REPLY_SKIP",
-        ],
-      ],
-    ],
-    [
-      "trailing heartbeat token",
-      [
-        [
-          chatDelta(
-            `${"Visible progress continues. ".repeat(16)}Final visible status. HEARTBEAT_OK`,
-          ),
-          (line: string) => {
-            expect(line).toBe("Final visible status.");
-            expect(line).not.toContain("HEARTBEAT_OK");
-          },
-        ],
-      ],
-    ],
-    [
+        ].join("\n"),
+      ),
+      "REPLY_SKIP",
+    ]),
+    scenario("trailing heartbeat token", [
+      chatDelta(`${"Visible progress continues. ".repeat(16)}Final visible status. HEARTBEAT_OK`),
+      (line: string) => {
+        expect(line).toBe("Final visible status.");
+        expect(line).not.toContain("HEARTBEAT_OK");
+      },
+    ]),
+    scenario(
       "truncated internal block",
       [
-        [
-          chatDelta(`Visible setup.\n${internal}\n${"private runtime detail ".repeat(1_000)}`),
-          "Visible setup.",
-        ],
-        [
-          chatDelta(undefined, `\n${internalEnd}\nFinal bounded line.`),
-          "Final bounded line.",
-          true,
-        ],
+        chatDelta(`Visible setup.\n${internal}\n${"private runtime detail ".repeat(1_000)}`),
+        "Visible setup.",
       ],
-    ],
-    [
+      [chatDelta(undefined, `\n${internalEnd}\nFinal bounded line.`), "Final bounded line.", true],
+    ),
+    scenario(
       "partial internal delimiter",
-      [
-        [chatDelta("Visible setup.\n<<<BEGIN_OPENCLAW_INTERNAL_CONT"), "Visible setup."],
-        [chatDelta(undefined, "EXT>>>\nprivate runtime detail"), "Visible setup."],
-      ],
-    ],
-    [
+      [chatDelta("Visible setup.\n<<<BEGIN_OPENCLAW_INTERNAL_CONT"), "Visible setup."],
+      [chatDelta(undefined, "EXT>>>\nprivate runtime detail"), "Visible setup."],
+    ),
+    scenario(
       "replacement resets internal streaming state",
       [
-        [
-          chatDelta(`${internal}\nprivate runtime text`, `${internal}\nprivate runtime text`),
-          undefined,
-        ],
-        [chatDelta(undefined, "Replacement", true), undefined],
-        [chatDelta(undefined, " now."), "Replacement now.", true],
+        chatDelta(`${internal}\nprivate runtime text`, `${internal}\nprivate runtime text`),
+        undefined,
       ],
-    ],
-    [
+      [chatDelta(undefined, "Replacement", true), undefined],
+      [chatDelta(undefined, " now."), "Replacement now.", true],
+    ),
+    scenario(
       "nested internal block outlives the raw buffer",
       [
-        [
-          chatDelta(
-            [
-              "Visible setup.",
-              internal,
-              "private outer runtime detail ".repeat(1_000),
-              internal,
-              "private nested runtime detail ".repeat(1_000),
-              internalEnd,
-            ].join("\n"),
-          ),
-          "Visible setup.",
-        ],
-        [chatDelta(undefined, "\nStill private after the nested block."), "Visible setup.", true],
-        [chatDelta(undefined, `\n${internalEnd}\nFinal public line.`), "Final public line.", true],
+        chatDelta(
+          [
+            "Visible setup.",
+            internal,
+            "private outer runtime detail ".repeat(1_000),
+            internal,
+            "private nested runtime detail ".repeat(1_000),
+            internalEnd,
+          ].join("\n"),
+        ),
+        "Visible setup.",
       ],
-    ],
-    [
+      [chatDelta(undefined, "\nStill private after the nested block."), "Visible setup.", true],
+      [chatDelta(undefined, `\n${internalEnd}\nFinal public line.`), "Final public line.", true],
+    ),
+    scenario(
       "corrected replacement",
-      [
-        [chatDelta("Draft answer."), undefined],
-        [chatDelta("Corrected answer.", "Corrected answer.", true), "Corrected answer.", true],
-      ],
-    ],
-    [
+      [chatDelta("Draft answer."), undefined],
+      [chatDelta("Corrected answer.", "Corrected answer.", true), "Corrected answer.", true],
+    ),
+    scenario(
       "silent join until cumulative alignment",
+      [chatFrame({ deltaText: "secret internal continuation." }), false, true],
       [
-        [chatFrame({ deltaText: "secret internal continuation." }), false, true],
-        [
-          chatFrame({
-            deltaText: " Visible update.",
-            message: { role: "assistant", content: "Public progress line. Visible update." },
-          }),
-          "Visible update.",
-          true,
-        ],
+        chatFrame({
+          deltaText: " Visible update.",
+          message: { role: "assistant", content: "Public progress line. Visible update." },
+        }),
+        "Visible update.",
+        true,
       ],
-    ],
-    [
+    ),
+    scenario(
       "empty replacement retracts shown text",
       [
-        [
-          chatFrame({
-            deltaText: "Queued draft that gets withdrawn.",
-            message: { role: "assistant", content: "Queued draft that gets withdrawn." },
-          }),
-          "Queued draft that gets withdrawn.",
-          true,
-        ],
-        [chatFrame({ deltaText: "", replace: true }), false, true],
+        chatFrame({
+          deltaText: "Queued draft that gets withdrawn.",
+          message: { role: "assistant", content: "Queued draft that gets withdrawn." },
+        }),
+        "Queued draft that gets withdrawn.",
+        true,
       ],
-    ],
-    [
+      [chatFrame({ deltaText: "", replace: true }), false, true],
+    ),
+    scenario(
       "suppressed replacement retracts shown text",
-      [
-        [chatDelta("Draft that gets withdrawn."), "Draft that gets withdrawn.", true],
-        [chatDelta("HEARTBEAT_OK", "HEARTBEAT_OK", true), undefined],
-        [chatDelta("", "", true), false, true],
-      ],
-    ],
-    [
+      [chatDelta("Draft that gets withdrawn."), "Draft that gets withdrawn.", true],
+      [chatDelta("HEARTBEAT_OK", "HEARTBEAT_OK", true), undefined],
+      [chatDelta("", "", true), false, true],
+    ),
+    scenario(
       "new run discards accumulated deltas",
-      [
-        [
-          chatFrame({
-            runId: "first",
-            state: "delta",
-            deltaText: "Unfinished old work",
-            message: { role: "assistant", content: "Unfinished old work" },
-          }),
-          undefined,
-        ],
-        [
-          chatFrame({
-            runId: "second",
-            state: "delta",
-            deltaText: "New run work.",
-            message: { role: "assistant", content: "New run work." },
-          }),
-          "New run work.",
-        ],
-      ],
-    ],
-    [
+      [chatSnapshot("Unfinished old work", { runId: "first" }), undefined],
+      [chatSnapshot("New run work.", { runId: "second" }), "New run work."],
+    ),
+    scenario(
       "newest sentence beyond the retained tail",
+      [chatSnapshot(preamble, { runId: "long" }), undefined, true],
       [
-        [
-          chatFrame({
-            runId: "long",
-            state: "delta",
-            deltaText: preamble,
-            message: { role: "assistant", content: preamble },
-          }),
-          undefined,
-          true,
-        ],
-        [
-          chatFrame({
-            runId: "long",
-            state: "delta",
-            deltaText: ". Final bounded line.",
-            message: { role: "assistant", content: `${preamble}. Final bounded line.` },
-          }),
-          "Final bounded line.",
-        ],
+        chatFrame({
+          runId: "long",
+          state: "delta",
+          deltaText: ". Final bounded line.",
+          message: { role: "assistant", content: `${preamble}. Final bounded line.` },
+        }),
+        "Final bounded line.",
       ],
-    ],
+    ),
   ])("publishes narration for %s", async (_name, steps) => {
     const { narration } = narrationFixture();
     for (const [event, expected, advance] of steps) {
@@ -831,12 +694,12 @@ describe("createSidebarNarration", () => {
       }
       const lines = narration.read().lines;
       if (expected === false) {
-        expect(lines?.has("agent:main:run") ?? false).toBe(false);
+        expect(lines?.has(runKey) ?? false).toBe(false);
       } else if (typeof expected === "string") {
-        expect(lines?.get("agent:main:run")).toBe(expected);
+        expect(lines?.get(runKey)).toBe(expected);
       }
       if (typeof expected === "function") {
-        const line = lines?.get("agent:main:run");
+        const line = lines?.get(runKey);
         expect(line).toBeDefined();
         expected(line!);
       }
