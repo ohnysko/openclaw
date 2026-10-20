@@ -46,11 +46,8 @@ import { cleanupTailscaleExposure, setupTailscaleExposure } from "./webhook/tail
 
 export type VoiceCallRuntime = {
   config: VoiceCallConfig;
-  provider: VoiceCallProvider;
   manager: CallManager;
   webhookServer: VoiceCallWebhookServer;
-  webhookUrl: string;
-  publicUrl: string | null;
   stop: () => Promise<void>;
 };
 
@@ -555,11 +552,8 @@ export async function createVoiceCallRuntime(params: {
 
     return {
       config,
-      provider,
       manager,
       webhookServer,
-      webhookUrl,
-      publicUrl,
       stop: () => stop(),
     };
   } catch (err) {
