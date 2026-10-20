@@ -64,25 +64,23 @@ describe("recoverInstalledLaunchAgent", () => {
     expect(repairLaunchAgentBootstrap).toHaveBeenCalledWith({ env: process.env });
   });
 
-  it("returns null when bootstrap repair fails", async () => {
+  it.each([
+    { status: "kickstart-failed", error: undefined },
+    { status: "gui-session-unavailable", error: "requires a logged-in macOS GUI session" },
+    { status: "system-launchdaemon-unverifiable", error: "recovery guidance" },
+  ])("handles $status bootstrap failure", async ({ status, error }) => {
     repairLaunchAgentBootstrap.mockResolvedValue({
       ok: false,
-      status: "kickstart-failed",
-      detail: "permission denied",
+      status,
+      detail: "recovery guidance",
+      ...(status === "gui-session-unavailable" ? { domain: "gui/501" } : {}),
     });
-
-    await expect(recover()).resolves.toBeNull();
-  });
-
-  it("surfaces headless GUI bootstrap failures instead of falling back to unmanaged restart", async () => {
-    repairLaunchAgentBootstrap.mockResolvedValue({
-      ok: false,
-      status: "gui-session-unavailable",
-      detail: "Bootstrap failed: 125: Domain does not support specified action",
-      domain: "gui/501",
-    });
-
-    await expect(recover("restarted")).rejects.toThrow("requires a logged-in macOS GUI session");
+    const result = recover("restarted");
+    if (error) {
+      await expect(result).rejects.toThrow(error);
+    } else {
+      await expect(result).resolves.toBeNull();
+    }
   });
 
   it("surfaces system ownership even when no user LaunchAgent plist exists", async () => {
@@ -95,15 +93,5 @@ describe("recoverInstalledLaunchAgent", () => {
       "System LaunchDaemon system/ai.openclaw.gateway owns this label",
     );
     expect(launchAgentPlistExists).not.toHaveBeenCalled();
-  });
-
-  it("preserves typed system-launchdaemon-unverifiable bootstrap failures", async () => {
-    repairLaunchAgentBootstrap.mockResolvedValue({
-      ok: false,
-      status: "system-launchdaemon-unverifiable",
-      detail: "system ownership recovery guidance",
-    });
-
-    await expect(recover("restarted")).rejects.toThrow("system ownership recovery guidance");
   });
 });
