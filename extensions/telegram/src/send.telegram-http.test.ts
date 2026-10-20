@@ -21,6 +21,7 @@ import { sendLogger } from "./send-context.js";
 import {
   createForumTopicTelegram,
   deleteMessageTelegram,
+  deleteForumTopicTelegram,
   editForumTopicTelegram,
   editMessageTelegram,
   pinMessageTelegram,
@@ -678,6 +679,20 @@ describe("Telegram physical send acceptance over HTTP", () => {
       createForumTopicTelegram("@platformbound", "Bound topic", options),
     ).rejects.toThrow("Platform request authority revoked");
     expect(requests).toEqual([{ method: "getChat", fields: { chat_id: "@platformbound" } }]);
+  });
+
+  it("deletes a forum topic and refuses the General topic", async () => {
+    const opts = { cfg, api: bot.api };
+    await expect(deleteForumTopicTelegram("-100123", 77, opts)).resolves.toEqual({
+      ok: true,
+      chatId: "-100123",
+      messageThreadId: 77,
+    });
+    expect(requests).toEqual([
+      { method: "deleteForumTopic", fields: { chat_id: "-100123", message_thread_id: 77 } },
+    ]);
+    await expect(deleteForumTopicTelegram("-100123", 1, opts)).rejects.toThrow(/General/);
+    expect(requests).toHaveLength(1);
   });
 
   it("validates forum names by code points rather than UTF-16 length", async () => {
