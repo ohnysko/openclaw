@@ -21,6 +21,21 @@ import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db
 import { makeTempWorkspace } from "../../test-helpers/workspace.js";
 import { captureEnv, withEnvAsync } from "../../test-utils/env.js";
 import { stubNodeRuntime } from "../update-cli/update-command-runtime-recovery.test-support.js";
+import { expectNoCalls, expectPartialCall } from "./lifecycle-assertions.test-support.js";
+import type { DaemonInstallOptions } from "./types.js";
+
+const tokenConfig = (token?: string) => ({
+  gateway: { auth: { mode: "token", ...(token ? { token } : {}) } },
+});
+
+function expectText(output: string, included: string[], excluded: string[] = []) {
+  for (const text of included) {
+    expect(output).toContain(text);
+  }
+  for (const text of excluded) {
+    expect(output).not.toContain(text);
+  }
+}
 
 const { runtimeLogs, runtimeErrors, defaultRuntime, resetRuntimeCapture } = await vi.hoisted(
   async () => {
@@ -138,6 +153,17 @@ describe("runDaemonInstall integration", () => {
     return { contents, ino, mode, uid, entries: (await fs.readdir(tempHome)).toSorted() };
   }
 
+  async function expectPreservedConfig(
+    before: Awaited<ReturnType<typeof snapshotConfig>>,
+    message: string,
+    options: DaemonInstallOptions = { json: true, force: true },
+  ) {
+    await expect(runDaemonInstall(options)).rejects.toThrow("__exit__:1");
+    expect(runtimeLogs.join("\n")).toContain(message);
+    expectNoCalls(serviceMock.install);
+    expect(await snapshotConfig()).toEqual(before);
+  }
+
   beforeAll(async () => {
     envSnapshot = captureEnv([
       "HOME",
@@ -176,12 +202,11 @@ describe("runDaemonInstall integration", () => {
     process.env.OPENCLAW_GATEWAY_TOKEN = "";
     process.env.OPENCLAW_GATEWAY_PASSWORD = "";
     serviceMock.isLoaded.mockResolvedValue(false);
-    serviceMock.install.mockReset();
-    serviceMock.install.mockResolvedValue(undefined);
-    serviceMock.readDefinitionMutationCapability.mockReset();
-    serviceMock.readDefinitionMutationCapability.mockResolvedValue({ kind: "writable" });
-    serviceMock.readCommand.mockReset();
-    serviceMock.readCommand.mockResolvedValue(null);
+    serviceMock.install.mockReset().mockResolvedValue(undefined);
+    serviceMock.readDefinitionMutationCapability
+      .mockReset()
+      .mockResolvedValue({ kind: "writable" });
+    serviceMock.readCommand.mockReset().mockResolvedValue(null);
     await writeConfig({}, 2);
   });
 
@@ -326,86 +351,86 @@ describe("runDaemonInstall integration", () => {
         SUDO_USER: mode === "sudo user manager" ? "service-fixture" : undefined,
       },
       async () => {
-        await expect(runDaemonInstall({ json: true })).rejects.toThrow("__exit__:1");
-        expect(runtimeLogs.join("\n")).toContain(reason);
-        expect(serviceMock.isLoaded).not.toHaveBeenCalled();
-        expect(serviceMock.readCommand).not.toHaveBeenCalled();
-        expect(serviceMock.readDefinitionMutationCapability).not.toHaveBeenCalled();
-        expect(serviceMock.install).not.toHaveBeenCalled();
-        expect(await snapshotConfig()).toEqual(before);
+        await expectPreservedConfig(before, reason, { json: true });
+        expectNoCalls(
+          serviceMock.isLoaded,
+          serviceMock.readCommand,
+          serviceMock.readDefinitionMutationCapability,
+        );
       },
     );
   });
 
-  it.each([false])(
-    "explains unsafe publication permissions and recovers without bypassing SecretRefs (json=%s)",
-    async (json) => {
-      const fixture = await fs.realpath(
-        await fs.mkdtemp(path.join(tempHome, "private-path-canary-")),
-      );
-      const ancestor = path.join(fixture, ".config");
-      const config = {
-        gateway: {
-          auth: {
-            mode: "token",
-            token: { source: "env", provider: "default", id: "MISSING_GATEWAY_TOKEN" },
-          },
+  it("explains unsafe publication permissions and recovers without bypassing SecretRefs", async () => {
+    const fixture = await fs.realpath(
+      await fs.mkdtemp(path.join(tempHome, "private-path-canary-")),
+    );
+    const ancestor = path.join(fixture, ".config");
+    const config = {
+      gateway: {
+        auth: {
+          mode: "token",
+          token: { source: "env", provider: "default", id: "MISSING_GATEWAY_TOKEN" },
         },
-      };
-      await fs.mkdir(ancestor);
-      await fs.chmod(ancestor, 0o777);
-      await writeConfig(config);
-      busctl.mockResolvedValue({
-        code: 1,
-        termination: "exit",
-        stdout: "",
-        stderr: "Call failed: Unit openclaw-gateway.service not found.",
-      });
-      const env = { ...process.env, HOME: fixture, OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway" };
-      serviceMock.readCommand.mockImplementation((_env, options) =>
-        readUserSystemdServiceExecStart(env, options),
+      },
+    };
+    await fs.mkdir(ancestor);
+    await fs.chmod(ancestor, 0o777);
+    await writeConfig(config);
+    busctl.mockResolvedValue({
+      code: 1,
+      termination: "exit",
+      stdout: "",
+      stderr: "Call failed: Unit openclaw-gateway.service not found.",
+    });
+    const env = { ...process.env, HOME: fixture, OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway" };
+    serviceMock.readCommand.mockImplementation((_env, options) =>
+      readUserSystemdServiceExecStart(env, options),
+    );
+    serviceMock.readDefinitionMutationCapability.mockImplementation(() =>
+      readSystemdDefinitionMutationCapability(env, {
+        systemdReadTarget: {
+          scope: "user",
+          unitName: "openclaw-gateway.service",
+          unitPath: resolveSystemdUnitPath(env),
+        },
+      }),
+    );
+    // Admit local runtime intent without depending on an earlier install test.
+    await runtimePinState.withDaemonRuntimePinMigration(process.env, () => undefined);
+    const before = await snapshotConfig();
+    try {
+      await expect(runDaemonInstall({ json: false, force: true })).rejects.toThrow("__exit__:1");
+      expect(await snapshotConfig()).toEqual(before);
+      expect(await fs.readdir(ancestor)).toEqual([]);
+      expect(serviceMock.install).not.toHaveBeenCalled();
+      const output = [...runtimeLogs, ...runtimeErrors].join("\n");
+      expectText(
+        output,
+        [
+          "SERVICE_DEFINITION_UNKNOWN",
+          "unsafe-permissions",
+          "service directory",
+          "group/world-writable",
+          "chmod go-w",
+        ],
+        ["private-path-canary", "MISSING_GATEWAY_TOKEN"],
       );
-      serviceMock.readDefinitionMutationCapability.mockImplementation(() =>
-        readSystemdDefinitionMutationCapability(env, {
-          systemdReadTarget: {
-            scope: "user",
-            unitName: "openclaw-gateway.service",
-            unitPath: resolveSystemdUnitPath(env),
-          },
-        }),
-      );
-      // Admit local runtime intent without depending on an earlier install test.
-      await runtimePinState.withDaemonRuntimePinMigration(process.env, () => undefined);
-      const before = await snapshotConfig();
-      try {
-        await expect(runDaemonInstall({ json, force: true })).rejects.toThrow("__exit__:1");
-        expect(await snapshotConfig()).toEqual(before);
-        expect(await fs.readdir(ancestor)).toEqual([]);
-        expect(serviceMock.install).not.toHaveBeenCalled();
-        const output = [...runtimeLogs, ...runtimeErrors].join("\n");
-        expect(output).toContain("SERVICE_DEFINITION_UNKNOWN");
-        expect(output).toContain("unsafe-permissions");
-        expect(output).toContain("service directory");
-        expect(output).toContain("group/world-writable");
-        expect(output).toContain("chmod go-w");
-        expect(output).not.toContain("private-path-canary");
-        expect(output).not.toContain("MISSING_GATEWAY_TOKEN");
 
-        await fs.chmod(ancestor, 0o700);
-        resetRuntimeCapture();
-        await expect(runDaemonInstall({ json, force: true })).rejects.toThrow("__exit__:1");
-        const recovered = [...runtimeLogs, ...runtimeErrors].join("\n");
-        expect(recovered).not.toContain("SERVICE_DEFINITION_UNKNOWN");
-        expect(recovered).toContain("SecretRef is configured but unresolved");
-        expect((await readJson(configPath)).gateway).toEqual({ ...config.gateway, mode: "local" });
-        expect(await fs.readdir(ancestor)).toEqual([]);
-        expect(serviceMock.install).not.toHaveBeenCalled();
-      } finally {
-        await fs.chmod(ancestor, 0o700);
-        await fs.rm(fixture, { recursive: true, force: true });
-      }
-    },
-  );
+      await fs.chmod(ancestor, 0o700);
+      resetRuntimeCapture();
+      await expect(runDaemonInstall({ json: false, force: true })).rejects.toThrow("__exit__:1");
+      const recovered = [...runtimeLogs, ...runtimeErrors].join("\n");
+      expect(recovered).not.toContain("SERVICE_DEFINITION_UNKNOWN");
+      expect(recovered).toContain("SecretRef is configured but unresolved");
+      expect((await readJson(configPath)).gateway).toEqual({ ...config.gateway, mode: "local" });
+      expect(await fs.readdir(ancestor)).toEqual([]);
+      expect(serviceMock.install).not.toHaveBeenCalled();
+    } finally {
+      await fs.chmod(ancestor, 0o700);
+      await fs.rm(fixture, { recursive: true, force: true });
+    }
+  });
 
   it("names an unreadable Linux unit without changing config or replacing it", async () => {
     const unit = path.join(accountHome, ".config/systemd/user/openclaw-gateway.service");
@@ -419,13 +444,9 @@ describe("runDaemonInstall integration", () => {
     serviceMock.readCommand.mockImplementation(readUserSystemdServiceExecStart);
     serviceMock.isLoaded.mockRejectedValue(new Error("Failed to get unit file state"));
     const before = await snapshotConfig();
-    await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
+    await expectPreservedConfig(before, "unreadable");
     const output = runtimeLogs.join("\n");
-    expect(output).toContain(JSON.stringify(unit).slice(1, -1));
-    expect(output).toContain("unreadable");
-    expect(output).not.toContain("private-native-error-canary");
-    expect(await snapshotConfig()).toEqual(before);
-    expect(serviceMock.install).not.toHaveBeenCalled();
+    expectText(output, [JSON.stringify(unit).slice(1, -1)], ["private-native-error-canary"]);
     expect(serviceMock.isLoaded).not.toHaveBeenCalled();
   });
 
@@ -453,10 +474,7 @@ describe("runDaemonInstall integration", () => {
       `[Service]\nEnvironment=OPENCLAW_STATE_DIR=${effectiveState}\nEnvironmentFile=\nEnvironmentFile=${effectiveFile}\n`,
       { mode: 0o600 },
     );
-    await fs.writeFile(
-      configPath,
-      JSON.stringify({ gateway: { auth: { mode: "token", token: "existing-token" } } }),
-    );
+    await fs.writeFile(configPath, JSON.stringify(tokenConfig("existing-token")));
     process.env.HOME = fixture;
     process.env.OPENCLAW_STATE_DIR = plannedState;
     process.env.OPENCLAW_CONFIG_PATH = path.join(plannedState, "openclaw.json");
@@ -499,10 +517,7 @@ describe("runDaemonInstall integration", () => {
     });
     const before = await snapshotConfig();
     try {
-      await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
-      expect(await snapshotConfig()).toEqual(before);
-      expect(serviceMock.install).not.toHaveBeenCalled();
-      expect(runtimeLogs.join("\n")).toContain("SERVICE_DEFINITION_SEALED");
+      await expectPreservedConfig(before, "SERVICE_DEFINITION_SEALED");
       expect((await fs.readdir(plannedState)).toSorted()).toEqual([
         "control",
         "gateway.systemd.env",
@@ -521,19 +536,7 @@ describe("runDaemonInstall integration", () => {
   });
 
   it("refuses service install when config was written by a newer OpenClaw", async () => {
-    await writeConfig(
-      {
-        meta: {
-          lastTouchedVersion: "9999.1.1",
-        },
-        gateway: {
-          auth: {
-            mode: "token",
-          },
-        },
-      },
-      2,
-    );
+    await writeConfig({ ...tokenConfig(), meta: { lastTouchedVersion: "9999.1.1" } }, 2);
 
     await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
 
@@ -542,7 +545,7 @@ describe("runDaemonInstall integration", () => {
   });
 
   it("refuses loaded-service auto-refresh before persisting missing gateway defaults", async () => {
-    await writeConfig({ gateway: { auth: { mode: "token", token: "existing-token" } } });
+    await writeConfig(tokenConfig("existing-token"));
     serviceMock.isLoaded.mockResolvedValue(true);
     serviceMock.readCommand.mockResolvedValue({
       programArguments: ["openclaw", "gateway", "run"],
@@ -554,16 +557,12 @@ describe("runDaemonInstall integration", () => {
     });
     const before = await snapshotConfig();
 
-    await expect(runDaemonInstall({ json: true })).rejects.toThrow("__exit__:1");
-
-    expect(runtimeLogs.join("\n")).toContain("SERVICE_DEFINITION_SEALED");
-    expect(serviceMock.install).not.toHaveBeenCalled();
-    expect(await snapshotConfig()).toEqual(before);
+    await expectPreservedConfig(before, "SERVICE_DEFINITION_SEALED", { json: true });
   });
 
   it("refuses a loaded service's sealed effective state before persisting config or a token", async () => {
     const effectiveStateDir = path.join(tempHome, "sealed-service-state");
-    await writeConfig({ gateway: { auth: { mode: "token" } } });
+    await writeConfig(tokenConfig());
     serviceMock.isLoaded.mockResolvedValue(true);
     serviceMock.readCommand.mockResolvedValue({
       programArguments: ["openclaw", "gateway", "run"],
@@ -576,17 +575,11 @@ describe("runDaemonInstall integration", () => {
     );
     const before = await snapshotConfig();
 
-    await expect(runDaemonInstall({ json: true, force: true })).rejects.toThrow("__exit__:1");
-
-    expect(serviceMock.readDefinitionMutationCapability).toHaveBeenCalledWith(
-      expect.objectContaining({
-        env: expect.objectContaining({ OPENCLAW_STATE_DIR: tempHome }),
-        environment: expect.objectContaining({ OPENCLAW_STATE_DIR: effectiveStateDir }),
-      }),
-    );
-    expect(await snapshotConfig()).toEqual(before);
-    expect(serviceMock.install).not.toHaveBeenCalled();
-    expect(runtimeLogs.join("\n")).toContain("SERVICE_DEFINITION_SEALED");
+    await expectPreservedConfig(before, "SERVICE_DEFINITION_SEALED");
+    expectPartialCall(serviceMock.readDefinitionMutationCapability, {
+      env: expect.objectContaining({ OPENCLAW_STATE_DIR: tempHome }),
+      environment: expect.objectContaining({ OPENCLAW_STATE_DIR: effectiveStateDir }),
+    });
   });
 
   it("preserves absent config and shared state while admitting local intent for rejected definition inspection", async () => {
@@ -624,16 +617,7 @@ describe("runDaemonInstall integration", () => {
   });
 
   it("auto-mints token when no source exists without embedding it into service env", async () => {
-    await writeConfig(
-      {
-        gateway: {
-          auth: {
-            mode: "token",
-          },
-        },
-      },
-      2,
-    );
+    await writeConfig(tokenConfig(), 2);
     serviceMock.isLoaded.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
 
     await runDaemonInstall({});
@@ -708,9 +692,7 @@ describe("runDaemonInstall integration", () => {
     );
 
     it("orders Gateway mode warning, installed result, and reinstall hint in plain text", async () => {
-      await writeConfig({
-        gateway: { auth: { mode: "token", token: "existing-token" } },
-      });
+      await writeConfig(tokenConfig("existing-token"));
       serviceMock.isLoaded.mockResolvedValue(true);
       serviceMock.readCommand.mockResolvedValue(await createInstalledServiceCommand());
 

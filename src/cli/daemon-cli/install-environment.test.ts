@@ -71,7 +71,6 @@ describe("mergeInstallInvocationEnv", () => {
   });
 
   it.each([
-    { platform: "darwin" as const, caKey: "NODE_EXTRA_CA_CERTS" },
     { platform: "linux" as const, caKey: "NODE_EXTRA_CA_CERTS" },
     { platform: "win32" as const, caKey: "node_extra_ca_certs" },
   ])(

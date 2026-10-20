@@ -69,6 +69,24 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 let originalArgv: string[];
 let entrypoint: string;
 
+function parseInstall(args: string[]) {
+  const program = new Command().name("openclaw");
+  addGatewayServiceCommands(program.command("gateway"));
+  return program.parseAsync(["gateway", "install", ...args], { from: "user" });
+}
+
+async function expectExit(operation: () => Promise<unknown>) {
+  const exit = new ExitError(1);
+  await defaultRuntime.exit.withImplementation(
+    () => {
+      throw exit;
+    },
+    async () => {
+      await expect(operation()).rejects.toBe(exit);
+    },
+  );
+}
+
 describe("registered gateway install runtime default", () => {
   it("uses the running Bun on first install when Node is unavailable", async () => {
     const execPath = Object.getOwnPropertyDescriptor(process, "execPath")!;
@@ -87,11 +105,7 @@ describe("registered gateway install runtime default", () => {
     };
     const probe = vi.spyOn(runtimePaths, "resolveBunRuntimeInfo").mockResolvedValue(supported);
     try {
-      const program = new Command().name("openclaw");
-      addGatewayServiceCommands(program.command("gateway"));
-      await program.parseAsync(["gateway", "install", "--force", "--port", "29453", "--json"], {
-        from: "user",
-      });
+      await parseInstall(["--force", "--port", "29453", "--json"]);
       expect(runtimeErrors).toEqual([]);
       expect(service.install).toHaveBeenCalledOnce();
       const [installed] = service.install.mock.calls[0]!;
@@ -145,10 +159,8 @@ beforeEach(async () => {
   clearRuntimeConfigSnapshot();
   resetRuntimeCapture();
   executor.current = true;
-  service.install.mockReset();
-  service.install.mockResolvedValue(undefined);
-  service.readCommand.mockReset();
-  service.readCommand.mockResolvedValue(null);
+  service.install.mockReset().mockResolvedValue(undefined);
+  service.readCommand.mockReset().mockResolvedValue(null);
   await fs.writeFile(
     path.join(state, "openclaw.json"),
     JSON.stringify({ gateway: { mode: "local", auth: { mode: "none" } } }),
@@ -191,22 +203,7 @@ describe("update executor failure reporting", () => {
     service.readCommand.mockRejectedValue(
       new ServiceStartRefusalError({ reason: "disabled-no-start", message }),
     );
-    const exit = new ExitError(1);
-    await defaultRuntime.exit.withImplementation(
-      () => {
-        throw exit;
-      },
-      async () => {
-        const program = new Command().name("openclaw");
-        addGatewayServiceCommands(program.command("gateway"));
-        await expect(
-          program.parseAsync(
-            ["gateway", "install", "--force", "--json", "--update-executor", "run"],
-            { from: "user" },
-          ),
-        ).rejects.toBe(exit);
-      },
-    );
+    await expectExit(() => parseInstall(["--force", "--json", "--update-executor", "run"]));
     expect(JSON.parse(runtimeLogs[0]!)).toMatchObject({
       ok: false,
       error: `SERVICE_DEFINITION_UNKNOWN: ${message}`,
@@ -249,18 +246,10 @@ describe("update executor failure reporting", () => {
           "recovery-pending",
         );
       }
-      const exit = new ExitError(1);
-      await defaultRuntime.exit.withImplementation(
-        () => {
-          throw exit;
-        },
-        async () => {
-          await expect(
-            runGatewayServiceUpdateCommand("run", "install", async () => {
-              createDaemonActionContext({ action: "install", json: true }).fail(String(error));
-            }),
-          ).rejects.toBe(exit);
-        },
+      await expectExit(() =>
+        runGatewayServiceUpdateCommand("run", "install", async () => {
+          createDaemonActionContext({ action: "install", json: true }).fail(String(error));
+        }),
       );
       const reported = JSON.parse(runtimeLogs[0]!).error;
       expect(reported).toContain(
@@ -311,27 +300,12 @@ describe("registered gateway install --force wrapper selection", () => {
         vi.spyOn(runtimePaths, "resolvePreferredNodePath").mockResolvedValue(undefined);
       }
       defaultRuntime.exit.mockClear();
-      const exit = new ExitError(1);
-      await defaultRuntime.exit.withImplementation(
-        () => {
-          throw exit;
-        },
-        async () => {
-          const program = new Command().name("openclaw");
-          addGatewayServiceCommands(program.command("gateway"));
-          await expect(
-            program.parseAsync(
-              [
-                "gateway",
-                "install",
-                "--force",
-                "--json",
-                ...(reason === "blank-wrapper" ? ["--wrapper", " "] : ["--runtime", "node"]),
-              ],
-              { from: "user" },
-            ),
-          ).rejects.toBe(exit);
-        },
+      await expectExit(() =>
+        parseInstall([
+          "--force",
+          "--json",
+          ...(reason === "blank-wrapper" ? ["--wrapper", " "] : ["--runtime", "node"]),
+        ]),
       );
       expect(defaultRuntime.exit).toHaveBeenCalledExactlyOnceWith(1);
       expect(runtimeLogs).toHaveLength(1);

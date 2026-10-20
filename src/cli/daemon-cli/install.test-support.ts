@@ -163,17 +163,7 @@ vi.mock("../../runtime.js", () => ({
   defaultRuntime,
 }));
 
-function expectFields(value: unknown, expected: Record<string, unknown>): void {
-  if (!value || typeof value !== "object") {
-    throw new Error("expected fields object");
-  }
-  const record = value as Record<string, unknown>;
-  for (const [key, expectedValue] of Object.entries(expected)) {
-    expect(record[key], key).toEqual(expectedValue);
-  }
-}
-
-function readFirstInstallPlanArg(): Record<string, unknown> {
+export function readFirstInstallPlanArg(): Record<string, unknown> {
   const [firstArg] = buildGatewayInstallPlanMock.mock.calls[0] ?? [];
   if (!firstArg) {
     throw new Error("Expected gateway install plan arg");
@@ -181,51 +171,28 @@ function readFirstInstallPlanArg(): Record<string, unknown> {
   return firstArg as Record<string, unknown>;
 }
 
-function readFirstNodeStartupTlsEnvironmentArg(): Record<string, unknown> {
-  const [params] = resolveNodeStartupTlsEnvironmentMock.mock.calls[0] ?? [];
-  if (!params || typeof params !== "object") {
-    throw new Error("expected node startup TLS environment params");
-  }
-  return params as Record<string, unknown>;
+export function expectLastEmittedResult(result: string): void {
+  expect(actionState.emitted.at(-1)).toMatchObject({ result });
 }
 
-function expectLastEmittedResult(result: string): void {
-  expectFields(actionState.emitted.at(-1), { result });
-}
-
-const { runDaemonInstall } = await import("./install.js");
+export const { runDaemonInstall } = await import("./install.js");
 const envSnapshot = captureFullEnv();
 
 export function setupInstallTests() {
   beforeEach(() => {
     pinSnapshotMock.mockReset().mockReturnValue({ revision: "empty", stored: false });
     pinMigrationMock.mockReset().mockResolvedValue(undefined);
-    runExecMock.mockReset();
-    runExecMock.mockResolvedValue(nodeProbeOutput("26.8.1"));
-    resolveNodeStartupTlsEnvironmentMock.mockReset();
-    readConfigFileSnapshotMock.mockReset();
+    runExecMock.mockReset().mockResolvedValue(nodeProbeOutput("26.8.1"));
     resolveGatewayPortMock.mockClear();
     mockSystemAccountHome();
     replaceConfigFileMock.mockReset();
-    resolveGatewayAuthMock.mockReset();
-    resolveGatewayBindHostMock.mockReset();
-    resolveSecretRefValuesMock.mockReset();
-    randomTokenMock.mockReset();
-    buildGatewayInstallPlanMock.mockReset();
-    isGatewayDaemonRuntimeMock.mockReset();
-    installDaemonServiceAndEmitMock.mockReset();
     ensureConfigReadyMock.mockReset();
-    service.isLoaded.mockReset();
-    service.stage.mockReset();
-    service.install.mockReset();
-    service.readDefinitionMutationCapability.mockReset();
-    service.readCommand.mockReset();
     resetRuntimeCapture();
     actionState.warnings.length = 0;
     actionState.emitted.length = 0;
     actionState.failed.length = 0;
 
-    readConfigFileSnapshotMock.mockResolvedValue({
+    readConfigFileSnapshotMock.mockReset().mockResolvedValue({
       exists: false,
       valid: true,
       config: {},
@@ -233,24 +200,24 @@ export function setupInstallTests() {
     });
     resolveGatewayPortMock.mockReturnValue(18789);
     delete process.env.OPENCLAW_NIX_MODE;
-    resolveGatewayAuthMock.mockReturnValue({
+    resolveGatewayAuthMock.mockReset().mockReturnValue({
       mode: "token",
       token: undefined,
       password: undefined,
       allowTailscale: false,
     });
-    resolveGatewayBindHostMock.mockResolvedValue("127.0.0.1");
-    resolveSecretRefValuesMock.mockResolvedValue(new Map());
-    randomTokenMock.mockReturnValue("generated-token");
-    buildGatewayInstallPlanMock.mockImplementation(createInstallPlanFixture);
-    isGatewayDaemonRuntimeMock.mockReturnValue(true);
-    installDaemonServiceAndEmitMock.mockResolvedValue(undefined);
-    service.isLoaded.mockResolvedValue(false);
-    service.stage.mockResolvedValue(undefined);
-    service.install.mockResolvedValue(undefined);
-    service.readDefinitionMutationCapability.mockResolvedValue({ kind: "writable" });
-    service.readCommand.mockResolvedValue(null);
-    resolveNodeStartupTlsEnvironmentMock.mockReturnValue({
+    resolveGatewayBindHostMock.mockReset().mockResolvedValue("127.0.0.1");
+    resolveSecretRefValuesMock.mockReset().mockResolvedValue(new Map());
+    randomTokenMock.mockReset().mockReturnValue("generated-token");
+    buildGatewayInstallPlanMock.mockReset().mockImplementation(createInstallPlanFixture);
+    isGatewayDaemonRuntimeMock.mockReset().mockReturnValue(true);
+    installDaemonServiceAndEmitMock.mockReset().mockResolvedValue(undefined);
+    service.isLoaded.mockReset().mockResolvedValue(false);
+    service.stage.mockReset().mockResolvedValue(undefined);
+    service.install.mockReset().mockResolvedValue(undefined);
+    service.readDefinitionMutationCapability.mockReset().mockResolvedValue({ kind: "writable" });
+    service.readCommand.mockReset().mockResolvedValue(null);
+    resolveNodeStartupTlsEnvironmentMock.mockReset().mockReturnValue({
       NODE_EXTRA_CA_CERTS: undefined,
       NODE_USE_SYSTEM_CA: undefined,
     });
@@ -266,21 +233,16 @@ export function setupInstallTests() {
 export {
   actionState,
   buildGatewayInstallPlanMock,
-  expectFields,
-  expectLastEmittedResult,
   ensureConfigReadyMock,
   installDaemonServiceAndEmitMock,
   isGatewayDaemonRuntimeMock,
+  pinSnapshotMock,
+  pinMigrationMock,
   readConfigFileSnapshotMock,
-  readFirstInstallPlanArg,
-  readFirstNodeStartupTlsEnvironmentArg,
   replaceConfigFileMock,
   resolveGatewayAuthMock,
   resolveGatewayBindHostMock,
   resolveNodeStartupTlsEnvironmentMock,
-  runDaemonInstall,
   runExecMock,
   service,
 };
-
-export { pinSnapshotMock, pinMigrationMock };
