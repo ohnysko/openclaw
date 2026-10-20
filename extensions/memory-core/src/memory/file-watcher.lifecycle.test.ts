@@ -55,26 +55,23 @@ describe("Memory observation lifecycle", () => {
     await state.cleanup();
   });
   function owner({
-    onChange = vi.fn<() => void | Promise<void>>(),
-    extraPaths = [],
-    agentId = "main",
-    workspaceDir = state.workspaceDir,
     images = false,
-    runInBackgroundContext = AsyncLocalStorage.snapshot(),
-  }: {
+    extraPaths = [],
+    onChange = vi.fn<() => void | Promise<void>>(),
+    ...options
+  }: Partial<
+    Pick<MemoryFileWatcherOptions, "agentId" | "workspaceDir" | "runInBackgroundContext">
+  > & {
     onChange?: ReturnType<typeof vi.fn<() => void | Promise<void>>>;
     extraPaths?: MemoryFileWatcherOptions["settings"]["extraPaths"];
-    agentId?: string;
-    workspaceDir?: string;
     images?: boolean;
-    runInBackgroundContext?: MemoryFileWatcherOptions["runInBackgroundContext"];
   } = {}) {
     const onDirty = vi.fn();
     const onUnavailable = vi.fn();
     const watcher = new MemoryFileWatcher({
-      runInBackgroundContext,
-      workspaceDir,
-      agentId,
+      runInBackgroundContext: AsyncLocalStorage.snapshot(),
+      workspaceDir: state.workspaceDir,
+      agentId: "main",
       settings: {
         extraPaths,
         multimodal: {
@@ -87,6 +84,7 @@ describe("Memory observation lifecycle", () => {
       onChange,
       onDirty,
       onUnavailable,
+      ...options,
     });
     owners.push(watcher);
     return { watcher, onChange, onDirty, onUnavailable };
@@ -102,7 +100,7 @@ describe("Memory observation lifecycle", () => {
   function selectedPath(entry: Observation, file: string) {
     return path.relative(entry.root.rootDir, path.join(state.workspaceDir, file));
   }
-  function pauseDiscovery(once = false) {
+  function pauseDiscovery() {
     const entered = createDeferred<void>();
     const resume = createDeferred<void>();
     // oxlint-disable-next-line typescript/unbound-method -- Called with the intercepted policy receiver.
@@ -113,13 +111,36 @@ describe("Memory observation lifecycle", () => {
       await resume.promise;
       return groups;
     };
-    const spy = vi.spyOn(MemoryWatchPolicy.prototype, "observations");
-    if (once) {
-      spy.mockImplementationOnce(implementation);
-    } else {
-      spy.mockImplementation(implementation);
-    }
+    vi.spyOn(MemoryWatchPolicy.prototype, "observations").mockImplementationOnce(implementation);
     return { entered, resume };
+  }
+  function admissionGate() {
+    let accepting = true;
+    return {
+      runInBackgroundContext: <T>(run: () => T): T => {
+        if (!accepting) {
+          throw new Error("plugin instance retired");
+        }
+        return run();
+      },
+      reject(run: () => void) {
+        accepting = false;
+        try {
+          expect(run).not.toThrow();
+        } finally {
+          accepting = true;
+        }
+      },
+    };
+  }
+  function createdWhen(predicate = () => true) {
+    const created = createDeferred<void>();
+    observer.created = () => {
+      if (predicate()) {
+        created.resolve();
+      }
+    };
+    return created.promise;
   }
 
   it.each([
@@ -143,14 +164,12 @@ describe("Memory observation lifecycle", () => {
         });
         entry.health({ state: "ready", mode: "poll" });
       }
-      expect(watcher.health()).toEqual(
-        observer.observations.map(() =>
-          expect.objectContaining({
-            mode: "poll",
-            pollingFallback: poll !== "true",
-            pollIntervalMs: expected,
-          }),
-        ),
+      expect(watcher.health()).toMatchObject(
+        observer.observations.map(() => ({
+          mode: "poll",
+          pollingFallback: poll !== "true",
+          pollIntervalMs: expected,
+        })),
       );
     },
   );
@@ -262,31 +281,18 @@ describe("Memory observation lifecycle", () => {
   it.each(["invalidate", "health", "unavailable"] as const)(
     "retires rejected %s delivery without stranding a shared peer or retrying",
     async (notification) => {
-      let accepting = true;
-      const failure = new Error("plugin instance retired");
-      const retired = await start({
-        runInBackgroundContext: (run) => {
-          if (!accepting) {
-            throw failure;
-          }
-          return run();
-        },
-      });
+      const gate = admissionGate();
+      const retired = await start(gate);
       const healthy = await start({ agentId: "healthy" });
       expect(observer.observations).toHaveLength(1);
       const shared = observer.observations[0]!;
-      accepting = false;
-      try {
-        expect(() => {
-          if (notification === "invalidate") {
-            shared.dirty();
-          } else {
-            shared.health({ state: notification === "health" ? "ready" : "unavailable" });
-          }
-        }).not.toThrow();
-      } finally {
-        accepting = true;
-      }
+      gate.reject(() => {
+        if (notification === "invalidate") {
+          shared.dirty();
+        } else {
+          shared.health({ state: notification === "health" ? "ready" : "unavailable" });
+        }
+      });
       expect(calls(retired.onUnavailable, retired.onDirty)).toEqual([1, 1]);
       expect(retired.watcher.health()).toEqual([]);
       if (notification !== "unavailable") {
@@ -294,14 +300,9 @@ describe("Memory observation lifecycle", () => {
       }
 
       // Cleanup may enter the owner again; that must not restart ordinary observation.
-      const recovered = createDeferred<void>();
-      if (notification === "unavailable") {
-        observer.created = () => recovered.resolve();
-      }
+      const recovered = notification === "unavailable" ? createdWhen() : undefined;
       await vi.advanceTimersByTimeAsync(20_000);
-      if (notification === "unavailable") {
-        await recovered.promise;
-      }
+      await recovered;
       expect(observer.observations).toHaveLength(notification === "unavailable" ? 2 : 1);
       expect(retired.watcher.health()).toEqual([]);
       expect(retired.onChange).not.toHaveBeenCalled();
@@ -313,25 +314,15 @@ describe("Memory observation lifecycle", () => {
   );
 
   it("joins physical retirement failures after background admission closes", async () => {
-    let accepting = true;
     const physical = createDeferred<void>();
     observer.closeBarrier = physical.promise;
-    const { watcher } = await start({
-      runInBackgroundContext: (run) => {
-        if (!accepting) {
-          throw new Error("plugin instance retired");
-        }
-        return run();
-      },
-    });
-    accepting = false;
+    const gate = admissionGate();
+    const { watcher } = await start(gate);
     try {
-      expect(() => observer.observations[0]!.dirty()).not.toThrow();
+      gate.reject(() => observer.observations[0]!.dirty());
     } catch (error) {
       physical.resolve();
       throw error;
-    } finally {
-      accepting = true;
     }
     let settled = false;
     const closing = watcher.close().finally(() => {
@@ -409,15 +400,10 @@ describe("Memory observation lifecycle", () => {
         false,
       ]);
 
-      const recovered = createDeferred<void>();
       const entries = () => observer.observations.filter((entry) => entry.root.rootDir === parent);
-      observer.created = () => {
-        if (entries().length === 3) {
-          recovered.resolve();
-        }
-      };
+      const recovered = createdWhen(() => entries().length === 3);
       await vi.advanceTimersByTimeAsync(500);
-      await recovered.promise;
+      await recovered;
       const independent = entries().slice(1);
       const healthyEntry = independent.find(
         (entry) => entry.options.scopes[0]?.path === "healthy",
@@ -480,8 +466,8 @@ describe("Memory observation lifecycle", () => {
     expect(warnings).toHaveBeenCalledWith(
       expect.stringContaining(code ?? "fs-safe did not report a reason"),
     );
-    expect(watcher.health()).toEqual([
-      expect.objectContaining({ mode: "poll", pollingFallback: true, pollIntervalMs: 30_000 }),
+    expect(watcher.health()).toMatchObject([
+      { mode: "poll", pollingFallback: true, pollIntervalMs: 30_000 },
     ]);
     expect(onUnavailable).not.toHaveBeenCalled();
     if (failure) {
@@ -575,7 +561,7 @@ describe("Memory observation lifecycle", () => {
 
   it("does not rearm when watch-limit retires observation during source discovery", async () => {
     const { watcher, entry } = await start();
-    const { entered, resume } = pauseDiscovery(true);
+    const { entered, resume } = pauseDiscovery();
     entry.dirty();
     await entered.promise;
     try {
@@ -648,12 +634,11 @@ describe("Memory observation lifecycle", () => {
     expect(onUnavailable).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(500);
     expect(calls(onChange, observer.watch)).toEqual([1, 1]);
-    const acquired = createDeferred<void>();
-    observer.created = () => acquired.resolve();
+    const acquired = createdWhen();
     observer.closeBarrier = undefined;
     physical.resolve();
     await vi.advanceTimersByTimeAsync(500);
-    await acquired.promise;
+    await acquired;
     expect(observer.observations[1]!.root).toBe(old.root);
     const count = onChange.mock.calls.length;
     observer.observations[1]!.dirty();

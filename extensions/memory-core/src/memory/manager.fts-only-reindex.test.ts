@@ -79,6 +79,16 @@ function missingProviderAuth() {
   );
 }
 
+type ManagerInternals = {
+  writeMeta(meta: MemoryIndexMeta): Promise<void>;
+  awaitManagerIdle(): Promise<void>;
+  syncMemoryFiles(params: { needsFullReindex: boolean }): Promise<unknown>;
+  loadVectorExtension(): Promise<boolean>;
+  embeddingBootstrapFailure?: unknown;
+  provider?: { id: string } | null;
+};
+const internals = (manager: MemoryIndexManager) => manager as unknown as ManagerInternals;
+
 vi.mock("./embeddings.js", () => ({
   createEmbeddingProvider: createProvider,
   resolveEmbeddingProviderAdapterTransport: (providerId: string) =>
@@ -98,7 +108,15 @@ describe("memory manager FTS-only reindex", () => {
     const now = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     restoreClocks.push(() => clock.mockRestore());
-    return { now, clock };
+    return {
+      now,
+      clock,
+      recoverProvider(elapsed = 31_000) {
+        providerConstructionError = null;
+        providerAvailable = true;
+        clock.mockReturnValue(now + elapsed);
+      },
+    };
   }
   const keywordResult = [expect.objectContaining({ path: "MEMORY.md", source: "memory" })];
   const activeProvider = { mode: "active", providerId: "openai" };
@@ -133,6 +151,22 @@ describe("memory manager FTS-only reindex", () => {
     providerConstructionGate = barrier.promise;
     return () => barrier.resolve();
   }
+  async function searchWithDebug(manager: MemoryIndexManager) {
+    const debug: unknown[] = [];
+    const results = await manager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) });
+    return { results, debug };
+  }
+  async function writeMemory(text: string) {
+    await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), text);
+  }
+  async function closeManager(manager: MemoryIndexManager) {
+    await manager.close();
+    await closeAllMemorySearchManagers();
+  }
+  async function searchAndSettle(manager: MemoryIndexManager) {
+    await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
+    await internals(manager).awaitManagerIdle();
+  }
 
   beforeAll(async () => {
     fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-mem-fts-only-"));
@@ -149,7 +183,7 @@ describe("memory manager FTS-only reindex", () => {
     providerBatchCalls = 0;
     workspaceDir = path.join(fixtureRoot, `case-${caseId++}`);
     await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
-    await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), "Alpha topic\n\nKeep this note.");
+    await writeMemory("Alpha topic\n\nKeep this note.");
     vi.stubEnv("OPENCLAW_STATE_DIR", path.join(workspaceDir, "state"));
     indexPath = resolveOpenClawAgentSqlitePath({ agentId: "main" });
   });
@@ -187,10 +221,6 @@ describe("memory manager FTS-only reindex", () => {
       rememberAcrossConversations?: boolean;
     } = {},
   ): Promise<MemoryIndexManager> {
-    const store =
-      params.vectorEnabled === undefined
-        ? undefined
-        : { vector: { enabled: params.vectorEnabled } };
     const cfg = {
       // Provider construction is mocked here; avoid cold-loading real plugins during config resolution.
       plugins: { enabled: false },
@@ -201,7 +231,10 @@ describe("memory manager FTS-only reindex", () => {
           provider: params.provider,
           rememberAcrossConversations: params.rememberAcrossConversations,
           model: "",
-          store,
+          store:
+            params.vectorEnabled === undefined
+              ? undefined
+              : { vector: { enabled: params.vectorEnabled } },
           cache: { enabled: false },
         },
       },
@@ -235,10 +268,7 @@ describe("memory manager FTS-only reindex", () => {
   }
 
   async function writeExistingMeta(manager: MemoryIndexManager, model: string): Promise<void> {
-    const metaWriter = manager as unknown as {
-      writeMeta(meta: MemoryIndexMeta): Promise<void>;
-    };
-    await metaWriter.writeMeta({
+    await internals(manager).writeMeta({
       model,
       provider: "openai",
       chunkTokens: 600,
@@ -250,8 +280,7 @@ describe("memory manager FTS-only reindex", () => {
   it("keeps a reopened semantic index valid before discovering the provider model", async () => {
     const indexed = await indexedManager("openai");
     expect(indexed.status().chunks).toBeGreaterThan(0);
-    await indexed.close();
-    await closeAllMemorySearchManagers();
+    await closeManager(indexed);
     createProvider.mockClear();
 
     const reopened = await createManager({ provider: "openai", purpose: "status" });
@@ -264,22 +293,18 @@ describe("memory manager FTS-only reindex", () => {
   });
 
   it.each(["first search", "failed background sync"])(
-    "returns keyword matches after an embedding failure during %s",
+    "falls back to keyword matches after %s embedding failure",
     async (phase) => {
       providerAvailable = true;
       providerEmbeddingError = new Error("embedding request failed during bootstrap");
       const manager = await createManager();
-      const debug: unknown[] = [];
       if (phase === "failed background sync") {
         await expect(manager.sync({ reason: "watch" })).rejects.toThrow(
           "embedding request failed during bootstrap",
         );
       }
 
-      const results = await manager.search("Alpha topic", {
-        onDebug: (entry) => debug.push(entry),
-      });
-
+      const { results, debug } = await searchWithDebug(manager);
       expect(results).toEqual(keywordResult);
       expect(providerQueryCalls).toBe(0);
       expectBootstrap(debug, {
@@ -295,11 +320,9 @@ describe("memory manager FTS-only reindex", () => {
     providerAvailable = true;
     providerEmbeddingError = new Error("embedding request failed during bootstrap");
     const manager = await createManager();
-    const metadata = vi
-      .spyOn(manager as unknown as { writeMeta(meta: MemoryIndexMeta): Promise<void> }, "writeMeta")
-      .mockImplementationOnce(() => {
-        throw new Error("keyword publication failed");
-      });
+    const metadata = vi.spyOn(internals(manager), "writeMeta").mockImplementationOnce(() => {
+      throw new Error("keyword publication failed");
+    });
 
     await expect(manager.search("Alpha topic")).resolves.toEqual([]);
     await expect(manager.search("Alpha topic")).resolves.toEqual([]);
@@ -310,57 +333,43 @@ describe("memory manager FTS-only reindex", () => {
     await expect(manager.search("Alpha topic")).resolves.toEqual(keywordResult);
   });
 
-  it.each(["watch", "search maintenance"])(
-    "retains the original embedding cooldown after a quota failure in %s",
-    async (origin) => {
-      const manager = await indexedManager();
-      const idle = manager as unknown as { awaitManagerIdle(): Promise<void> };
-      const { now, clock } = mockClock();
-      quotaFailure();
-      await fs.writeFile(
-        path.join(workspaceDir, "MEMORY.md"),
-        "Alpha topic\n\nPending quota update.",
-      );
-      // The observation fixture leaves dirty notification to the test.
-      Reflect.set(manager, "dirty", true);
-      if (origin === "watch") {
-        await expect(manager.sync({ reason: "watch" })).rejects.toThrow(
-          "embedding quota exhausted",
-        );
-      } else {
-        await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
-        await idle.awaitManagerIdle();
-      }
-      const requestsAfterFailure = providerBatchCalls + providerQueryCalls;
+  it.each(["watch", "search maintenance"])("preserves quota cooldown after %s", async (origin) => {
+    const manager = await indexedManager();
+    const { now, clock } = mockClock();
+    quotaFailure();
+    await writeMemory("Alpha topic\n\nPending quota update.");
+    // The observation fixture leaves dirty notification to the test.
+    Reflect.set(manager, "dirty", true);
+    if (origin === "watch") {
+      await expect(manager.sync({ reason: "watch" })).rejects.toThrow("embedding quota exhausted");
+    } else {
+      await searchAndSettle(manager);
+    }
+    const requestsAfterFailure = providerBatchCalls + providerQueryCalls;
 
-      for (const elapsed of [10_000, 29_999]) {
-        clock.mockReturnValue(now + elapsed);
-        await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
-        await idle.awaitManagerIdle();
-        expect(providerBatchCalls + providerQueryCalls).toBe(requestsAfterFailure);
-        expect(manager.getCachedEmbeddingAvailability()?.cacheExpiresAtMs).toBe(now + 30_000);
-        expect(countChunksContaining("Pending quota update")).toBe(0);
-      }
+    for (const elapsed of [10_000, 29_999]) {
+      clock.mockReturnValue(now + elapsed);
+      await searchAndSettle(manager);
+      expect(providerBatchCalls + providerQueryCalls).toBe(requestsAfterFailure);
+      expect(manager.getCachedEmbeddingAvailability()?.cacheExpiresAtMs).toBe(now + 30_000);
+      expect(countChunksContaining("Pending quota update")).toBe(0);
+    }
 
-      providerEmbeddingError = null;
-      providerQueryError = null;
-      clock.mockReturnValue(now + 30_000);
-      await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
-      await idle.awaitManagerIdle();
-      expect(providerBatchCalls + providerQueryCalls).toBeGreaterThan(requestsAfterFailure);
-      expect(countChunksContaining("Pending quota update")).toBeGreaterThan(0);
-      expect(manager.status().custom?.providerState).toEqual(activeProvider);
-    },
-  );
+    providerEmbeddingError = null;
+    providerQueryError = null;
+    clock.mockReturnValue(now + 30_000);
+    await searchAndSettle(manager);
+    expect(providerBatchCalls + providerQueryCalls).toBeGreaterThan(requestsAfterFailure);
+    expect(countChunksContaining("Pending quota update")).toBeGreaterThan(0);
+    expect(manager.status().custom?.providerState).toEqual(activeProvider);
+  });
 
   it("updates a keyword-only index during the original embedding cooldown", async () => {
     const { now, clock } = mockClock();
     providerAvailable = true;
     quotaFailure();
     const manager = await createManager();
-    const idle = manager as unknown as { awaitManagerIdle(): Promise<void> };
-    await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
-    await idle.awaitManagerIdle();
+    await searchAndSettle(manager);
     const requestsAfterFailure = providerBatchCalls + providerQueryCalls;
 
     for (const [elapsed, marker] of [
@@ -368,10 +377,10 @@ describe("memory manager FTS-only reindex", () => {
       [29_999, "Delta keyword update"],
     ] as const) {
       clock.mockReturnValue(now + elapsed);
-      await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), `${marker}\n\nKeep this note.`);
+      await writeMemory(`${marker}\n\nKeep this note.`);
       Reflect.set(manager, "dirty", true);
       await manager.search(marker);
-      await idle.awaitManagerIdle();
+      await internals(manager).awaitManagerIdle();
       expect(providerBatchCalls + providerQueryCalls).toBe(requestsAfterFailure);
       expect(countChunksContaining(marker)).toBeGreaterThan(0);
       await expect(manager.search(marker)).resolves.toHaveLength(1);
@@ -413,28 +422,19 @@ describe("memory manager FTS-only reindex", () => {
 
   it("uses keyword search when provider construction fails against an existing semantic index", async () => {
     const credential = "sk-test-abcdefghijklmnopqrstuvwxyz123456";
-    const { now, clock } = mockClock();
+    const { recoverProvider } = mockClock();
     const firstManager = await indexedManager();
     await expect(firstManager.probeVectorAvailability()).resolves.toBe(true);
-    await firstManager.close();
-    await closeAllMemorySearchManagers();
+    await closeManager(firstManager);
     providerAvailable = false;
     providerConstructionError = missingProviderAuth();
     providerConstructionError.message += ` apiKey=${credential}`;
     const manager = await createManager();
-    const debug: unknown[] = [];
-
-    await expect(
-      manager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) }),
-    ).resolves.toEqual(keywordResult);
+    const { results, debug } = await searchWithDebug(manager);
+    expect(results).toEqual(keywordResult);
     expectBootstrap(debug, { degradedTo: "keyword-only" });
     expect(JSON.stringify(debug)).not.toContain(credential);
-    expect(
-      manager as unknown as {
-        embeddingBootstrapFailure?: unknown;
-        provider?: { id: string } | null;
-      },
-    ).toMatchObject({
+    expect(internals(manager)).toMatchObject({
       embeddingBootstrapFailure: expect.objectContaining({ degradedTo: "keyword-only" }),
       provider: null,
     });
@@ -445,9 +445,7 @@ describe("memory manager FTS-only reindex", () => {
       custom: { indexIdentity: { status: "valid" }, searchMode: "fts-only" },
     });
 
-    providerConstructionError = null;
-    providerAvailable = true;
-    clock.mockReturnValue(now + 31_000);
+    recoverProvider();
     await expect(manager.probeEmbeddingAvailability()).resolves.toEqual({ ok: true });
     await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
 
@@ -465,10 +463,8 @@ describe("memory manager FTS-only reindex", () => {
 
     providerConstructionError = null;
     clock.mockReturnValue(now + 31_000);
-    const debug: unknown[] = [];
-    await expect(
-      manager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) }),
-    ).resolves.toHaveLength(1);
+    const { results, debug } = await searchWithDebug(manager);
+    expect(results).toHaveLength(1);
     const callsAfterRetry = createProvider.mock.calls.length;
     await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
 
@@ -494,13 +490,11 @@ describe("memory manager FTS-only reindex", () => {
   });
 
   it("serializes provider construction when concurrent probes retry an expired failure", async () => {
-    const { now, clock } = mockClock();
+    const { recoverProvider } = mockClock();
     const manager = await failedBootstrap();
     const callsBeforeRetry = createProvider.mock.calls.length;
 
-    providerConstructionError = null;
-    providerAvailable = true;
-    clock.mockReturnValue(now + 31_000);
+    recoverProvider();
     const releaseProviderConstruction = constructionBarrier();
     const firstProbe = manager.probeEmbeddingAvailability();
     const secondProbe = manager.probeEmbeddingAvailability();
@@ -523,20 +517,14 @@ describe("memory manager FTS-only reindex", () => {
   });
 
   it("keeps keyword results when semantic recovery reindex fails", async () => {
-    const { now, clock } = mockClock();
+    const { now, clock, recoverProvider } = mockClock();
     const manager = await failedBootstrap();
-
-    providerConstructionError = null;
-    providerAvailable = true;
-    clock.mockReturnValue(now + 31_000);
+    recoverProvider();
     await expect(manager.probeEmbeddingAvailability()).resolves.toEqual({ ok: true });
     providerEmbeddingError = new Error("embedding request failed during rebuild");
     const queryCallsAfterProbe = providerQueryCalls;
-    const debug: unknown[] = [];
-
-    await expect(
-      manager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) }),
-    ).resolves.toHaveLength(1);
+    const { results, debug } = await searchWithDebug(manager);
+    expect(results).toHaveLength(1);
     expect(providerQueryCalls).toBe(queryCallsAfterProbe);
     expectBootstrap(debug, {
       degradedTo: "keyword-only",
@@ -545,12 +533,12 @@ describe("memory manager FTS-only reindex", () => {
     expect(JSON.stringify(debug)).not.toContain("No API key resolved");
     expect(manager.status().custom?.indexIdentity).toEqual({ status: "valid" });
 
-    for (const [elapsed, title, body] of [
-      [31_000, "Gamma fallback refresh", "Indexed while embeddings remain degraded."],
-      [62_000, "Delta fallback refresh", "Retry remains keyword-only while embeddings still fail."],
+    for (const [elapsed, title] of [
+      [31_000, "Gamma fallback refresh"],
+      [62_000, "Delta fallback refresh"],
     ] as const) {
       clock.mockReturnValue(now + elapsed);
-      await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), `${title}\n\n${body}`);
+      await writeMemory(title);
       await expect(manager.sync({ reason: "watch", force: true })).resolves.toBeUndefined();
       await expect(manager.search(title)).resolves.toHaveLength(1);
       expect(providerQueryCalls).toBe(queryCallsAfterProbe);
@@ -605,8 +593,7 @@ describe("memory manager FTS-only reindex", () => {
     ).run();
 
     await manager.sync({ force: true });
-    await manager.close();
-    await closeAllMemorySearchManagers();
+    await closeManager(manager);
 
     const reopened = await createManager({ provider: "none", purpose: "status" });
     expect(reopened.status()).toMatchObject({
@@ -664,21 +651,27 @@ describe("memory manager FTS-only reindex", () => {
   );
 
   it("removes chunks and FTS rows when the dirty source file is already deleted", async () => {
-    const seedDb = requireNativeSqliteDatabase(openOpenClawAgentDatabase({ agentId: "main" }).db);
-    expect(() => seedDb.loadExtension("not-a-real-extension")).toThrow(
-      "extension loading is not allowed",
-    );
-    const loaded = await loadSqliteVecExtension({ db: seedDb });
-    expect(() => seedDb.loadExtension("not-a-real-extension")).toThrow(
-      "extension loading is not allowed",
-    );
-    expect(() => seedDb.prepare("SELECT load_extension(?)").get("not-a-real-extension")).toThrow(
+    const db = requireNativeSqliteDatabase(openOpenClawAgentDatabase({ agentId: "main" }).db);
+    const read = (sql: string) => db.prepare(sql).get();
+    const countRows = (table: string, sourcePath?: string) =>
+      sourcePath === undefined
+        ? read(`SELECT COUNT(*) AS count FROM ${table}`)
+        : db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE path = ?`).get(sourcePath);
+    const expectVectorRows = () =>
+      expect(countRows("memory_index_chunks_vec")).toEqual({ count: 2 });
+    const expectExtensionBlocked = () =>
+      expect(() => db.loadExtension("not-a-real-extension")).toThrow(
+        "extension loading is not allowed",
+      );
+    expectExtensionBlocked();
+    const loaded = await loadSqliteVecExtension({ db });
+    expectExtensionBlocked();
+    expect(() => db.prepare("SELECT load_extension(?)").get("not-a-real-extension")).toThrow(
       "not authorized",
     );
     expect(loaded.ok, loaded.error).toBe(true);
-    const vectorExtensionPath = loaded.extensionPath;
-    ensureMemoryIndexSchema({ db: seedDb, cacheEnabled: false, ftsEnabled: true });
-    seedDb.exec(`
+    ensureMemoryIndexSchema({ db, cacheEnabled: false, ftsEnabled: true });
+    db.exec(`
         INSERT INTO memory_index_sources (path, source, hash, mtime, size)
           VALUES
             ('memory/deleted.md', 'memory', '', 200, 20),
@@ -691,19 +684,13 @@ describe("memory manager FTS-only reindex", () => {
            'fts-only', 'obsolete saffronquasar', x'', 200),
           ('chunk-ownerless', 'memory/ownerless.md', 'memory', 1, 2, 'ownerless-chunk-hash',
            'fts-only', 'obsolete ambercomet', x'', 190);
-        CREATE VIRTUAL TABLE memory_index_chunks_vec USING vec0(
-          id TEXT PRIMARY KEY,
-          embedding FLOAT[3]
-        );
+        CREATE VIRTUAL TABLE memory_index_chunks_vec USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[3]);
         INSERT INTO memory_index_chunks_vec VALUES ('chunk-canonical', '[1,0,0]');
         INSERT INTO memory_index_chunks_vec VALUES ('chunk-ownerless', '[0,1,0]');
         INSERT INTO memory_index_meta (key, value)
           VALUES ('memory_vector_rebuild_v1', 'clean');
-
       `);
-    expect(seedDb.prepare("SELECT COUNT(*) AS count FROM memory_index_chunks_vec").get()).toEqual({
-      count: 2,
-    });
+    expectVectorRows();
 
     const manager = await createManager({
       provider: "none",
@@ -713,9 +700,6 @@ describe("memory manager FTS-only reindex", () => {
     expect(manager.status().fts?.available).toBe(true);
     expect(Reflect.get(manager, "sessionsFullRetryDirty")).toBe(false);
 
-    const db = seedDb;
-    const countRows = (table: string, sourcePath: string) =>
-      db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE path = ?`).get(sourcePath);
     for (const file of ["deleted", "ownerless"]) {
       expect(
         db.prepare("SELECT hash FROM memory_index_sources WHERE path = ?").get(`memory/${file}.md`),
@@ -725,11 +709,7 @@ describe("memory manager FTS-only reindex", () => {
     expect(countRows("memory_index_chunks_fts", "memory/deleted.md")).toEqual({ count: 1 });
     expect(countRows("memory_index_chunks_fts", "memory/ownerless.md")).toEqual({ count: 1 });
 
-    await (
-      manager as unknown as {
-        syncMemoryFiles(params: { needsFullReindex: boolean }): Promise<unknown>;
-      }
-    ).syncMemoryFiles({ needsFullReindex: false });
+    await internals(manager).syncMemoryFiles({ needsFullReindex: false });
 
     for (const sourcePath of ["memory/deleted.md", "memory/ownerless.md"]) {
       for (const table of [
@@ -740,41 +720,26 @@ describe("memory manager FTS-only reindex", () => {
         expect(countRows(table, sourcePath), `${table}: ${sourcePath}`).toEqual({ count: 0 });
       }
     }
-    // Cleanup ran while vectors were disabled. Keep the old table untouched and
-    // persist a rebuild marker; one-sided orphan pruning would still miss vector
-    // rows that should exist but were never written.
+    // Disabled vectors retain their rows and record debt, including missing writes.
     expect(
-      db
-        .prepare("SELECT value FROM memory_index_meta WHERE key = 'memory_vector_rebuild_v1'")
-        .get(),
+      read("SELECT value FROM memory_index_meta WHERE key = 'memory_vector_rebuild_v1'"),
     ).toEqual({ value: "1" });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM memory_index_chunks_vec").get()).toEqual({
-      count: 2,
-    });
-    // Exercise the later vector-enabled load directly. Recreating the public
-    // manager here also tests unrelated provider/cache retirement lifecycles.
+    expectVectorRows();
+    // Reopen only the vector layer, not unrelated provider/cache lifecycles.
     const vectorState = Reflect.get(manager, "vector") as {
       available: boolean | null;
       enabled: boolean;
       extensionPath?: string;
     };
-    vectorState.enabled = true;
-    vectorState.available = true;
-    vectorState.extensionPath = vectorExtensionPath;
+    Object.assign(vectorState, {
+      enabled: true,
+      available: true,
+      extensionPath: loaded.extensionPath,
+    });
     Reflect.set(Reflect.get(manager, "database"), "vectorReady", null);
-    await expect(
-      (
-        manager as unknown as {
-          loadVectorExtension(): Promise<boolean>;
-        }
-      ).loadVectorExtension(),
-    ).resolves.toBe(false);
-    expect(db.prepare("SELECT vec_version() AS version").get()).toEqual({
-      version: expect.any(String),
-    });
-    expect(db.prepare("SELECT COUNT(*) AS count FROM memory_index_chunks_vec").get()).toEqual({
-      count: 2,
-    });
+    await expect(internals(manager).loadVectorExtension()).resolves.toBe(false);
+    expect(read("SELECT vec_version() AS version")).toEqual({ version: expect.any(String) });
+    expectVectorRows();
     expect(Reflect.get(manager, "memoryFullRetryDirty")).toBe(true);
   });
 });

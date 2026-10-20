@@ -21,7 +21,7 @@ import {
 import * as knn from "./manager-search-knn.js";
 import { insertKeywordFixture } from "./manager-search.test-support.js";
 
-const { closeAllMemorySearchManagers, getMemorySearchManager } = await import("./index.js");
+const fixture = createManagerIndexFixture(await import("./index.js"));
 
 const originalHelperId = "active-memory-mabc123-1a2b3c4d";
 const liveHelperId = "03b3e791-f9cc-4dbb-a806-b6ae72441042";
@@ -35,7 +35,7 @@ const helperPath = `sessions/main/${originalHelperId}.jsonl`;
 const expectedPaths = [memoryFilePath, ordinaryPath, unknownArchivePath].toSorted();
 type RetrievalMode = "keyword-only" | "hybrid KNN" | "hybrid embedding scan";
 type Writer = ReturnType<typeof memoryIndexFixtureWriter>;
-type Manager = NonNullable<Awaited<ReturnType<typeof getMemorySearchManager>>["manager"]>;
+type Manager = Awaited<ReturnType<typeof fixture.getFreshManager>>;
 const lexicalOptions = { lexicalOnly: true };
 const resultPaths = (entries: { path: string }[]) => entries.map((entry) => entry.path).toSorted();
 const sessionPath = (id: string) => `sessions/main/${id}.jsonl`;
@@ -53,9 +53,11 @@ function helperRows(writer: Writer, table: string, columns: string) {
     .prepare(`SELECT ${columns} FROM ${table} WHERE path = ? AND source = 'sessions'`)
     .all(helperPath);
 }
-function validRows(writer: Writer, table: string, columns: string, order: string) {
+function validRows(writer: Writer, table: "chunks" | "sources", columns: string, order: string) {
   return writer
-    .prepare(`SELECT ${columns} FROM ${table} WHERE path IN (?, ?, ?) ORDER BY ${order}`)
+    .prepare(
+      `SELECT ${columns} FROM memory_index_${table} WHERE path IN (?, ?, ?) ORDER BY ${order}`,
+    )
     .all(...expectedPaths);
 }
 function expectHelperPruned(writer: Writer) {
@@ -63,10 +65,6 @@ function expectHelperPruned(writer: Writer) {
   expect(helperRows(writer, "memory_index_chunks", "id")).toEqual([]);
 }
 
-const fixture = createManagerIndexFixture({
-  getMemorySearchManager,
-  closeAllMemorySearchManagers,
-});
 afterEach(() => vi.restoreAllMocks());
 const sessionScope = (sessionKey: string) => ({
   agentId: "main",
@@ -75,6 +73,11 @@ const sessionScope = (sessionKey: string) => ({
 });
 const archivedSessions = (sessionId: string) =>
   sessionMetadata.loadArchivedSessionsAsync({ ...sessionScope(""), sessionIds: [sessionId] });
+const setOwnership = (sessionId: string, sessionKey: string, pluginOwnerId?: string) =>
+  upsertSessionEntry({
+    ...sessionScope(sessionKey),
+    entry: { sessionId, updatedAt: Date.now(), ...(pluginOwnerId ? { pluginOwnerId } : {}) },
+  });
 async function archive(sessionId: string, sessionKey: string) {
   await expect(
     deleteSessionEntry({
@@ -86,9 +89,7 @@ async function archive(sessionId: string, sessionKey: string) {
   const name = (await fs.readdir(resolveSessionTranscriptsDirForAgent("main"))).find((entry) =>
     entry.startsWith(`${sessionId}.jsonl.deleted.`),
   );
-  if (!name) {
-    throw new Error("The real deletion did not produce an archive");
-  }
+  expect(name, "The real deletion did not produce an archive").toBeDefined();
   return name;
 }
 const search = (manager: Manager) => manager.search("alpha", lexicalOptions);
@@ -138,7 +139,6 @@ async function pollutedIndex(mode: RetrievalMode) {
     vectorEnabled: mode === "hybrid KNN",
     minScore: 0,
   });
-  // CLI mode avoids background listeners and timers.
   const manager = await fixture.getFreshManager(cfg, "cli");
   await manager.sync({ reason: "prepare-valid-index", force: true });
   expect(manager.status().fts?.available).toBe(true);
@@ -197,12 +197,11 @@ it.for<RetrievalMode>(["keyword-only", "hybrid KNN", "hybrid embedding scan"])(
   async (mode, { signal }) => {
     const { manager, writer } = await pollutedIndex(mode);
     const nativeKnn = vi.spyOn(knn, "searchMemoryVectorIndex");
-    const validChunks = () =>
-      validRows(writer, "memory_index_chunks", "id, path, hash, embedding, updated_at", "id");
-    const validSources = () =>
-      validRows(writer, "memory_index_sources", "path, source, hash, mtime, size", "path");
-    const beforeChunks = validChunks();
-    const beforeSources = validSources();
+    const validIndex = () => ({
+      chunks: validRows(writer, "chunks", "id, path, hash, embedding, updated_at", "id"),
+      sources: validRows(writer, "sources", "path, source, hash, mtime, size", "path"),
+    });
+    const beforeIndex = validIndex();
     const embeddingBatches = fixture.provider.embedBatchCalls;
     const releaseCleanup = createDeferred<void>();
     // oxlint-disable-next-line typescript/unbound-method -- apply below preserves the intercepted database owner.
@@ -229,9 +228,7 @@ it.for<RetrievalMode>(["keyword-only", "hybrid KNN", "hybrid embedding scan"])(
       });
 
       expect(resultPaths(results)).toEqual(expectedPaths);
-      for (const paths of partialPaths) {
-        expect(paths.every((pathname) => expectedPaths.includes(pathname))).toBe(true);
-      }
+      expect(partialPaths.flat().every((pathname) => expectedPaths.includes(pathname))).toBe(true);
       // Successful serving cannot be explained by cleanup winning the race.
       expect(countHelpers(writer)).toEqual({ n: 201 });
       if (mode === "hybrid KNN") {
@@ -245,8 +242,7 @@ it.for<RetrievalMode>(["keyword-only", "hybrid KNN", "hybrid embedding scan"])(
     }
     await manager.close();
     expectHelperPruned(writer);
-    expect(validChunks()).toEqual(beforeChunks);
-    expect(validSources()).toEqual(beforeSources);
+    expect(validIndex()).toEqual(beforeIndex);
     expect(fixture.provider.embedBatchCalls).toBe(embeddingBatches);
   },
 );
@@ -267,8 +263,7 @@ it("preserves memory-sourced content whose path collides with an excluded transc
 
 it("prunes helpers before a failing source embedding settles", async ({ signal }) => {
   const { manager, writer } = await pollutedIndex("hybrid embedding scan");
-  const validChunks = () =>
-    validRows(writer, "memory_index_chunks", "id, path, hash, text, embedding", "id");
+  const validChunks = () => validRows(writer, "chunks", "id, path, hash, text, embedding", "id");
   const beforeChunks = validChunks();
   await fs.writeFile(
     path.join(fixture.paths.workspace, memoryFilePath),
@@ -326,16 +321,10 @@ it("excludes captured ownership, preserving older archives, unknown provenance a
   ] as const) {
     const sessionKey = `agent:main:explicit:${sessionId}`;
     await seedTranscript(sessionId, sessionKey, "Alpha ownership canary.");
-    await upsertSessionEntry({
-      ...sessionScope(sessionKey),
-      entry: { sessionId, updatedAt: Date.now(), pluginOwnerId },
-    });
+    await setOwnership(sessionId, sessionKey, pluginOwnerId);
   }
   // Same-ID replacement neither revokes captured ownership nor reclassifies older archives.
-  await upsertSessionEntry({
-    ...ownerScope,
-    entry: { sessionId: ownerId, updatedAt: Date.now() },
-  });
+  await setOwnership(ownerId, ownerScope.sessionKey);
   const currentEntry = await getSessionEntryAsync(ownerScope);
   expect(currentEntry?.sessionId).toBe(ownerId);
   expect(currentEntry?.pluginOwnerId).toBeUndefined();
@@ -385,11 +374,7 @@ it("preserves an ordinary reused UUID and its unidentified index until normal re
   const before = indexedSources();
   expect(before).toEqual([{ path: pathname, hash: expect.any(String) }]);
   const expected = [
-    {
-      path: pathname,
-      source: "sessions",
-      snippet: expect.stringContaining(content),
-    },
+    { path: pathname, source: "sessions", snippet: expect.stringContaining(content) },
   ];
   expect(await search(manager)).toMatchObject(expected);
   expect(indexedSources()).toEqual(before);

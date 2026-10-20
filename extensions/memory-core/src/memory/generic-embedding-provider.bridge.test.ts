@@ -1,4 +1,3 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { EmbeddingInput } from "openclaw/plugin-sdk/embedding-providers";
 import {
   createPluginRegistryFixture,
@@ -10,40 +9,23 @@ import {
   getActivePluginRegistry,
   getRegisteredEmbeddingProvider,
   listRegisteredEmbeddingProviders,
-  type RegisteredEmbeddingProvider,
   restoreRegisteredEmbeddingProviders,
   setActivePluginRegistry,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import { createEmbeddingProvider, resolveEmbeddingProviderIndexIdentity } from "./embeddings.js";
 
-let embeddingProvidersSnapshot: RegisteredEmbeddingProvider[];
-let previousPluginRegistry: ReturnType<typeof getActivePluginRegistry>;
-
-function createOptions(config: OpenClawConfig) {
-  return {
-    config,
-    agentDir: "/tmp/openclaw-agent",
-    provider: "virtual-generic",
-    fallback: "none",
-    model: "virtual-model",
-    outputDimensionality: 7,
-  };
-}
-
-beforeEach(() => {
-  previousPluginRegistry = getActivePluginRegistry();
-  embeddingProvidersSnapshot = listRegisteredEmbeddingProviders();
+it("preserves a contract-declared provider and its identity metadata", async ({
+  onTestFinished,
+}) => {
+  const previousPluginRegistry = getActivePluginRegistry();
+  const embeddingProvidersSnapshot = listRegisteredEmbeddingProviders();
+  onTestFinished(() => {
+    clearEmbeddingProviders();
+    setActivePluginRegistry(previousPluginRegistry ?? createEmptyPluginRegistry());
+    restoreRegisteredEmbeddingProviders(embeddingProvidersSnapshot);
+  });
   clearEmbeddingProviders();
-});
-
-afterEach(() => {
-  clearEmbeddingProviders();
-  setActivePluginRegistry(previousPluginRegistry ?? createEmptyPluginRegistry());
-  restoreRegisteredEmbeddingProviders(embeddingProvidersSnapshot);
-});
-
-it("preserves a contract-declared provider and its identity metadata", async () => {
   const cacheKey = (model: string, dimensions: number | undefined) => ({
     provider: "virtual-generic",
     model,
@@ -68,6 +50,14 @@ it("preserves a contract-declared provider and its identity metadata", async () 
     inputs.map((_input, index) => [index, 7]),
   );
   const { config, registry } = createPluginRegistryFixture({ plugins: { enabled: false } });
+  const providerOptions = {
+    config,
+    agentDir: "/tmp/openclaw-agent",
+    provider: "virtual-generic",
+    fallback: "none",
+    model: "virtual-model",
+    outputDimensionality: 7,
+  };
 
   registerVirtualTestPlugin({
     registry,
@@ -118,12 +108,12 @@ it("preserves a contract-declared provider and its identity metadata", async () 
   expect(registry.registry.embeddingProviders.map((entry) => entry.provider.id)).toEqual([
     "virtual-generic",
   ]);
-  expect(resolveEmbeddingProviderIndexIdentity(createOptions(config))).toEqual({
+  expect(resolveEmbeddingProviderIndexIdentity(providerOptions)).toEqual({
     provider: { id: "virtual-generic", model: "virtual-model" },
     ...identity,
   });
 
-  const result = await createEmbeddingProvider(createOptions(config));
+  const result = await createEmbeddingProvider(providerOptions);
 
   expect(result.requestedProvider).toBe("virtual-generic");
   expect(result.provider).toMatchObject({
