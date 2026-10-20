@@ -39,9 +39,7 @@ type TitleOptions = {
   titleSource?: string;
 };
 async function createTitleFixture(state: OpenClawTestState, options: TitleOptions) {
-  const cfg = options.cfg ?? {
-    agents: { defaults: { model: { primary: "openai/gpt-5.6-sol" } } },
-  };
+  const cfg = options.cfg ?? { agents: { defaults: { model: { primary: "openai/gpt-5.6-sol" } } } };
   if (options.writeConfig) {
     await state.writeConfig(cfg);
   }
@@ -60,9 +58,9 @@ async function createTitleFixture(state: OpenClawTestState, options: TitleOption
   });
   const started = createDeferredCore();
   const generation = createDeferredCore<string>();
-  generate.mockReset().mockImplementation(() => {
+  generate.mockReset().mockImplementation(async () => {
     started.resolve();
-    return generation.promise;
+    return await generation.promise;
   });
   const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
   let title: Promise<boolean> | undefined;
@@ -111,12 +109,16 @@ async function withTitle(
 ) {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
     const fixture = await createTitleFixture(state, options);
-    await run(fixture).finally(() => fixture.finish());
+    try {
+      await run(fixture);
+    } finally {
+      await fixture.finish();
+    }
   });
 }
 
-it.each(["persisted", "failed"])("publishes pending and %s title settlement", (outcome) =>
-  withTitle({ legacyPath: true }, async ({ scope, context, start, finish }) => {
+it.each(["persisted", "failed"])("publishes pending and %s title settlement", async (outcome) => {
+  await withTitle({ legacyPath: true }, async ({ scope, context, start, finish }) => {
     const states: boolean[] = [];
     const stop = sessionChanges.subscribe((change) => {
       if (
@@ -151,34 +153,39 @@ it.each(["persisted", "failed"])("publishes pending and %s title settlement", (o
       write?.mockRestore();
       stop();
     }
-  }),
+  });
+});
+
+it.each([
+  { titleSource: undefined, expectedSource: "Original release plan" },
+  { titleSource: "Accepted worktree intent", expectedSource: "Accepted worktree intent" },
+])(
+  "prepares one detached title entry from $expectedSource",
+  async ({ titleSource, expectedSource }) => {
+    await withTitle(
+      { writeConfig: true, titleSource },
+      async ({ scope, append, start, finish }) => {
+        await append("Original release plan");
+        const reads = observeSqliteReadSql(StatementSync.prototype);
+        try {
+          await start("A later follow-up", undefined, true);
+          expect(
+            reads.queries.filter((sql) => /\b(?:from|join)\s+"?session_nodes\b/u.test(sql)).length,
+          ).toBeLessThanOrEqual(1);
+          expect(generate).toHaveBeenCalledOnce();
+          expect(generate.mock.calls[0]?.[0].userMessage).toBe(expectedSource);
+        } finally {
+          reads.restore();
+          await finish();
+        }
+        expect(loadSessionEntry(scope)?.displayName).toBe("Original release plan");
+      },
+    );
+  },
 );
 
-it.each([undefined, "Accepted worktree intent"])(
-  "prepares one detached title entry from %s",
-  (titleSource) =>
-    withTitle({ writeConfig: true, titleSource }, async ({ scope, append, start, finish }) => {
-      await append("Original release plan");
-      const reads = observeSqliteReadSql(StatementSync.prototype);
-      try {
-        await start("A later follow-up", undefined, true);
-        expect(
-          reads.queries.filter((sql) => /\b(?:from|join)\s+"?session_nodes\b/u.test(sql)).length,
-        ).toBeLessThanOrEqual(1);
-        expect(generate).toHaveBeenCalledOnce();
-        expect(generate.mock.calls[0]?.[0].userMessage).toBe(
-          titleSource ?? "Original release plan",
-        );
-      } finally {
-        reads.restore();
-        await finish();
-      }
-      expect(loadSessionEntry(scope)?.displayName).toBe("Original release plan");
-    }),
-);
-
-it("compacts after the reply releases its admission while its title is still generating", () =>
-  withTitle(
+it("compacts after the reply releases its admission while its title is still generating", async () => {
+  await withTitle(
     { cfg: { agents: { entries: { main: {} } } }, writeConfig: true, legacyPath: true },
     async ({ scope, context, append, start, finish }) => {
       await append("First question", "Follow-up question", "Final answer");
@@ -224,4 +231,5 @@ it("compacts after the reply releases its admission while its title is still gen
       }
       expect(loadSessionEntry(scope)?.displayName).toBe("First question");
     },
-  ));
+  );
+});

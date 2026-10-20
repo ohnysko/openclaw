@@ -25,15 +25,11 @@ import {
   markGatewayRestartDraining,
   resetGatewayWorkAdmission,
 } from "../../../process/gateway-work-admission.js";
-import { createDeferredCore, type Deferred } from "../../../shared/deferred.js";
+import { createDeferredCore } from "../../../shared/deferred.js";
 import { createGatewayMethodRegistry } from "../../methods/registry.js";
 import { agentHandlers } from "../../server-methods/agent.js";
 import { createLazyCoreHandlers } from "../../server-methods/lazy-core-handlers.js";
-import type {
-  GatewayRequestHandler,
-  GatewayRequestHandlers,
-  RespondFn,
-} from "../../server-methods/types.js";
+import type { GatewayRequestHandler, RespondFn } from "../../server-methods/types.js";
 import {
   createDispatchTestHarness,
   createOperatorWsClient,
@@ -52,8 +48,6 @@ vi.mock("node:worker_threads", async (importOriginal) => ({
 }));
 
 const scheduling = vi.hoisted(() => ({ start: vi.fn<() => Promise<void> | null>() }));
-const traceId = "1".repeat(32);
-const parentSpanId = "1".repeat(16);
 vi.mock("./request-start.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./request-start.js")>()),
   scheduleGatewayRequestStart: scheduling.start,
@@ -68,24 +62,6 @@ afterEach(() => {
   vi.restoreAllMocks();
   resetDiagnosticEventsForTest();
 });
-
-function captureLogs(consoleLevel: "info" | "debug") {
-  const output = vi.fn();
-  setLoggerOverride({ level: "silent", consoleLevel });
-  loggingState.rawConsole = { log: output, info: output, warn: output, error: output };
-  onTestFinished(() => {
-    setLoggerOverride(null);
-    loggingState.rawConsole = null;
-    resetLogger();
-  });
-  return output;
-}
-
-function expectEventSubset(events: unknown[], expected: Record<string, unknown>[]) {
-  expect(events).toEqual(
-    expect.arrayContaining(expected.map((event) => expect.objectContaining(event))),
-  );
-}
 
 function observeRequests() {
   const events: Extract<DiagnosticEventPayload, { type: "gateway.rpc" }>[] = [];
@@ -102,121 +78,24 @@ function observeRequests() {
     { include: ["gateway.rpc"] },
   );
   onTestFinished(unsubscribe);
-  return {
-    events,
-    finished: finished.promise,
-    phase: (phase: (typeof events)[number]["phase"]) =>
-      events.filter((event) => event.phase === phase),
-  };
+  return { events, finished: finished.promise };
 }
 
-const respondOk: GatewayRequestHandler = ({ respond }) => respond(true, {});
-
-function createRequest(
-  handler: GatewayRequestHandler | GatewayRequestHandlers = respondOk,
-  method = "health",
-  options: Parameters<typeof createDispatchTestHarness>[0] = {},
-) {
+function createRequest(handler: GatewayRequestHandler, method = "health") {
   const observed = observeRequests();
   const socket = new EventEmitter();
   const client = createOperatorWsClient({ socket });
-  const harness = createDispatchTestHarness({
-    ...options,
-    extraHandlers: typeof handler === "function" ? { [method]: handler } : handler,
-  });
-  const dispatch = (
-    params: Record<string, unknown> = {},
-    connection = client,
-    frame: { id?: string; traceparent?: string } = {},
-  ) =>
-    harness.dispatcher.dispatch(
-      { type: "req", id: "private-request-id", method, params, ...frame },
-      connection,
-    );
+  const harness = createDispatchTestHarness({ extraHandlers: { [method]: handler } });
   return {
     ...observed,
     ...harness,
     client,
     socket,
-    dispatch,
-    run: async (...args: Parameters<typeof dispatch>) => {
-      await dispatch(...args);
-      await observed.finished;
-    },
-  };
-}
-
-function privateClient(id: string) {
-  const client = createOperatorWsClient({ clientInfo: { id, mode: "backend" } });
-  Object.assign(client.connect.client, {
-    displayName: "private-",
-    instanceId: "private-",
-    platform: "private-",
-  });
-  client.connect.userAgent = "private-";
-  return client;
-}
-
-type ReceiptCase = [Record<string, unknown>, Record<string, unknown>];
-function checkReceipt(
-  method: string,
-  field: string,
-  defaults: Record<string, unknown>,
-  paramsDefaults: Record<string, unknown> = {},
-) {
-  return async (params: Record<string, unknown>, shape: Record<string, unknown>) => {
-    const clientKind = "openclaw-control-ui";
-    const fixture = createRequest(respondOk, method);
-    await fixture.run({ ...paramsDefaults, ...params }, privateClient(clientKind));
-    expect(fixture.phase("received")).toEqual([
-      expect.objectContaining({
-        method,
-        [field]: { clientKind, source: "wire", ...defaults, ...shape },
-      }),
-    ]);
-    expect(JSON.stringify(fixture.events)).not.toContain("private-");
-  };
-}
-
-function mockHeap(heapUsed: number) {
-  const memory = { ...process.memoryUsage(), heapUsed };
-  const sample = vi.spyOn(process, "memoryUsage").mockImplementation(() => ({ ...memory }));
-  return { memory, sample };
-}
-
-function expectPhaseCounts(fixture: ReturnType<typeof createRequest>, ...phases: string[]) {
-  expect(
-    phases.map((phase) => fixture.events.filter((event) => event.phase === phase).length),
-  ).toEqual(phases.map(() => 1));
-}
-
-function finishAfterTest(dispatch: Promise<unknown>, ...gates: Deferred[]) {
-  onTestFinished(async () => {
-    gates.forEach((gate) => gate.resolve());
-    await dispatch;
-  });
-}
-
-function createPausedRequest(handler: GatewayRequestHandler, method = "health") {
-  const entered = createDeferredCore();
-  const release = createDeferredCore();
-  const fixture = createRequest(async (request) => {
-    entered.resolve();
-    await release.promise;
-    await handler(request);
-  }, method);
-  return {
-    ...fixture,
-    entered: entered.promise,
-    release,
-    start: async () => {
-      finishAfterTest(fixture.dispatch(), release);
-      await entered.promise;
-    },
-    finish: async () => {
-      release.resolve();
-      await fixture.finished;
-    },
+    dispatch: () =>
+      harness.dispatcher.dispatch(
+        { type: "req", id: "private-request-id", method, params: {} },
+        client,
+      ),
   };
 }
 
@@ -254,81 +133,144 @@ describe("authenticated Gateway RPC diagnostics", () => {
     ["openclaw-linux", "other"],
     ["test", "other"],
   ] as const)("attributes ordinary RPCs from %s as %s", async (id, clientKind) => {
-    const fixture = createRequest();
-    await fixture.run({}, privateClient(id));
-    expect(fixture.phase("received")[0]).toMatchObject({ method: "health", clientKind });
+    const fixture = createRequest(({ respond }) => respond(true, {}));
+    const client = createOperatorWsClient({ clientInfo: { id, mode: "backend" } });
+    client.connect.client.displayName = "private-display-name";
+    client.connect.client.instanceId = "private-instance";
+    client.connect.client.platform = "private-platform";
+    await fixture.dispatcher.dispatch(
+      { type: "req", id: "private-request", method: "health", params: {} },
+      client,
+    );
+    await fixture.finished;
+    expect(fixture.events.find((event) => event.phase === "received")).toMatchObject({
+      method: "health",
+      clientKind,
+    });
     expect(JSON.stringify(fixture.events)).not.toContain("private-");
   });
 
-  it.each<ReceiptCase>([
-    [
-      { sessionKey: "private-", agentId: "private-", compact: true },
-      { scope: "session", compact: true },
-    ],
-    [
-      { agentId: "private-", offset: 50 },
-      { scope: "agent", page: "append" },
-    ],
-    [{ compact: "private-", offset: "private-", query: "private-" }, {}],
-  ])(
-    "attributes cron receipt (%j)",
-    checkReceipt("cron.list", "cronList", {
-      scope: "global",
-      compact: false,
-      page: "first",
-    }),
-  );
+  it.each([
+    {
+      clientKind: "openclaw-control-ui",
+      params: { sessionKey: "private-session", agentId: "private-agent", compact: true },
+      shape: { scope: "session", compact: true, page: "first" },
+    },
+    {
+      clientKind: "openclaw-macos",
+      params: { agentId: "private-agent", offset: 50 },
+      shape: { scope: "agent", compact: false, page: "append" },
+    },
+    {
+      clientKind: "gateway-client",
+      params: { compact: "private-invalid", offset: "private-invalid", query: "private-query" },
+      shape: { scope: "global", compact: false, page: "first" },
+    },
+  ])("attributes cron list receipt without private values ($clientKind)", async (query) => {
+    const fixture = createRequest(({ respond }) => respond(true, {}), "cron.list");
+    const client = createOperatorWsClient({
+      clientInfo: { id: query.clientKind, mode: "backend" },
+    });
+    await fixture.dispatcher.dispatch(
+      { type: "req", id: "private-request", method: "cron.list", params: query.params },
+      client,
+    );
+    await fixture.finished;
+    expect(fixture.events.filter((event) => event.phase === "received")).toEqual([
+      expect.objectContaining({
+        method: "cron.list",
+        cronList: { clientKind: query.clientKind, source: "wire", ...query.shape },
+      }),
+    ]);
+    expect(JSON.stringify(fixture.events)).not.toContain("private-");
+  });
 
-  it.each<ReceiptCase>([
-    [
-      { view: "configured", agentId: "private-", preparedOnly: true },
-      { view: "configured", scope: "agent", preparedOnly: true },
-    ],
-    [
-      { sessionKey: "private-", agentId: "private-", refresh: true },
-      { scope: "session", refresh: true },
-    ],
-    [
-      { view: "provider-config", authProfileId: "private-" },
-      { view: "provider-config", scope: "auth-profile" },
-    ],
-    [{ view: "private-", refresh: "private-" }, { view: "other" }],
-  ])(
-    "attributes model catalog receipt (%j)",
-    checkReceipt("models.list", "modelsList", {
-      view: "default",
-      scope: "global",
-      preparedOnly: false,
-      refresh: false,
-    }),
-  );
+  it.each([
+    {
+      clientKind: "openclaw-control-ui",
+      params: { view: "configured", agentId: "private-agent", preparedOnly: true },
+      shape: { view: "configured", scope: "agent", preparedOnly: true, refresh: false },
+    },
+    {
+      clientKind: "openclaw-macos",
+      params: { sessionKey: "private-session", agentId: "private-agent", refresh: true },
+      shape: { view: "default", scope: "session", preparedOnly: false, refresh: true },
+    },
+    {
+      clientKind: "gateway-client",
+      params: { view: "provider-config", authProfileId: "private-profile" },
+      shape: {
+        view: "provider-config",
+        scope: "auth-profile",
+        preparedOnly: false,
+        refresh: false,
+      },
+    },
+    {
+      clientKind: "cli",
+      params: { view: "private-view", refresh: "private-refresh" },
+      shape: { view: "other", scope: "global", preparedOnly: false, refresh: false },
+    },
+  ])("attributes model catalog receipt without private values ($clientKind)", async (query) => {
+    const fixture = createRequest(({ respond }) => respond(true, {}), "models.list");
+    const client = createOperatorWsClient({
+      clientInfo: { id: query.clientKind, mode: "backend" },
+    });
+    client.connect.userAgent = "private-user-agent";
+    client.connect.client.displayName = "private-display-name";
+    client.connect.client.instanceId = "private-instance";
+    await fixture.dispatcher.dispatch(
+      { type: "req", id: "private-request", method: "models.list", params: query.params },
+      client,
+    );
+    await fixture.finished;
+    expect(fixture.events.filter((event) => event.phase === "received")).toEqual([
+      expect.objectContaining({
+        method: "models.list",
+        modelsList: { clientKind: query.clientKind, source: "wire", ...query.shape },
+      }),
+    ]);
+    expect(JSON.stringify(fixture.events)).not.toContain("private-");
+  });
 
   it.each([
     { source: "dashboard", rowMode: "compact", bytes: 204_800, elapsed: 0 },
-    { source: "private-", rowMode: undefined, bytes: 100, elapsed: 1_000 },
+    { source: "arbitrary-private-caller", rowMode: undefined, bytes: 100, elapsed: 1_000 },
   ])("attributes session list diagnostics without private filters ($source)", async (query) => {
     let now = 1_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
-    const output = captureLogs("debug");
+    const output = vi.fn();
+    setLoggerOverride({ level: "silent", consoleLevel: "debug" });
+    loggingState.rawConsole = { log: output, info: output, warn: output, error: output };
+    onTestFinished(() => {
+      setLoggerOverride(null);
+      loggingState.rawConsole = null;
+      resetLogger();
+    });
     const fixture = createRequest(({ respond }) => {
       now += query.elapsed;
       respond(true, {});
     }, "sessions.list");
     fixture.send.mockReturnValue({ kind: "sent", bytes: query.bytes });
-    await fixture.run(
+    await fixture.dispatcher.dispatch(
       {
-        source: query.source,
-        rowMode: query.rowMode,
-        limit: 60,
-        offset: 120,
-        ownerId: "private-",
-        search: "private-",
+        type: "req",
+        id: "private-request-id",
+        method: "sessions.list",
+        params: {
+          source: query.source,
+          rowMode: query.rowMode,
+          limit: 60,
+          offset: 120,
+          ownerId: "synthetic-private-owner",
+          search: "synthetic-private-search",
+        },
       },
       fixture.client,
-      { id: "session-list-diagnostics" },
     );
+    await fixture.finished;
     expect(fixture.send).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
-    expect(fixture.phase("received")[0]).toMatchObject({
+    expect(fixture.events.find((event) => event.phase === "received")).toMatchObject({
       sessionsList: {
         clientKind: fixture.client.connect.client.id,
         source: "wire",
@@ -337,64 +279,90 @@ describe("authenticated Gateway RPC diagnostics", () => {
         filter: "search",
       },
     });
-    expect(JSON.stringify(fixture.events)).not.toContain("private-");
+    expect(JSON.stringify(fixture.events)).not.toMatch(
+      /synthetic-private|arbitrary-private-caller/,
+    );
     const log = output.mock.calls.flat().join("\n");
     expect(log).toContain("sessions.list");
     expect(log).toContain(`source=${query.rowMode ? "dashboard" : "unspecified"}`);
     expect(log).toContain(`rowMode=${query.rowMode ?? "full"}`);
     expect(log).toContain("limit=60 offset=120 filterKind=ownerId+search");
     expect(log).toContain(`bytes=${query.bytes}`);
-    expect(log).not.toContain("private-");
+    expect(log).not.toMatch(/synthetic-private|arbitrary-private-caller/);
   });
 
-  it.each<ReceiptCase>([
-    [{ spawnedBy: "private-", ownerId: "private-" }, { filter: "children" }],
-    [{ ownerId: "private-", involvingMe: true }, { filter: "owner" }],
-    [{ involvingProfileId: "private-", activeOnly: true }, { filter: "involving" }],
-    [{ activeMinutes: 15 }, { filter: "active" }],
-    [{ activeOnly: false, agentId: "private-" }, { filter: "general" }],
-  ])(
-    "bounds session list filter attribution (%j)",
-    checkReceipt(
-      "sessions.list",
-      "sessionsList",
-      { callerSource: "sidebar", rowMode: "other" },
-      { source: "sidebar", rowMode: "private-" },
-    ),
-  );
+  it.each([
+    { params: { spawnedBy: "private-parent", ownerId: "private-owner" }, filter: "children" },
+    { params: { ownerId: "private-owner", involvingMe: true }, filter: "owner" },
+    { params: { involvingProfileId: "private-profile", activeOnly: true }, filter: "involving" },
+    { params: { activeMinutes: 15 }, filter: "active" },
+    { params: { activeOnly: false, agentId: "private-agent" }, filter: "general" },
+  ])("bounds session list filter attribution ($filter)", async ({ params, filter }) => {
+    const fixture = createRequest(({ respond }) => respond(true, {}), "sessions.list");
+    await fixture.dispatcher.dispatch(
+      {
+        type: "req",
+        id: "private-request",
+        method: "sessions.list",
+        params: { ...params, source: "sidebar", rowMode: "private-invalid-mode" },
+      },
+      fixture.client,
+    );
+    await fixture.finished;
+    expect(fixture.events.find((event) => event.phase === "received")).toMatchObject({
+      sessionsList: {
+        clientKind: fixture.client.connect.client.id,
+        source: "wire",
+        callerSource: "sidebar",
+        rowMode: "other",
+        filter,
+      },
+    });
+    expect(JSON.stringify(fixture.events)).not.toContain("private-");
+  });
 
   it.each([true, false])(
     "records frame bytes and logs, sampling heap only on the main thread (main=%s)",
     async (main) => {
       thread.isMainThread = main;
-      const { memory, sample } = mockHeap(4096);
+      let heapUsed = 4096;
+      const memory = process.memoryUsage();
+      const sample = vi
+        .spyOn(process, "memoryUsage")
+        .mockImplementation(() => ({ ...memory, heapUsed }));
       let now = 1000;
       vi.spyOn(Date, "now").mockImplementation(() => now);
-      const output = captureLogs("info");
+      const output = vi.fn();
+      setLoggerOverride({ level: "silent", consoleLevel: "info" });
+      loggingState.rawConsole = { log: output, info: output, warn: output, error: output };
+      onTestFinished(() => {
+        setLoggerOverride(null);
+        loggingState.rawConsole = null;
+        resetLogger();
+      });
       const completion = createDeferredCore();
       const fixture = createRequest(async ({ respond }) => {
         now = 2000;
         respond(true, { accepted: true });
         await completion.promise;
         respond(true, { final: true });
-        memory.heapUsed = 2048;
+        heapUsed = 2048;
         fixture.send.mockReturnValue({ kind: "unavailable" });
         respond(true);
       });
       fixture.send.mockReturnValue({ kind: "sent", bytes: 1234 });
       const dispatch = fixture.dispatch();
-      finishAfterTest(dispatch, completion);
       await fixture.awaitResponseFrame("private-request-id");
       fixture.send.mockReturnValue({ kind: "sent", bytes: 8192 });
       completion.resolve();
       await dispatch;
       await fixture.finished;
-      expect(fixture.phase("handler")[0]).toMatchObject({
+      expect(fixture.events.find((event) => event.phase === "handler")).toMatchObject({
         heapDeltaBytes: main ? -2048 : undefined,
       });
       expect(sample).toHaveBeenCalledTimes(main ? 2 : 0);
       expect(output).toHaveBeenCalledWith(expect.stringMatching(/res.*health.*1000ms.*bytes=1234/));
-      expect(fixture.phase("response")).toMatchObject([
+      expect(fixture.events.filter((event) => event.phase === "response")).toMatchObject([
         { responseBytes: 1234, firstResponse: true },
         { responseBytes: 8192, firstResponse: false },
         { outcome: "unavailable", firstResponse: undefined, responseBytes: undefined },
@@ -405,51 +373,66 @@ describe("authenticated Gateway RPC diagnostics", () => {
   it.each(["nested", "crossing", "unobserved"])(
     "discards entire overlapping handler windows (%s) and resumes after settlement",
     async (overlap) => {
-      const { memory } = mockHeap(1024);
-      const first = createPausedRequest(() => {
-        memory.heapUsed += 4096;
+      const firstEntered = createDeferredCore();
+      const secondEntered = createDeferredCore();
+      const firstRelease = createDeferredCore();
+      const secondRelease = createDeferredCore();
+      let heapUsed = 1024;
+      const memory = process.memoryUsage();
+      vi.spyOn(process, "memoryUsage").mockImplementation(() => ({ ...memory, heapUsed }));
+      const first = createRequest(async () => {
+        firstEntered.resolve();
+        await firstRelease.promise;
+        heapUsed += 4096;
       });
-      const second = createPausedRequest(() => {
-        memory.heapUsed += 8192;
+      const second = createRequest(async () => {
+        secondEntered.resolve();
+        await secondRelease.promise;
+        heapUsed += 8192;
       }, "cron.status");
       const firstDispatch = first.dispatch();
-      await first.entered;
+      await firstEntered.promise;
       if (overlap === "unobserved") {
         setDiagnosticsEnabledForProcess(false);
       }
       const secondDispatch = second.dispatch();
-      finishAfterTest(Promise.all([firstDispatch, secondDispatch]), first.release, second.release);
-      onTestFinished(() => setDiagnosticsEnabledForProcess(true));
-      await awaitGateBeforeSettlement(
-        second.entered,
-        secondDispatch,
-        "overlapping request settled before handler entry",
-      );
-      setDiagnosticsEnabledForProcess(true);
-      if (overlap === "crossing") {
-        first.release.resolve();
-        await firstDispatch;
-        second.release.resolve();
-      } else {
-        second.release.resolve();
-        await secondDispatch;
-        first.release.resolve();
+      try {
+        await awaitGateBeforeSettlement(
+          secondEntered.promise,
+          secondDispatch,
+          "overlapping request settled before handler entry",
+        );
+        setDiagnosticsEnabledForProcess(true);
+        if (overlap === "crossing") {
+          firstRelease.resolve();
+          await firstDispatch;
+          secondRelease.resolve();
+        } else {
+          secondRelease.resolve();
+          await secondDispatch;
+          firstRelease.resolve();
+        }
+        await Promise.all([firstDispatch, secondDispatch]);
+        await waitForDiagnosticEventsDrained();
+        const handlers = first.events.filter((event) => event.phase === "handler");
+        expect(handlers).toHaveLength(overlap === "unobserved" ? 1 : 2);
+        expect(
+          first.events.filter(
+            (event) => "heapDeltaBytes" in event && event.heapDeltaBytes !== undefined,
+          ),
+        ).toEqual([]);
+        first.events.length = 0;
+        await first.dispatch();
+        await waitForDiagnosticEventsDrained();
+        expect(first.events.find((event) => event.phase === "handler")).toMatchObject({
+          heapDeltaBytes: 4096,
+        });
+      } finally {
+        setDiagnosticsEnabledForProcess(true);
+        firstRelease.resolve();
+        secondRelease.resolve();
+        await Promise.all([firstDispatch, secondDispatch]);
       }
-      await Promise.all([firstDispatch, secondDispatch]);
-      await waitForDiagnosticEventsDrained();
-      const handlers = first.phase("handler");
-      expect(handlers).toHaveLength(overlap === "unobserved" ? 1 : 2);
-      expect(
-        first.events.filter(
-          (event) => "heapDeltaBytes" in event && event.heapDeltaBytes !== undefined,
-        ),
-      ).toEqual([]);
-      first.events.length = 0;
-      await first.dispatch();
-      await waitForDiagnosticEventsDrained();
-      expect(first.phase("handler")[0]).toMatchObject({
-        heapDeltaBytes: 4096,
-      });
     },
   );
 
@@ -457,17 +440,21 @@ describe("authenticated Gateway RPC diagnostics", () => {
     "keeps %s preparation separate from actual handler entry",
     async (preparation) => {
       let now = 100;
-      const { memory } = mockHeap(1024);
+      let heapUsed = 1024;
+      const memory = process.memoryUsage();
+      vi.spyOn(process, "memoryUsage").mockImplementation(() => ({ ...memory, heapUsed }));
       vi.spyOn(performance, "now").mockImplementation(() => now);
       const reached = createDeferredCore();
       const release = createDeferredCore();
       const handler: GatewayRequestHandler = ({ respond }) => {
-        memory.heapUsed += 2048;
+        heapUsed += 2048;
         now = 240;
         respond(true);
       };
-      const fixture = createRequest(
-        createLazyCoreHandlers({
+      const observed = observeRequests();
+      const client = createOperatorWsClient();
+      const harness = createDispatchTestHarness({
+        extraHandlers: createLazyCoreHandlers({
           methods: ["health"],
           loadHandlers: async () => {
             reached.resolve();
@@ -481,25 +468,34 @@ describe("authenticated Gateway RPC diagnostics", () => {
               : handlers;
           },
         }),
-      );
-      finishAfterTest(fixture.dispatch(), release);
-      await reached.promise;
-      memory.heapUsed += 8192;
-      now = 200;
-      release.resolve();
-      await fixture.finished;
-      await waitForDiagnosticEventsDrained();
-      if (preparation === "family rejection") {
-        expect(fixture.phase("handler").length > 0).toBe(false);
-        expect(fixture.events.at(-1)).toMatchObject({ phase: "dispatch", outcome: "threw" });
-        return;
-      }
-      expect(fixture.phase("handler")[0]).toMatchObject({
-        admissionMs: 100,
-        durationMs: 40,
-        outcome: "returned",
-        heapDeltaBytes: 2048,
       });
+      const dispatch = harness.dispatcher.dispatch(
+        { type: "req", id: "prepared", method: "health" },
+        client,
+      );
+      try {
+        await reached.promise;
+        heapUsed += 8192;
+        now = 200;
+        release.resolve();
+        await observed.finished;
+        await waitForDiagnosticEventsDrained();
+        if (preparation === "family rejection") {
+          expect(observed.events.some((event) => event.phase === "handler")).toBe(false);
+          expect(observed.events.at(-1)).toMatchObject({ phase: "dispatch", outcome: "threw" });
+          return;
+        }
+        expect(observed.events.find((event) => event.phase === "handler")).toMatchObject({
+          admissionMs: 100,
+          durationMs: 40,
+          outcome: "returned",
+          heapDeltaBytes: 2048,
+        });
+      } finally {
+        release.resolve();
+        await dispatch;
+        await observed.finished;
+      }
     },
   );
 
@@ -520,50 +516,79 @@ describe("authenticated Gateway RPC diagnostics", () => {
       respond(true, { final: true });
     });
     const dispatch = fixture.dispatch();
-    finishAfterTest(dispatch, queue, completion);
-    await queued.promise;
-    now = 120;
-    queue.resolve();
-    expect(await fixture.awaitResponseFrame("private-request-id")).toMatchObject({
-      payload: { accepted: true },
+    try {
+      await queued.promise;
+      now = 120;
+      queue.resolve();
+      expect(await fixture.awaitResponseFrame("private-request-id")).toMatchObject({
+        payload: { accepted: true },
+      });
+      await waitForDiagnosticEventsDrained();
+      expect(fixture.events.filter((event) => event.phase === "response")).toMatchObject([
+        { outcome: "ok", durationMs: 50 },
+      ]);
+      expect(fixture.events.some((event) => event.phase === "handler")).toBe(false);
+      now = 220;
+      completion.resolve();
+      await fixture.finished;
+      expect(fixture.events.filter((event) => event.phase === "handler")).toMatchObject([
+        { outcome: "returned", durationMs: 100, admissionMs: 20 },
+      ]);
+      expect(fixture.events.filter((event) => event.phase === "dispatch")).toMatchObject([
+        { outcome: "returned", durationMs: 120, queueWaitMs: 20, response: "sent" },
+      ]);
+      expect(fixture.events.filter((event) => event.phase === "received")).toHaveLength(1);
+      expect(fixture.events.filter((event) => event.phase === "response")).toHaveLength(1);
+      expect(JSON.stringify(fixture.events)).not.toContain("private-request-id");
+    } finally {
+      queue.resolve();
+      completion.resolve();
+      await dispatch;
+      await fixture.finished;
+    }
+  });
+
+  it("records a first response after handler return without reopening dispatch", async () => {
+    let retainedRespond: RespondFn | undefined;
+    const fixture = createRequest(({ respond }) => {
+      retainedRespond = respond;
     });
-    await waitForDiagnosticEventsDrained();
-    expect(fixture.phase("response")).toMatchObject([{ outcome: "ok", durationMs: 50 }]);
-    expect(fixture.phase("handler").length > 0).toBe(false);
-    now = 220;
-    completion.resolve();
+    await fixture.dispatch();
     await fixture.finished;
-    expect(fixture.phase("handler")).toMatchObject([
-      { outcome: "returned", durationMs: 100, admissionMs: 20 },
-    ]);
-    expect(fixture.phase("dispatch")).toMatchObject([
-      { outcome: "returned", durationMs: 120, queueWaitMs: 20, response: "sent" },
-    ]);
-    expectPhaseCounts(fixture, "received", "response");
-    expect(JSON.stringify(fixture.events)).not.toContain("private-request-id");
+    expect(fixture.events.at(-1)).toMatchObject({ phase: "dispatch", response: "none" });
+    retainedRespond?.(true, { late: true });
+    retainedRespond?.(true, { later: true });
+    await waitForDiagnosticEventsDrained();
+    expect(fixture.events.filter((event) => event.phase === "response")).toHaveLength(1);
+    expect(fixture.events.filter((event) => event.phase === "handler")).toHaveLength(1);
+    expect(fixture.events.filter((event) => event.phase === "dispatch")).toHaveLength(1);
   });
 
   it.each([true, false])(
-    "keeps late responses single and trace-bound (trace=%s)",
+    "preserves captured trace presence for late responses (trace=%s)",
     async (hasTrace) => {
       let retainedRespond: RespondFn | undefined;
       const fixture = createRequest(({ respond }) => {
         retainedRespond = respond;
       });
-      await fixture.dispatch({}, fixture.client, {
-        id: "trace-request",
-        ...(hasTrace ? { traceparent: `00-${traceId}-${parentSpanId}-01` } : {}),
-      });
+      const traceId = "11111111111111111111111111111111";
+      await fixture.dispatcher.dispatch(
+        {
+          type: "req",
+          id: "trace-request",
+          method: "health",
+          params: {},
+          ...(hasTrace ? { traceparent: `00-${traceId}-1111111111111111-01` } : {}),
+        },
+        fixture.client,
+      );
       await fixture.finished;
-      expect(fixture.events.at(-1)).toMatchObject({ phase: "dispatch", response: "none" });
       const unrelated = createDiagnosticTraceContext({ parentSpanId: "2222222222222222" });
       runWithDiagnosticTraceContext(unrelated, () => {
-        retainedRespond?.(true, { late: true });
-        retainedRespond?.(true, { later: true });
+        retainedRespond?.(true);
         expect(getActiveDiagnosticTraceContext()).toEqual(unrelated);
       });
       await waitForDiagnosticEventsDrained();
-      expectPhaseCounts(fixture, "response", "handler", "dispatch");
       expect(
         fixture.events
           .filter((event) => event.phase !== "received")
@@ -573,24 +598,32 @@ describe("authenticated Gateway RPC diagnostics", () => {
   );
 
   it.each(
-    (["shared-auth", "runtime"] as const).flatMap((reason) =>
-      [
-        { parent: "valid", traceparent: `00-${traceId}-${parentSpanId}-01` },
-        { parent: "invalid", traceparent: `00-${"0".repeat(32)}-${parentSpanId}-01` },
-        { parent: "absent", traceparent: undefined },
-      ].map((parent) => Object.assign(parent, { reason })),
-    ),
+    (["shared-auth", "runtime"] as const).flatMap((reason) => [
+      {
+        reason,
+        parent: "valid",
+        traceparent: "00-11111111111111111111111111111111-1111111111111111-01",
+      },
+      {
+        reason,
+        parent: "invalid",
+        traceparent: "00-00000000000000000000000000000000-1111111111111111-01",
+      },
+      { reason, parent: "absent", traceparent: undefined },
+    ]),
   )(
     "preserves supplied parent semantics through early $reason denial (parent=$parent)",
     async ({ reason, parent, traceparent }) => {
+      const { events, finished } = observeRequests();
       const handler = vi.fn<GatewayRequestHandler>(({ respond }) => respond(true));
+      const client = createOperatorWsClient();
       const ambient = createDiagnosticTraceContext();
       const authority = vi.fn(() => false);
-      const fixture = createRequest(handler, "health", {
+      const harness = createDispatchTestHarness({
+        extraHandlers: { health: handler },
         getRequiredSharedGatewaySessionGeneration: () => "new-generation",
         buildRequestContext: () => ({ validateAgentRuntimeApprovalAuthority: authority }),
       });
-      const { client } = fixture;
       if (reason === "shared-auth") {
         client.usesSharedGatewayAuth = true;
         client.sharedGatewaySessionGeneration = "previous-generation";
@@ -612,26 +645,36 @@ describe("authenticated Gateway RPC diagnostics", () => {
         };
       }
       await runWithDiagnosticTraceContext(ambient, () =>
-        fixture.run({}, client, { id: "early-denial", traceparent }),
+        harness.dispatcher.dispatch(
+          { type: "req", id: "early-denial", method: "health", params: {}, traceparent },
+          client,
+        ),
       );
+      await finished;
       expect(handler).not.toHaveBeenCalled();
-      const phases = fixture.events.filter((event) => event.phase !== "received");
+      const phases = events.filter((event) => event.phase !== "received");
       expect(phases.map((event) => event.phase)).toEqual(
         reason === "runtime" ? ["response", "dispatch"] : ["dispatch"],
       );
       expect(phases.at(-1)).toMatchObject({ phase: "dispatch", outcome: "rejected" });
-      expect(phases.map((event) => [event.trace?.traceId, event.trace?.parentSpanId])).toEqual(
-        phases.map(() =>
-          parent === "valid" ? [traceId, parentSpanId] : [ambient.traceId, undefined],
-        ),
-      );
+      if (parent === "valid") {
+        expect(
+          phases.every((event) => event.trace?.traceId === "11111111111111111111111111111111"),
+        ).toBe(true);
+        expect(phases.every((event) => event.trace?.parentSpanId === "1111111111111111")).toBe(
+          true,
+        );
+      } else {
+        expect(phases.every((event) => event.trace?.traceId === ambient.traceId)).toBe(true);
+        expect(phases.every((event) => event.trace?.parentSpanId === undefined)).toBe(true);
+      }
       if (reason === "runtime") {
         expect(authority).toHaveBeenCalledWith(client.internal?.agentRuntimeIdentity);
-        expect(fixture.send).toHaveBeenCalledWith(expect.objectContaining({ ok: false }));
+        expect(harness.send).toHaveBeenCalledWith(expect.objectContaining({ ok: false }));
       } else {
-        expect(fixture.send).not.toHaveBeenCalled();
+        expect(harness.send).not.toHaveBeenCalled();
       }
-      expect(fixture.close).toHaveBeenCalledWith(4001, expect.any(String));
+      expect(harness.close).toHaveBeenCalledWith(4001, expect.any(String));
       expect(getActiveDiagnosticTraceContext()).toBeUndefined();
     },
   );
@@ -648,13 +691,16 @@ describe("authenticated Gateway RPC diagnostics", () => {
       } else {
         scheduling.start.mockRejectedValue(new GatewayRequestStartTimeoutError());
       }
-      await fixture.run();
+      await fixture.dispatch();
+      await fixture.finished;
       expect(handler).not.toHaveBeenCalled();
-      expect(fixture.phase("handler").length > 0).toBe(false);
-      expectEventSubset(fixture.events, [
-        { phase: "response", outcome: "error" },
-        { phase: "dispatch", outcome: "rejected" },
-      ]);
+      expect(fixture.events.some((event) => event.phase === "handler")).toBe(false);
+      expect(fixture.events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ phase: "response", outcome: "error" }),
+          expect.objectContaining({ phase: "dispatch", outcome: "rejected" }),
+        ]),
+      );
       if (reason === "capacity") {
         expect(fixture.events.at(-1)).not.toHaveProperty("queueWaitMs");
       } else if (reason === "timeout") {
@@ -673,40 +719,43 @@ describe("authenticated Gateway RPC diagnostics", () => {
     },
   );
 
-  it.each(["unavailable", "suppressed"] as const)(
-    "records %s delivery independently of settlement",
-    async (outcome) => {
-      const fixture = createPausedRequest(({ respond, signal }) => {
-        expect(signal).toBeUndefined();
-        respond(true, { private: "must not send after revocation" });
-        respond(true, { duplicate: true });
-      });
-      await fixture.start();
-      if (outcome === "unavailable") {
-        expect(fixture.socket.listenerCount("close")).toBe(0);
-        fixture.socket.emit("close");
-        fixture.send.mockReturnValue({ kind: "unavailable" });
-      } else {
-        fixture.client.invalidated = true;
-      }
-      await fixture.finish();
-      expect(fixture.phase("response")).toMatchObject([{ outcome }]);
+  it("keeps disconnected ordinary work alive and records unavailable delivery separately", async () => {
+    const entered = createDeferredCore();
+    const completion = createDeferredCore();
+    const fixture = createRequest(async ({ respond, signal }) => {
+      expect(signal).toBeUndefined();
+      entered.resolve();
+      await completion.promise;
+      respond(true, { done: true });
+      respond(true, { duplicate: true });
+    });
+    const dispatch = fixture.dispatch();
+    try {
+      await entered.promise;
+      expect(fixture.socket.listenerCount("close")).toBe(0);
+      fixture.socket.emit("close");
+      fixture.send.mockReturnValue({ kind: "unavailable" });
+      completion.resolve();
+      await fixture.finished;
+      expect(fixture.events.filter((event) => event.phase === "response")).toMatchObject([
+        { outcome: "unavailable" },
+      ]);
       expect(fixture.events.at(-1)).toMatchObject({
         phase: "dispatch",
         outcome: "returned",
-        response: outcome,
+        response: "unavailable",
       });
-      expectEventSubset(fixture.events, [{ phase: "handler", outcome: "returned" }]);
-      if (outcome === "suppressed") {
-        expect(fixture.send).not.toHaveBeenCalled();
-      }
-    },
-  );
+    } finally {
+      completion.resolve();
+      await dispatch;
+      await fixture.finished;
+    }
+  });
 
   it.each(["sent", "unavailable"] as const)(
     "measures serialization fallback only when its send is %s",
     async (fallback) => {
-      const fixture = createRequest();
+      const fixture = createRequest(({ respond }) => respond(true, {}));
       fixture.send
         .mockReturnValueOnce({
           kind: "serialization",
@@ -715,9 +764,10 @@ describe("authenticated Gateway RPC diagnostics", () => {
         .mockReturnValueOnce(
           fallback === "sent" ? { kind: "sent", bytes: 256 } : { kind: "unavailable" },
         );
-      await fixture.run();
+      await fixture.dispatch();
+      await fixture.finished;
       expect(fixture.send).toHaveBeenCalledTimes(2);
-      expect(fixture.phase("response")).toMatchObject([
+      expect(fixture.events.filter((event) => event.phase === "response")).toMatchObject([
         {
           outcome: fallback === "sent" ? "error" : "unavailable",
           responseBytes: fallback === "sent" ? 256 : undefined,
@@ -725,6 +775,35 @@ describe("authenticated Gateway RPC diagnostics", () => {
       ]);
     },
   );
+
+  it("records suppressed delivery after authority revocation without changing handler settlement", async () => {
+    const entered = createDeferredCore();
+    const completion = createDeferredCore();
+    const fixture = createRequest(async ({ respond }) => {
+      entered.resolve();
+      await completion.promise;
+      respond(true, { private: "must not send" });
+    });
+    const dispatch = fixture.dispatch();
+    try {
+      await entered.promise;
+      fixture.client.invalidated = true;
+      completion.resolve();
+      await fixture.finished;
+      expect(fixture.send).not.toHaveBeenCalled();
+      expect(fixture.events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ phase: "response", outcome: "suppressed" }),
+          expect.objectContaining({ phase: "handler", outcome: "returned" }),
+          expect.objectContaining({ phase: "dispatch", response: "suppressed" }),
+        ]),
+      );
+    } finally {
+      completion.resolve();
+      await dispatch;
+      await fixture.finished;
+    }
+  });
 
   it("reports request-owned cancellation separately from transport delivery failure", async () => {
     const entered = createDeferredCore();
@@ -745,7 +824,7 @@ describe("authenticated Gateway RPC diagnostics", () => {
         outcome: "cancelled",
         response: "none",
       });
-      expect(fixture.phase("response").length > 0).toBe(false);
+      expect(fixture.events.some((event) => event.phase === "response")).toBe(false);
       expect(fixture.socket.listenerCount("close")).toBe(0);
     } finally {
       fixture.socket.emit("close");
@@ -757,12 +836,15 @@ describe("authenticated Gateway RPC diagnostics", () => {
     const fixture = createRequest(() => {
       throw new Error("synthetic handler failure");
     });
-    await fixture.run();
-    expectEventSubset(fixture.events, [
-      { phase: "handler", outcome: "threw" },
-      { phase: "response", outcome: "error" },
-      { phase: "dispatch", outcome: "threw" },
-    ]);
+    await fixture.dispatch();
+    await fixture.finished;
+    expect(fixture.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ phase: "handler", outcome: "threw" }),
+        expect.objectContaining({ phase: "response", outcome: "error" }),
+        expect.objectContaining({ phase: "dispatch", outcome: "threw" }),
+      ]),
+    );
     expect(JSON.stringify(fixture.events)).not.toContain("synthetic handler failure");
   });
 
@@ -777,12 +859,17 @@ describe("authenticated Gateway RPC diagnostics", () => {
     expect(captureGatewayRpcReceivedAt()).toEqual(expect.any(Number));
     await fixture.dispatch();
     expect(fixture.send).toHaveBeenCalledOnce();
-    expectEventSubset(events, [
-      { operation: "health.received" },
-      { operation: "health.response", durationMs: expect.any(Number) },
-      { operation: "health.handler", admissionMs: expect.any(Number) },
-      { operation: "health.dispatch", durationMs: expect.any(Number) },
-    ]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ operation: "health.received" }),
+        expect.objectContaining({
+          operation: "health.response",
+          durationMs: expect.any(Number),
+        }),
+        expect.objectContaining({ operation: "health.handler", admissionMs: expect.any(Number) }),
+        expect.objectContaining({ operation: "health.dispatch", durationMs: expect.any(Number) }),
+      ]),
+    );
     expect(JSON.stringify(events)).not.toContain("private");
     expect(JSON.stringify(events)).not.toContain("response content");
   });

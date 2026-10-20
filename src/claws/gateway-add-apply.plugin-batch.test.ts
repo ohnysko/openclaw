@@ -16,7 +16,7 @@ import { writeConfigMachineState } from "../state/config-machine-state-write.js"
 import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db.js";
 import * as leaseAcquisition from "../state/openclaw-state-lease-acquisition.js";
 import { withEnvAsync } from "../test-utils/env.js";
-import type { ClawHubClawTrust, withResolvedClawHubSource } from "./clawhub-source.js";
+import type { ClawHubClawTrust } from "./clawhub-source.js";
 import { applyClawAddForGateway } from "./gateway-add-apply.js";
 import type { ClawAddPlan, ClawReadResult } from "./types.js";
 
@@ -45,18 +45,19 @@ vi.mock("./add-stateless.js", () => ({ stageClawAddHostRequirementsStateless: mo
 
 const dirs = useAutoCleanupTempDirTracker((cleanup) =>
   afterEach(async () => {
-    vi.restoreAllMocks();
     await closeOpenClawStateDatabaseAsync();
     cleanup();
   }),
 );
 
-type ReadResult = Extract<ClawReadResult, { ok: true }>;
 const source = {
   manifest: { agent: { id: "workflow-operator" } },
   source: { packageRoot: "/tmp/claw-source" },
-} as ReadResult;
-const persisted = { source: { packageRoot: "/tmp/claw-cache" } } as ReadResult;
+} as Extract<ClawReadResult, { ok: true }>;
+const persisted = { source: { packageRoot: "/tmp/claw-cache" } } as Extract<
+  ClawReadResult,
+  { ok: true }
+>;
 const trust: ClawHubClawTrust = {
   riskAcknowledgementRequired: false,
   trustRecord: {
@@ -99,9 +100,13 @@ const config: OpenClawConfig = { gateway: { controlUi: { experimental: { claws: 
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.resolve.mockImplementation(
-    async (input: Parameters<typeof withResolvedClawHubSource>[0]) => ({
-      value: await input.run(source, trust, async () => persisted),
-    }),
+    async (input: {
+      run: (
+        artifact: typeof source,
+        trust: ClawHubClawTrust,
+        persistSource: () => Promise<typeof persisted>,
+      ) => Promise<unknown>;
+    }) => ({ value: await input.run(source, trust, async () => persisted) }),
   );
   mocks.build.mockResolvedValue(plan);
   mocks.project.mockReturnValue(projection);
@@ -109,51 +114,19 @@ beforeEach(() => {
   mocks.configuredAccess.mockReturnValue(configuredAccess);
 });
 
-const disabledConfig = { ...config, plugins: { entries: { fixture: { enabled: false } } } };
-const writeJson = (file: string, value: unknown) => fs.writeFile(file, JSON.stringify(value));
-const agent = { finalId: "workflow-operator" };
-const partial = (code: string, message = "Runtime activation failed") => ({
-  agent,
-  status: "partial" as const,
-  error: { code, message },
-});
-const complete = { agent, status: "complete" as const };
-const reloadReceipt = { operationId: "reload", generation: 2, pluginIds: ["fixture"] };
-type ApplyInput = Parameters<typeof applyClawAddForGateway>[0];
-function applyInput(
-  env: Awaited<ReturnType<typeof fixture>>["env"],
-  reloadPlugins: ApplyInput["reloadPlugins"],
-  assertCurrent: () => void = () => {},
-): ApplyInput {
-  return {
-    source: { packageName: "@openclaw/workflow-operator", version: "1.0.0" },
-    planIntegrity: projection.planIntegrity,
-    getPlanningContext: async () => ({ config, sourceMcpServers: {} }),
-    policyConfig: { configPath: env.OPENCLAW_CONFIG_PATH, env },
-    assertCurrent,
-    reloadPlugins,
-  };
-}
-
-function writeIndex(
-  env: NodeJS.ProcessEnv,
-  installRecords: NonNullable<Parameters<typeof createInstalledPluginIndex>[0]>["installRecords"],
-  revision: number,
-) {
-  const index = createInstalledPluginIndex({ plugins: [], installRecords });
-  writeConfigMachineState("plugins.installedIndex", { revision, index }, { env });
-}
-
 async function fixture() {
   const root = dirs.make("gateway-claw-add-plugin-batch-");
   const env = {
     OPENCLAW_STATE_DIR: root,
     OPENCLAW_CONFIG_PATH: path.join(root, "openclaw.json"),
   };
-  await writeJson(env.OPENCLAW_CONFIG_PATH, config);
-  const record = { source: "path" as const, installPath: root, version: "1" };
-  writeIndex(env, { fixture: record }, 1);
-  return { env, record };
+  await fs.writeFile(env.OPENCLAW_CONFIG_PATH, JSON.stringify(config));
+  const index = createInstalledPluginIndex({
+    plugins: [],
+    installRecords: { fixture: { source: "path", installPath: root, version: "1" } },
+  });
+  writeConfigMachineState("plugins.installedIndex", { revision: 1, index }, { env });
+  return { env, index };
 }
 
 describe("Gateway Claw Add plugin handoff", () => {
@@ -163,49 +136,72 @@ describe("Gateway Claw Add plugin handoff", () => {
       let pluginLeaseAcquisitions = 0;
       let migrationCommitted = false;
       const acquire = leaseAcquisition.acquireOpenClawStateLease;
-      vi.spyOn(leaseAcquisition, "acquireOpenClawStateLease").mockImplementation(async (params) => {
-        if (params.label.includes("plugin lifecycle lease") && ++pluginLeaseAcquisitions === 2) {
-          await recordDeferredPluginMigrations({
-            env,
-            pending: [
-              {
-                pluginId: "legacy-fixture",
-                reason: "Legacy config awaits plugin migration",
-                command: "openclaw doctor --fix",
-                configPaths: [["legacyFixture"]],
-                validationExcludedPaths: [["legacyFixture"]],
-              },
-            ],
-          });
-          await writeJson(env.OPENCLAW_CONFIG_PATH, {
-            ...config,
-            legacyFixture: { value: "retained" },
-          });
-          migrationCommitted = true;
-        }
-        return await acquire(params);
-      });
-      const continueAdd = vi.fn(async () => complete);
+      const acquireSpy = vi
+        .spyOn(leaseAcquisition, "acquireOpenClawStateLease")
+        .mockImplementation(async (params) => {
+          if (params.label.includes("plugin lifecycle lease")) {
+            pluginLeaseAcquisitions += 1;
+            if (pluginLeaseAcquisitions === 2) {
+              await recordDeferredPluginMigrations({
+                env,
+                pending: [
+                  {
+                    pluginId: "legacy-fixture",
+                    reason: "Legacy config awaits plugin migration",
+                    command: "openclaw doctor --fix",
+                    configPaths: [["legacyFixture"]],
+                    validationExcludedPaths: [["legacyFixture"]],
+                  },
+                ],
+              });
+              await fs.writeFile(
+                env.OPENCLAW_CONFIG_PATH,
+                JSON.stringify({ ...config, legacyFixture: { value: "retained" } }),
+              );
+              migrationCommitted = true;
+            }
+          }
+          return await acquire(params);
+        });
+      const continueAdd = vi.fn(async () => ({
+        agent: { finalId: "workflow-operator" },
+        status: "complete" as const,
+      }));
       mocks.stage.mockImplementation(
         async (_plan: ClawAddPlan, options: { runtimeBatch: PluginInstallRuntimeBatch }) => {
           options.runtimeBatch.retain("fixture");
           return {
             kind: "ready",
             continue: continueAdd,
-            failBeforeContinue: async (_error: unknown, code: string) => partial(code),
+            failBeforeContinue: async (_error: unknown, code: string) => ({
+              agent: { finalId: "workflow-operator" },
+              status: "partial" as const,
+              error: { code, message: "Runtime activation failed" },
+            }),
           };
         },
       );
       const reloadPlugins = vi.fn(async (_targets, options) =>
         withPluginLifecycleLease({ env }, async () => {
           options?.commitGuard?.();
-          return reloadReceipt;
+          return { operationId: "reload", generation: 3, pluginIds: ["fixture"] };
         }),
       );
-      const result = await applyClawAddForGateway(applyInput(env, reloadPlugins));
-      expect(migrationCommitted).toBe(true);
-      expect(result).toMatchObject({ status: "complete" });
-      expect(continueAdd).toHaveBeenCalledOnce();
+      try {
+        const result = await applyClawAddForGateway({
+          source: { packageName: "@openclaw/workflow-operator", version: "1.0.0" },
+          planIntegrity: projection.planIntegrity,
+          getPlanningContext: async () => ({ config, sourceMcpServers: {} }),
+          policyConfig: { configPath: env.OPENCLAW_CONFIG_PATH, env },
+          assertCurrent: () => {},
+          reloadPlugins,
+        });
+        expect(migrationCommitted).toBe(true);
+        expect(result).toMatchObject({ status: "complete" });
+        expect(continueAdd).toHaveBeenCalledOnce();
+      } finally {
+        acquireSpy.mockRestore();
+      }
     });
   });
 
@@ -241,16 +237,13 @@ describe("Gateway Claw Add plugin handoff", () => {
   ] as const)(
     "settles %s before workspace effects and resumes only after a fresh policy read",
     async (outcome) => {
-      const { env, record } = await fixture();
+      const { env, index } = await fixture();
       await withEnvAsync(env, async () => {
         const events: string[] = [];
         let authorityActive = true;
         const zeroTarget = outcome === "owner-reuse-removed" || outcome === "plugin-disabled-reuse";
         const disableAfterFinish =
           outcome === "plugin-disabled-reuse" || outcome === "plugin-disabled-retained";
-        const stagePartial = outcome.startsWith("stage-partial");
-        const skipReload =
-          outcome === "prepare-failure" || outcome === "lease-finalizer-failure" || zeroTarget;
         const continueAdd = vi.fn(
           async (options: {
             getCurrentConfig: () => OpenClawConfig;
@@ -261,13 +254,17 @@ describe("Gateway Claw Add plugin handoff", () => {
             const currentConfig = options.getCurrentConfig();
             expect(currentConfig.gateway?.controlUi?.experimental?.claws).toBe(true);
             options.assertReviewedConfig(currentConfig);
-            return complete;
+            return { agent: { finalId: "workflow-operator" }, status: "complete" };
           },
         );
         const failBeforeContinue = vi.fn(async (_error: unknown, code: string) => {
           events.push("fail");
           expect(hasPluginLifecycleLease()).toBe(false);
-          return partial(code);
+          return {
+            agent: { finalId: "workflow-operator" },
+            status: "partial",
+            error: { code, message: "Runtime activation failed" },
+          };
         });
         mocks.stage.mockImplementation(
           async (_plan: ClawAddPlan, options: { runtimeBatch: PluginInstallRuntimeBatch }) => {
@@ -285,10 +282,14 @@ describe("Gateway Claw Add plugin handoff", () => {
                 },
               });
             }
-            if (stagePartial) {
+            if (outcome.startsWith("stage-partial")) {
               return {
                 kind: "partial",
-                result: partial("package_install_failed", "Package installation failed"),
+                result: {
+                  agent: { finalId: "workflow-operator" },
+                  status: "partial",
+                  error: { code: "package_install_failed", message: "Package installation failed" },
+                },
               };
             }
             return { kind: "ready", continue: continueAdd, failBeforeContinue };
@@ -297,12 +298,17 @@ describe("Gateway Claw Add plugin handoff", () => {
         const reloadPlugins = vi.fn(async (_targets, reloadOptions) => {
           events.push("reload");
           expect(hasPluginLifecycleLease()).toBe(true);
-          if (outcome === "policy-drift-at-commit" || outcome === "plugin-disabled-at-commit") {
-            await writeJson(
+          if (outcome === "policy-drift-at-commit") {
+            await fs.writeFile(
               env.OPENCLAW_CONFIG_PATH,
-              outcome === "plugin-disabled-at-commit"
-                ? disabledConfig
-                : { gateway: { controlUi: { experimental: { claws: false } } } },
+              JSON.stringify({ gateway: { controlUi: { experimental: { claws: false } } } }),
+            );
+            reloadOptions?.commitGuard?.();
+          }
+          if (outcome === "plugin-disabled-at-commit") {
+            await fs.writeFile(
+              env.OPENCLAW_CONFIG_PATH,
+              JSON.stringify({ ...config, plugins: { entries: { fixture: { enabled: false } } } }),
             );
             reloadOptions?.commitGuard?.();
           }
@@ -312,60 +318,118 @@ describe("Gateway Claw Add plugin handoff", () => {
           if (outcome === "authority-lost") {
             authorityActive = false;
           }
-          return reloadReceipt;
+          return { operationId: "reload", generation: 2, pluginIds: ["fixture"] };
         });
 
-        const finish = PluginInstallRuntimeBatch.prototype.finish;
-        if (outcome.startsWith("owner-") || disableAfterFinish) {
-          vi.spyOn(PluginInstallRuntimeBatch.prototype, "finish").mockImplementation(
-            async function (this: PluginInstallRuntimeBatch, warn) {
-              const application = await finish.call(this, warn);
-              if (disableAfterFinish) {
-                await writeJson(env.OPENCLAW_CONFIG_PATH, disabledConfig);
-                return application;
-              }
-              writeIndex(
-                env,
-                outcome === "owner-replaced"
-                  ? { fixture: { ...record, installedAt: "2026-10-02T03:00:00.000Z" } }
-                  : {},
-                2,
-              );
-              return application;
-            },
-          );
-        }
+        const finish = Reflect.get(
+          PluginInstallRuntimeBatch.prototype,
+          "finish",
+        ) as PluginInstallRuntimeBatch["finish"];
+        const finishSpy =
+          outcome === "owner-removed" ||
+          outcome === "owner-replaced" ||
+          outcome === "owner-reuse-removed" ||
+          disableAfterFinish
+            ? vi
+                .spyOn(PluginInstallRuntimeBatch.prototype, "finish")
+                .mockImplementation(async function (this: PluginInstallRuntimeBatch, warn) {
+                  const application = await finish.call(this, warn);
+                  if (disableAfterFinish) {
+                    await fs.writeFile(
+                      env.OPENCLAW_CONFIG_PATH,
+                      JSON.stringify({
+                        ...config,
+                        plugins: { entries: { fixture: { enabled: false } } },
+                      }),
+                    );
+                    return application;
+                  }
+                  const fixtureRecord = index.installRecords.fixture;
+                  if (!fixtureRecord) {
+                    throw new Error("Fixture plugin install record is missing");
+                  }
+                  const replacement: typeof index.installRecords =
+                    outcome === "owner-removed" || outcome === "owner-reuse-removed"
+                      ? {}
+                      : {
+                          fixture: {
+                            ...fixtureRecord,
+                            installedAt: "2026-10-02T03:00:00.000Z",
+                          },
+                        };
+                  writeConfigMachineState(
+                    "plugins.installedIndex",
+                    {
+                      revision: 2,
+                      index: createInstalledPluginIndex({
+                        plugins: [],
+                        installRecords: replacement,
+                      }),
+                    },
+                    { env },
+                  );
+                  return application;
+                })
+            : undefined;
 
-        const result = await applyClawAddForGateway(
-          applyInput(env, reloadPlugins, () => {
+        const result = await applyClawAddForGateway({
+          source: { packageName: "@openclaw/workflow-operator", version: "1.0.0" },
+          planIntegrity: projection.planIntegrity,
+          getPlanningContext: async () => ({ config, sourceMcpServers: {} }),
+          policyConfig: { configPath: env.OPENCLAW_CONFIG_PATH, env },
+          assertCurrent: () => {
             if (!authorityActive) {
               throw new Error("Gateway Add authority ended");
             }
-          }),
-        );
+          },
+          reloadPlugins,
+        }).finally(() => finishSpy?.mockRestore());
 
-        const success = outcome === "success";
-        expect(events).toEqual([
-          "stage",
-          ...(skipReload ? [] : ["reload"]),
-          ...(stagePartial ? [] : [success ? "continue" : "fail"]),
-        ]);
-        const code =
-          outcome === "stage-partial"
-            ? "package_install_failed"
-            : outcome === "authority-lost" || outcome.startsWith("owner-") || disableAfterFinish
-              ? "policy_recheck_failed"
-              : "package_runtime_failed";
-        expect(result).toMatchObject(
-          success ? { status: "complete" } : { status: "partial", error: { code } },
-        );
-        if (outcome === "stage-partial-runtime-failure") {
-          expect(result.error?.message).toContain("package_install_failed");
-          expect(result.error?.message).toMatch(/runtime activation failed/i);
+        if (outcome === "success") {
+          expect(events).toEqual(["stage", "reload", "continue"]);
+          expect(result).toMatchObject({ status: "complete" });
+          expect(continueAdd).toHaveBeenCalledOnce();
+          expect(failBeforeContinue).not.toHaveBeenCalled();
+        } else if (outcome.startsWith("stage-partial")) {
+          expect(events).toEqual(["stage", "reload"]);
+          expect(result).toMatchObject({
+            status: "partial",
+            error: {
+              code:
+                outcome === "stage-partial-runtime-failure"
+                  ? "package_runtime_failed"
+                  : "package_install_failed",
+            },
+          });
+          if (outcome === "stage-partial-runtime-failure") {
+            expect(result.error?.message).toContain("package_install_failed");
+            expect(result.error?.message).toMatch(/runtime activation failed/i);
+          }
+          expect(continueAdd).not.toHaveBeenCalled();
+          expect(failBeforeContinue).not.toHaveBeenCalled();
+        } else {
+          expect(events).toEqual(
+            outcome === "prepare-failure" || outcome === "lease-finalizer-failure" || zeroTarget
+              ? ["stage", "fail"]
+              : ["stage", "reload", "fail"],
+          );
+          expect(result).toMatchObject({
+            status: "partial",
+            error: {
+              code:
+                outcome === "authority-lost" || outcome.startsWith("owner-") || disableAfterFinish
+                  ? "policy_recheck_failed"
+                  : "package_runtime_failed",
+            },
+          });
+          expect(continueAdd).not.toHaveBeenCalled();
+          expect(failBeforeContinue).toHaveBeenCalledOnce();
         }
-        expect(continueAdd).toHaveBeenCalledTimes(success ? 1 : 0);
-        expect(failBeforeContinue).toHaveBeenCalledTimes(success || stagePartial ? 0 : 1);
-        expect(reloadPlugins).toHaveBeenCalledTimes(skipReload ? 0 : 1);
+        expect(reloadPlugins).toHaveBeenCalledTimes(
+          outcome === "prepare-failure" || outcome === "lease-finalizer-failure" || zeroTarget
+            ? 0
+            : 1,
+        );
       });
     },
   );
