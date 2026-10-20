@@ -236,6 +236,7 @@ function startTimeline(output) {
     previousMemory,
     previousDisks = new Map();
   let previousAt = started;
+  let previousProcessAt = started;
   const phase = () => {
     try {
       const value = readFileSync(phaseFile, "utf8").trim();
@@ -315,11 +316,10 @@ function startTimeline(output) {
     const vm = memory(await probe("/usr/bin/vm_stat"));
     const pressure = await probe("/usr/sbin/sysctl", ["-n", "kern.memorystatus_vm_pressure_level"]);
     const diskRows = disks(await probe("/usr/sbin/iostat", ["-Id"]));
-    const rows = processRows(
-      await probe("/bin/ps", ["-axo", "pid=,ppid=,time=,rss=,state=,comm="]),
-      previousProcesses,
-      at - previousAt,
-    );
+    const processOutput = await probe("/bin/ps", ["-axo", "pid=,ppid=,time=,rss=,state=,comm="]);
+    // Earlier probes can stall independently of the interval between process CPU observations.
+    const processAt = performance.now();
+    const rows = processRows(processOutput, previousProcesses, processAt - previousProcessAt);
     if (!active) {
       return;
     }
@@ -377,6 +377,7 @@ function startTimeline(output) {
       collector: overhead(),
     });
     previousAt = at;
+    previousProcessAt = processAt;
     previousCpu = cpu;
     previousMemory = vm;
     previousDisks = new Map(diskRows.map((disk) => [disk.device, disk]));

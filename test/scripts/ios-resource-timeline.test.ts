@@ -90,6 +90,90 @@ describe("iOS resource timeline workload boundary", () => {
     });
   });
 
+  posixIt(
+    "uses process observation intervals and resets CPU baseline after a missing probe",
+    () => {
+      const root = tempDirs.make("ios-resource-timeline-");
+      const output = path.join(root, "timeline.jsonl");
+      const complete = path.join(root, "complete");
+      const preload = path.join(root, "native-probes.mjs");
+      // Only this subprocess has accelerated time and synthetic native observations.
+      writeFileSync(
+        preload,
+        `
+      import childProcess from "node:child_process";
+      import { writeFileSync } from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      let now = 0, observations = 0;
+      Object.defineProperty(process, "platform", { value: "darwin" });
+      Object.defineProperty(performance, "now", { value: () => now });
+      globalThis.setTimeout = (callback, delay) => {
+        if (observations === 6) {
+          writeFileSync(${JSON.stringify(complete)}, "complete");
+          return;
+        }
+        return setImmediate(() => { now += delay; callback(); });
+      };
+      globalThis.clearTimeout = clearImmediate;
+      childProcess.execFile = (_file, args, _options, callback) => {
+        let error = null, stdout = "";
+        if (args.includes("/usr/bin/vm_stat") && observations === 1) now += 75_000;
+        if (args.includes("/bin/ps")) {
+          if (observations === 3) error = Object.assign(new Error("probe unavailable"), { killed: true });
+          else stdout = "42 1 " + (now / 1_000).toFixed(2) + " 1024 R /usr/bin/xcodebuild\\n";
+          observations += 1;
+        }
+        setImmediate(() => callback(error, stdout));
+        return { kill() {} };
+      };
+      syncBuiltinESMExports();
+    `,
+      );
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--import",
+          preload,
+          script,
+          "--output",
+          output,
+          "--",
+          process.execPath,
+          "--input-type=module",
+          "-e",
+          `
+        import { existsSync, watch } from "node:fs";
+        const finish = () => {
+          if (existsSync(${JSON.stringify(complete)})) { watcher.close(); process.exit(23); }
+        };
+        const watcher = watch(${JSON.stringify(root)}, finish);
+        finish();
+      `,
+        ],
+        {
+          encoding: "utf8",
+          timeout: 5_000,
+          env: { ...process.env, OPENCLAW_IOS_RESOURCE_DIAGNOSTICS: "1" },
+        },
+      );
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(23);
+      expect(result.stderr).toBe("");
+      const records = readFileSync(output, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const samples = records.filter((record) => record.type === "sample");
+      expect(
+        samples.map((sample) =>
+          sample.processes.map((row: { cpuPercent: number | null }) => row.cpuPercent),
+        ),
+      ).toEqual([[null], [100], [100], [], [null], [100]]);
+      expect(samples[3].probes.ps.outcome).toBe("timeout");
+      expect(records.at(-1)).toMatchObject({ type: "end", code: 23, signal: null });
+    },
+  );
+
   posixIt("retains the child's terminating signal", () => {
     const output = path.join(tempDirs.make("ios-resource-timeline-"), "timeline.jsonl");
     const result = run(output, `process.kill(process.pid, "SIGTERM");`);
