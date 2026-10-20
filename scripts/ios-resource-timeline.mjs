@@ -288,14 +288,18 @@ function startTimeline(output) {
         },
         (error, stdout) => {
           pending = undefined;
-          commandWallMs += performance.now() - at;
-          probeStatus[path.basename(command)] = !error
-            ? "ok"
-            : error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
-              ? "output-limit"
-              : error.killed
-                ? "timeout"
-                : "unavailable";
+          const wallMs = performance.now() - at;
+          commandWallMs += wallMs;
+          probeStatus[path.basename(command)] = {
+            wallMs: Math.round(wallMs),
+            outcome: !error
+              ? "ok"
+              : error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"
+                ? "output-limit"
+                : error.killed
+                  ? "timeout"
+                  : "unavailable",
+          };
           if (error) {
             unavailableProbes += 1;
           }
@@ -305,6 +309,8 @@ function startTimeline(output) {
     });
   async function sample() {
     const at = performance.now();
+    const startedAt = new Date().toISOString();
+    const phaseAtStart = phase();
     probeStatus = {};
     const vm = memory(await probe("/usr/bin/vm_stat"));
     const pressure = await probe("/usr/sbin/sysctl", ["-n", "kern.memorystatus_vm_pressure_level"]);
@@ -328,6 +334,8 @@ function startTimeline(output) {
     samples += 1;
     emit({
       type: "sample",
+      startedAt,
+      phaseAtStart,
       at: new Date().toISOString(),
       phase: phase(),
       intervalMs: samples === 1 ? null : Math.round(at - previousAt),

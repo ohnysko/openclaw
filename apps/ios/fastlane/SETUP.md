@@ -293,9 +293,13 @@ become `other`. It never exports arguments, environment values, paths, or applic
 content. Fixed phase labels correlate samples with builds, simulator startup,
 Gateway preparation, native tests, screenshots, archiving, and upload.
 
-Each native observation has a two-second deadline. Collection is independent of
-the workload, never overlaps or catches up after a slow sample, and stops at a
-4 MiB output limit. Missing observations remain diagnostics, not release failures.
+Each native observation requests termination after two seconds. A starved runner
+can delay process termination and output closure beyond that deadline. Samples
+record their start/end timestamps and phases plus each probe's elapsed wall time;
+slow samples can span phases and must not be treated as instantaneous snapshots.
+Collection is independent of the workload, never overlaps or catches up after a
+slow sample, and stops at a 4 MiB output limit. Missing observations remain
+diagnostics, not release failures.
 The footer records collector Node CPU time and RSS; native observation subprocess
 CPU is excluded. RSS is not physical memory footprint, CPU deltas miss processes
 that start and exit between samples, and sparse sampling cannot establish a
