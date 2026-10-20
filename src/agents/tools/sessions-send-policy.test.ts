@@ -2,23 +2,13 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { Value } from "typebox/value";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { setRuntimeConfigSnapshot } from "../../config/config.js";
-import {
-  appendTranscriptMessage,
-  replaceSessionEntry,
-} from "../../config/sessions/session-accessor.js";
+import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { SessionToolsVisibility } from "../../plugin-sdk/session-visibility.js";
-import {
-  captureActivePluginRegistrySnapshot,
-  restoreActivePluginRegistrySnapshot,
-  setActivePluginRegistry,
-} from "../../plugins/runtime.js";
+import * as plugins from "../../plugins/runtime.js";
 import * as sessionStateEvents from "../../sessions/session-state-events.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import {
-  createOpenClawTestState,
-  type OpenClawTestState,
-} from "../../test-utils/openclaw-test-state.js";
+import * as testState from "../../test-utils/openclaw-test-state.js";
 import { createSessionConversationTestRegistry } from "../../test-utils/session-conversation-registry.js";
 import { truncateToolResultMessage } from "../embedded-agent-runner/tool-result-truncation.js";
 import type { AgentToolGatewayRequestCaller } from "./in-process-gateway.js";
@@ -30,57 +20,57 @@ import { createSessionsSearchTool } from "./sessions-search-tool.js";
 import { createSessionsSendTool } from "./sessions-send-tool.js";
 import { SessionsSendOutputSchema } from "./sessions-send-tool.schema.js";
 
+type GatewayRequest = Parameters<AgentToolGatewayRequestCaller>[0];
 const requesterKey = "agent:main:dashboard:requester";
 const subagentRequesterKey = "agent:main:subagent:requester";
 const workerKey = "agent:worker:main";
 const workerSessionId = "91ee481c-f60c-42bc-a238-2fb0306e4f55";
 const nativeChildKey = "agent:worker:subagent:owned-child";
-const acpChildKey = "agent:worker:acp:owned-child";
+const workerTarget = { agentId: "worker" };
+const workerSession = { sessionKey: workerKey };
 const replyText = "Result from the dispatched run only";
 const runId = "send-policy-run";
-function ownedChild(key: string, name: string) {
-  return {
-    key,
-    agentId: "worker",
-    sessionId: `${name}-session`,
-    label: name,
-    spawnedBy: requesterKey,
-  };
-}
 const sessions = [
   { key: requesterKey, agentId: "main", sessionId: "requester-session" },
   { key: subagentRequesterKey, agentId: "main", sessionId: "subagent-requester-session" },
   { key: workerKey, agentId: "worker", sessionId: workerSessionId, label: "delegation-worker" },
   { key: "global", agentId: "worker", sessionId: "raw-worker-session", label: "raw-worker" },
   { key: "agent:stranger:main", agentId: "stranger", sessionId: "stranger-session" },
-  ownedChild(nativeChildKey, "native-child"),
-  ownedChild(acpChildKey, "acp-child"),
+  {
+    key: nativeChildKey,
+    agentId: "worker",
+    sessionId: "native-child-session",
+    label: "native-child",
+    spawnedBy: requesterKey,
+  },
 ];
 
 function configFor(
-  options: {
-    send?: string[];
-    visibility?: SessionToolsVisibility;
-    global?: NonNullable<OpenClawConfig["tools"]>["agentToAgent"];
-  } = {},
+  outbound?: string[],
+  visibility: SessionToolsVisibility = "self",
+  global: NonNullable<OpenClawConfig["tools"]>["agentToAgent"] = {
+    enabled: true,
+    allow: ["main", "worker", "stranger"],
+  },
 ): OpenClawConfig {
   return {
     agents: {
       ownership: "explicit",
       defaults: { sandbox: { sessionToolsVisibility: "spawned" } },
       entries: {
-        main: options.send === undefined ? {} : { tools: { agentToAgent: { send: options.send } } },
+        main: outbound === undefined ? {} : { tools: { agentToAgent: { send: outbound } } },
         worker: { tools: { agentToAgent: { send: [] } } },
         stranger: {},
       },
     },
     session: { mainKey: "main", scope: "per-sender" },
     tools: {
-      sessions: { visibility: options.visibility ?? "self" },
-      agentToAgent: options.global ?? { enabled: true, allow: ["main", "worker", "stranger"] },
+      sessions: { visibility },
+      agentToAgent: global,
     },
   };
 }
+const allowOnly = (...allow: string[]) => configFor(["worker"], "self", { enabled: true, allow });
 
 const callGateway = vi.fn();
 let replyPreview = replyText;
@@ -93,24 +83,19 @@ function assistantReply(text: string, id = runId) {
     content: [{ type: "text" as const, text }],
   };
 }
-function mockReplyHistory(preview: string, messages: ReturnType<typeof assistantReply>[]) {
-  replyPreview = preview;
-  historyMessages = messages;
-}
-
 function gatewayMethods() {
   return callGateway.mock.calls.map(([request]) => request.method);
 }
 
 function send(
-  config: OpenClawConfig,
+  config = configFor(["worker"]),
   target: {
     agentId?: string;
     sessionKey?: string;
     label?: string;
     watch?: boolean;
     message?: string;
-  } = { agentId: "worker" },
+  } = workerTarget,
   options: { agentSessionKey?: string; sandboxed?: boolean } = {},
 ) {
   setRuntimeConfigSnapshot(config);
@@ -128,8 +113,9 @@ function send(
 }
 
 function expectNoDispatch() {
-  expect(gatewayMethods()).not.toContain("agent");
-  expect(gatewayMethods()).not.toContain("agent.wait");
+  expect(
+    gatewayMethods().filter((method) => method === "agent" || method === "agent.wait"),
+  ).toEqual([]);
 }
 function gatewayParams(method: string) {
   return callGateway.mock.calls.find(([request]) => request.method === method)?.[0].params;
@@ -137,31 +123,26 @@ function gatewayParams(method: string) {
 function expectOk(result: Awaited<ReturnType<typeof send>>, extra = {}) {
   expect(result.details).toMatchObject({ status: "ok", reply: replyText, ...extra });
 }
+function expectDenied(result: Awaited<ReturnType<typeof send>>, error?: string) {
+  expect(result.details).toMatchObject({
+    status: "forbidden",
+    ...(error ? { error: expect.stringContaining(error) } : {}),
+  });
+  expectNoDispatch();
+}
 
 describe("sessions_send directed policy at the tool boundary", () => {
-  let state: OpenClawTestState;
-  let originalRegistry: ReturnType<typeof captureActivePluginRegistrySnapshot>;
+  let state: testState.OpenClawTestState;
+  let originalRegistry: ReturnType<typeof plugins.captureActivePluginRegistrySnapshot>;
 
   beforeAll(async () => {
-    originalRegistry = captureActivePluginRegistrySnapshot();
-    state = await createOpenClawTestState({ scenario: "minimal" });
+    originalRegistry = plugins.captureActivePluginRegistrySnapshot();
+    state = await testState.createOpenClawTestState({ scenario: "minimal" });
     setRuntimeConfigSnapshot(configFor());
-    setActivePluginRegistry(createSessionConversationTestRegistry());
+    plugins.setActivePluginRegistry(createSessionConversationTestRegistry());
     for (const { key, agentId, sessionId, ...entry } of sessions) {
-      await replaceSessionEntry(
-        { agentId, sessionKey: key },
-        { sessionId, updatedAt: 1, ...entry },
-      );
-      await appendTranscriptMessage(
-        { agentId, sessionKey: key, sessionId },
-        {
-          message: {
-            ...assistantReply(replyText),
-            phase: "final_answer",
-            stopReason: "stop",
-          },
-        },
-      );
+      const target = { agentId, sessionKey: key };
+      await replaceSessionEntry(target, { sessionId, updatedAt: 1, ...entry });
     }
   });
 
@@ -169,80 +150,71 @@ describe("sessions_send directed policy at the tool boundary", () => {
     callGateway.mockReset();
     replyPreview = replyText;
     historyMessages = undefined;
-    callGateway.mockImplementation(
-      async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-        const params = isRecord(request.params) ? request.params : {};
-        if (request.method === "sessions.resolve") {
-          const row = sessions.find(
-            (session) =>
-              (params.key === session.key ||
-                params.sessionId === session.sessionId ||
-                (params.label !== undefined && params.label === session.label)) &&
-              (!params.agentId || params.agentId === session.agentId) &&
-              (!params.spawnedBy || params.spawnedBy === session.spawnedBy),
-          );
-          if (row) {
-            return { key: row.key, agentId: row.agentId };
-          }
-          if (params.allowMissing) {
-            return {};
-          }
-          throw new Error("No session found");
+    callGateway.mockImplementation(async (request: GatewayRequest) => {
+      const params = isRecord(request.params) ? request.params : {};
+      if (request.method === "sessions.resolve") {
+        const row = sessions.find(
+          (session) =>
+            (params.key === session.key ||
+              params.sessionId === session.sessionId ||
+              (params.label !== undefined && params.label === session.label)) &&
+            (!params.agentId || params.agentId === session.agentId) &&
+            (!params.spawnedBy || params.spawnedBy === session.spawnedBy),
+        );
+        if (row) {
+          return { key: row.key, agentId: row.agentId };
         }
-        if (request.method === "sessions.list") {
-          return {
-            sessions: sessions
-              .filter((session) => !params.spawnedBy || params.spawnedBy === session.spawnedBy)
-              .map((session) => Object.assign({ classification: "main" }, session)),
-          };
+        if (params.allowMissing) {
+          return {};
         }
-        if (request.method === "agent") {
-          return { runId, status: "accepted" };
-        }
-        if (request.method === "agent.wait") {
-          expect(params.runId).toBe(runId);
-          return {
-            runId,
-            status: "ok",
-            terminalReply: { disposition: "visible", text: replyPreview },
-          };
-        }
-        if (request.method === "chat.history" && historyMessages) {
-          return { messages: historyMessages };
-        }
-        throw new Error("Unexpected Gateway method: " + request.method);
-      },
-    );
+        throw new Error("No session found");
+      }
+      if (request.method === "sessions.list") {
+        return {
+          sessions: sessions
+            .filter((session) => !params.spawnedBy || params.spawnedBy === session.spawnedBy)
+            .map((session) => Object.assign({ classification: "main" }, session)),
+        };
+      }
+      if (request.method === "agent") {
+        return { runId, status: "accepted" };
+      }
+      if (request.method === "agent.wait") {
+        expect(params.runId).toBe(runId);
+        return {
+          runId,
+          status: "ok",
+          terminalReply: { disposition: "visible", text: replyPreview },
+        };
+      }
+      if (request.method === "chat.history" && historyMessages) {
+        return { messages: historyMessages };
+      }
+      throw new Error("Unexpected Gateway method: " + request.method);
+    });
   });
 
   it.each([
-    ["agent ID", { agentId: "worker" }, configFor({ send: [] }), true],
-    [
-      "global disable",
-      { sessionKey: workerKey },
-      configFor({ send: ["worker"], global: { enabled: false } }),
-      true,
-    ],
+    ["agent ID", workerTarget, configFor([]), true],
+    ["global disable", workerSession, configFor(["worker"], "self", { enabled: false }), true],
     [
       "unrelated reload",
-      { sessionKey: workerKey },
-      { ...configFor({ send: ["worker"] }), gateway: { port: 19870 } },
+      workerSession,
+      { ...configFor(["worker"]), gateway: { port: 19870 } },
       false,
     ],
   ] as const)("rechecks current policy after resolving %s", async (_name, target, next, denied) => {
     const resolving = createDeferredCore();
     const resume = createDeferredCore();
     const resolve = callGateway.getMockImplementation()!;
-    callGateway.mockImplementation(
-      async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-        if (request.method === "sessions.resolve") {
-          resolving.resolve();
-          await resume.promise;
-        }
-        return await resolve(request);
-      },
-    );
-    const pending = send(configFor({ send: ["worker"] }), target);
+    callGateway.mockImplementation(async (request: GatewayRequest) => {
+      if (request.method === "sessions.resolve") {
+        resolving.resolve();
+        await resume.promise;
+      }
+      return await resolve(request);
+    });
+    const pending = send(undefined, target);
     try {
       await resolving.promise;
       setRuntimeConfigSnapshot(next);
@@ -259,17 +231,15 @@ describe("sessions_send directed policy at the tool boundary", () => {
     }
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
+  afterEach(vi.restoreAllMocks);
 
   afterAll(async () => {
-    restoreActivePluginRegistrySnapshot(originalRegistry);
+    plugins.restoreActivePluginRegistrySnapshot(originalRegistry);
     await state.cleanup();
   });
 
   it("prefers sessionKey over a redundant label without trimming the message", async () => {
-    const result = await send(configFor({ send: ["worker"] }), {
+    const result = await send(undefined, {
       sessionKey: workerKey,
       label: "stale-label",
       message: "    indented body",
@@ -289,9 +259,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
   });
 
   it("sends by session ID under self visibility and returns only that run's reply", async () => {
-    const result = await send(configFor({ send: ["worker"] }), {
-      sessionKey: workerSessionId,
-    });
+    const result = await send(undefined, { sessionKey: workerSessionId });
 
     expectOk(result, { sessionKey: workerKey, runId });
     const dispatches = callGateway.mock.calls.filter(([request]) => request.method === "agent");
@@ -305,29 +273,33 @@ describe("sessions_send directed policy at the tool boundary", () => {
   });
 
   it.each([
-    { name: "long reply", full: `${"a".repeat(5_000)}TAIL`, preview: `${"a".repeat(4_095)}…` },
-    {
-      name: "whitespace-shortened preview",
-      full: `${"a".repeat(4_000)}${" ".repeat(100)}TAIL`,
-      preview: `${"a".repeat(4_000)}…`,
-    },
-    { name: "literal ellipsis", full: "Still thinking…", preview: "Still thinking…" },
-    {
-      name: "tool-budget overflow",
-      full: `${"a".repeat(20_000)}TAIL`,
-      preview: `${"a".repeat(4_095)}…`,
-    },
-  ])(
-    "returns the accepted run's full $name with explicit tool-budget truncation",
-    async ({ full, preview }) => {
-      mockReplyHistory(preview, [
-        assistantReply(full),
+    ["long reply", `${"a".repeat(5_000)}TAIL`, `${"a".repeat(4_095)}…`],
+    [
+      "whitespace-shortened preview",
+      `${"a".repeat(4_000)}${" ".repeat(100)}TAIL`,
+      `${"a".repeat(4_000)}…`,
+    ],
+    ["literal ellipsis", "Still thinking…", "Still thinking…"],
+    ["tool-budget overflow", `${"a".repeat(20_000)}TAIL`, `${"a".repeat(4_095)}…`],
+    ["unavailable full reply", undefined, `${"a".repeat(4_095)}…`],
+  ] satisfies [string, string | undefined, string][])(
+    "returns the accepted run's %s with explicit tool-budget truncation",
+    async (_name, full, preview) => {
+      replyPreview = preview;
+      historyMessages = [
+        ...(full === undefined ? [] : [assistantReply(full)]),
         assistantReply("Unrelated answer", "later-run"),
-      ]);
-
-      const result = await send(configFor({ send: ["worker"] }));
-      expect(result.details).toMatchObject({ status: "ok", reply: full });
-      expect(result.details).not.toHaveProperty("replyTruncated");
+      ];
+      const result = await send();
+      expect(result.details).toMatchObject({ status: "ok", reply: full ?? preview });
+      if (full === undefined) {
+        expect(result.details).toMatchObject({
+          replyTruncated: true,
+          note: expect.stringContaining("missing section or a file"),
+        });
+      } else {
+        expect(result.details).not.toHaveProperty("replyTruncated");
+      }
       expect(Value.Check(SessionsSendOutputSchema, result.details)).toBe(true);
 
       const projected = truncateToolResultMessage(
@@ -342,7 +314,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
         16_000,
       );
       const text = projected.content.find((block) => block.type === "text")?.text;
-      if (full.length > 16_000) {
+      if (full && full.length > 16_000) {
         expect(text).toMatch(/\d+ more characters truncated/);
         expect(text).toContain("ask the target session for the missing section or a file");
         expect(text).toContain("do not repeat the original task");
@@ -352,53 +324,17 @@ describe("sessions_send directed policy at the tool boundary", () => {
     },
   );
 
-  it("reports a truncated preview when the accepted run's full reply is unavailable", async () => {
-    const preview = `${"a".repeat(4_095)}…`;
-    mockReplyHistory(preview, [assistantReply("Unrelated answer", "other-run")]);
-    const result = await send(configFor({ send: ["worker"] }));
-    expect(result.details).toMatchObject({
-      status: "ok",
-      reply: preview,
-      replyTruncated: true,
-      note: expect.stringContaining("missing section or a file"),
-    });
-    expect(Value.Check(SessionsSendOutputSchema, result.details)).toBe(true);
-  });
-
   it.each([
-    [
-      "unlisted key",
-      { send: ["worker"], visibility: "all" },
-      { sessionKey: "agent:stranger:main" },
-      "tools.agentToAgent.send",
-    ],
-    ["omitted outbound policy", {}, { agentId: "worker" }, undefined],
-    [
-      "requester excluded",
-      { send: ["worker"], global: { enabled: true, allow: ["worker"] } },
-      { agentId: "worker" },
-      "tools.agentToAgent.allow",
-    ],
-    [
-      "target excluded",
-      { send: ["worker"], global: { enabled: true, allow: ["main"] } },
-      { agentId: "worker" },
-      "tools.agentToAgent.allow",
-    ],
-  ] satisfies [
-    string,
-    Parameters<typeof configFor>[0],
-    Parameters<typeof send>[1],
-    string | undefined,
-  ][])("denies %s before dispatch", async (_name, options, target, error) => {
-    const config = configFor(options);
-    const result = await send(config, target);
-    expect(result.details).toMatchObject({ status: "forbidden" });
-    if (error) {
-      expect(result.details).toMatchObject({ error: expect.stringContaining(error) });
-    }
-    expectNoDispatch();
-  });
+    ["unlisted key", configFor(["worker"], "all"), { sessionKey: "agent:stranger:main" }, "send"],
+    ["omitted outbound policy", configFor(), workerTarget, undefined],
+    ["requester excluded", allowOnly("worker"), workerTarget, "allow"],
+    ["target excluded", allowOnly("main"), workerTarget, "allow"],
+  ] satisfies [string, OpenClawConfig, Parameters<typeof send>[1], string | undefined][])(
+    "denies %s before dispatch",
+    async (_name, config, target, error) => {
+      expectDenied(await send(config, target), error && `tools.agentToAgent.${error}`);
+    },
+  );
 
   it.each(["send-only", "readable", "raw-target"] as const)(
     "reports the requested watch for a %s target",
@@ -406,32 +342,28 @@ describe("sessions_send directed policy at the tool boundary", () => {
       const watch = vi
         .spyOn(sessionStateEvents, "registerSessionStateWatch")
         .mockResolvedValue(true);
-      const config = configFor({
-        send: ["worker"],
-        visibility: access === "send-only" ? "self" : "all",
-      });
+      const config = configFor(["worker"], access === "send-only" ? "self" : "all");
       const result = await send(config, {
         agentId: "worker",
         watch: true,
         ...(access === "raw-target" ? { label: "raw-worker" } : {}),
       });
+      expect(watch).toHaveBeenCalledTimes(access === "readable" ? 1 : 0);
       if (access === "send-only") {
-        expect(result.details).toMatchObject({ status: "forbidden" });
-        expectNoDispatch();
-        expect(watch).not.toHaveBeenCalled();
+        expectDenied(result);
         expectOk(await send(config));
         expect(watch).not.toHaveBeenCalled();
-      } else if (access === "readable") {
-        expectOk(result, { watched: true });
-        expect(watch).toHaveBeenCalledOnce();
       } else {
-        expectOk(result, {
-          watched: false,
-          watchError: expect.stringContaining("agent-qualified"),
-        });
-        expect(watch).not.toHaveBeenCalled();
-        expect(gatewayMethods()).toContain("agent");
-        expect(gatewayMethods()).toContain("agent.wait");
+        expectOk(
+          result,
+          access === "readable"
+            ? { watched: true }
+            : {
+                watched: false,
+                watchError: expect.stringContaining("agent-qualified"),
+              },
+        );
+        expect(gatewayMethods()).toEqual(expect.arrayContaining(["agent", "agent.wait"]));
       }
     },
   );
@@ -439,29 +371,22 @@ describe("sessions_send directed policy at the tool boundary", () => {
   it.each([requesterKey, subagentRequesterKey])(
     "keeps sandbox spawned-only for requester %s",
     async (agentSessionKey) => {
-      const config = configFor({ send: ["worker"], visibility: "all" });
-      const denied = await send(
-        config,
-        { sessionKey: workerKey },
-        { agentSessionKey, sandboxed: true },
-      );
-      expect(denied.details).toMatchObject({ status: "forbidden" });
-      expectNoDispatch();
-
-      const allowed = await send(config, { sessionKey: workerKey }, { agentSessionKey });
-      expectOk(allowed);
+      const config = configFor(["worker"], "all");
+      expectDenied(await send(config, workerSession, { agentSessionKey, sandboxed: true }));
+      expectOk(await send(config, workerSession, { agentSessionKey }));
     },
   );
 
   it.each([false, true])("retains owned-child access (interrupted=%s)", async (interrupted) => {
     const target = { agentId: "worker", sessionKey: nativeChildKey };
     const entry = { sessionId: "native-child-session", updatedAt: 1, spawnedBy: requesterKey };
-    if (interrupted) {
-      await replaceSessionEntry(target, { ...entry, status: "interrupted" });
-    }
+    await replaceSessionEntry(target, {
+      ...entry,
+      ...(interrupted ? { status: "interrupted" as const } : {}),
+    });
     try {
       const result = await send(
-        configFor({ send: [], visibility: "tree" }),
+        configFor([], "tree"),
         interrupted ? { sessionKey: nativeChildKey } : { label: "native-child", agentId: "worker" },
       );
       expectOk(result, { sessionKey: nativeChildKey });
@@ -480,40 +405,28 @@ describe("sessions_send directed policy at the tool boundary", () => {
         expect(prompt).not.toContain("gateway restart");
       }
     } finally {
-      if (interrupted) {
-        await replaceSessionEntry(target, entry);
-      }
+      await replaceSessionEntry(target, entry);
     }
   });
 
   it("does not turn a send grant into list, history, search, or status access", async () => {
-    const config = configFor({ send: ["worker"] });
+    const config = configFor(["worker"]);
     setRuntimeConfigSnapshot(config);
     const options = { config, agentSessionKey: requesterKey, callGateway };
     const listed = await createSessionsListTool(options).execute("list", {});
     expect(listed.details).toMatchObject({ count: 1, sessions: [{ key: requesterKey }] });
 
-    const history = await createSessionsHistoryTool(options).execute("history", {
-      sessionKey: workerKey,
-    });
-    expect(history.details).toMatchObject({ status: "forbidden" });
-    const search = await createSessionsSearchTool(options).execute("search", {
-      sessionKey: workerKey,
-      query: "private",
-    });
-    expect(search.details).toMatchObject({ status: "forbidden" });
-    const statusGateway = vi
-      .spyOn(inProcessGateway, "callAgentToolGatewayRequest")
-      .mockImplementation(callGateway);
-    try {
-      await expect(
-        createSessionStatusTool({ config, agentSessionKey: requesterKey }).execute("status", {
-          sessionKey: workerKey,
-        }),
-      ).rejects.toThrow("visibility");
-    } finally {
-      statusGateway.mockRestore();
-    }
+    expectDenied(await createSessionsHistoryTool(options).execute("history", workerSession));
+    expectDenied(
+      await createSessionsSearchTool(options).execute("search", {
+        ...workerSession,
+        query: "private",
+      }),
+    );
+    vi.spyOn(inProcessGateway, "callAgentToolGatewayRequest").mockImplementation(callGateway);
+    await expect(createSessionStatusTool(options).execute("status", workerSession)).rejects.toThrow(
+      "visibility",
+    );
     expectNoDispatch();
     expect(gatewayMethods()).not.toContain("sessions.search");
     expect(gatewayMethods()).not.toContain("chat.history");

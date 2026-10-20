@@ -73,6 +73,11 @@ vi.mock("./sessions-send-tool.a2a.js", () => ({
 
 const requesterSessionKey = "agent:main:main";
 const targetSessionKey = "agent:main:dashboard:admission-target";
+const targetIdentity = {
+  agentId: "main",
+  sessionKey: targetSessionKey,
+  sessionId: "target-session",
+};
 const runId = "sessions-send-admission-run";
 const config = {
   agents: { ownership: "explicit", entries: { main: {} } },
@@ -81,10 +86,12 @@ const config = {
 } satisfies OpenClawConfig;
 
 type GatewayRequest = Parameters<AgentToolGatewayRequestCaller>[0];
+function unexpectedRequest(request: GatewayRequest): never {
+  throw new Error(`Unexpected Gateway method: ${request.method}`);
+}
 function mockGateway(
-  handle: (request: GatewayRequest) => Promise<unknown> = async (request) => {
-    throw new Error(`Unexpected Gateway method: ${request.method}`);
-  },
+  handle: (request: GatewayRequest) => Promise<unknown> = async (request) =>
+    unexpectedRequest(request),
   list = false,
 ) {
   return vi.fn().mockImplementation((request: GatewayRequest) => {
@@ -98,6 +105,22 @@ function mockGateway(
     }
     return handle(request);
   });
+}
+function mockAgentGateway(handle: (request: GatewayRequest) => Promise<unknown>, list = false) {
+  return mockGateway(
+    async (request) => (request.method === "agent" ? handle(request) : unexpectedRequest(request)),
+    list,
+  );
+}
+function operatorFixture(name: string) {
+  const context = createContext([], () => config);
+  const owner = createOperatorClient({ profileName: `${name}-owner`, scopes: ["operator.write"] });
+  const source = captureGatewayDeviceRevocation(
+    context,
+    { deviceId: `${name}-device`, role: "operator" },
+    () => true,
+  );
+  return { context, owner, source };
 }
 function createTool(options: Parameters<typeof createSessionsSendTool>[0] = {}) {
   return createSessionsSendTool({
@@ -134,6 +157,20 @@ function interceptGateway(callGateway: AgentToolGatewayRequestCaller) {
     gateway.mockRestore();
     mutation.mockRestore();
   };
+}
+function requestParams(callGateway: ReturnType<typeof mockGateway>, method: string) {
+  return callGateway.mock.calls
+    .filter(([request]) => request.method === method)
+    .map(([request]) => request.params);
+}
+function assertPendingAtGate<T>(gate: Promise<void>, pending: Promise<T>, label: string) {
+  return awaitGateBeforeSettlement(
+    gate,
+    pending.then((result) => {
+      throw new Error(`${label} settled early: ${JSON.stringify(result)}`);
+    }),
+    `${label} did not reach its gate`,
+  );
 }
 function inOperatorScope<T>(
   context: ReturnType<typeof createContext>,
@@ -182,13 +219,9 @@ async function trackActualReplyFlow() {
     typeof import("./sessions-send-tool.a2a.js")
   >("./sessions-send-tool.a2a.js");
   const settled = createDeferredCore();
-  vi.mocked(runSessionsSendA2AFlow).mockImplementationOnce(async (params) => {
-    try {
-      await runActualFlow(params);
-    } finally {
-      settled.resolve();
-    }
-  });
+  vi.mocked(runSessionsSendA2AFlow).mockImplementationOnce((params) =>
+    runActualFlow(params).finally(settled.resolve),
+  );
   return settled;
 }
 
@@ -260,16 +293,13 @@ describe("sessions_send dispatch admission", () => {
       };
       setRuntimeConfigSnapshot(currentConfig);
       let admitted = false;
-      const callGateway = mockGateway(async (request) => {
-        if (request.method === "agent") {
-          currentConfig.session!.communication![direction] = "never";
-          setRuntimeConfigSnapshot(currentConfig);
-          request.assertDispatchCurrent?.();
-          request.sessionMutationCommitGuard?.();
-          admitted = true;
-          return { runId, status: "accepted" };
-        }
-        throw new Error(`Unexpected Gateway method: ${request.method}`);
+      const callGateway = mockAgentGateway(async (request) => {
+        currentConfig.session!.communication![direction] = "never";
+        setRuntimeConfigSnapshot(currentConfig);
+        request.assertDispatchCurrent?.();
+        request.sessionMutationCommitGuard?.();
+        admitted = true;
+        return { runId, status: "accepted" };
       });
       const result = await execute(
         createTool({ config: currentConfig, callGateway }),
@@ -285,13 +315,7 @@ describe("sessions_send dispatch admission", () => {
   );
 
   it("releases steering custody only when the selected physical native attempt settles", async () => {
-    const context = createContext([], () => config);
-    const owner = createOperatorClient({ profileName: "steer-owner", scopes: ["operator.write"] });
-    const source = captureGatewayDeviceRevocation(
-      context,
-      { deviceId: "steer-device", role: "operator" },
-      () => true,
-    );
+    const { context, owner, source } = operatorFixture("steer");
     const accepted = createDeferredCore();
     const receipt = createDeferredCore();
     const sessionFile = "/synthetic/steering-custody/session.jsonl";
@@ -320,31 +344,25 @@ describe("sessions_send dispatch admission", () => {
     });
     const sibling = createEmbeddedRunHandle({ runId: "sibling-steer-run" });
     const storePath = resolveSessionStorePathCore(undefined, { agentId: "main" });
-    const operations = [selected, sibling].map((handle, index) => {
-      const operation = createReplyOperation({
-        sessionKey: targetSessionKey,
-        sessionId: "target-session",
-        agentId: "main",
+    const operations = [storePath, `${storePath}.other`].map((storeScope) =>
+      createReplyOperation({
+        ...targetIdentity,
         resetTriggered: false,
         target: captureSessionTarget({
-          storeScope: index === 0 ? storePath : `${storePath}.other`,
+          storeScope,
           sessionKey: targetSessionKey,
           agentId: "main",
           incarnation: "target-session",
         }),
-      });
-      if (index === 1) {
-        attachActiveEmbeddedRun(
-          "target-session",
-          handle,
-          targetSessionKey,
-          undefined,
-          "main",
-          operation,
-        );
-      }
-      return operation;
-    });
+      }),
+    );
+    const attach = (
+      handle: typeof selected,
+      operation: Parameters<typeof attachActiveEmbeddedRun>[5],
+      file?: string,
+    ) =>
+      attachActiveEmbeddedRun("target-session", handle, targetSessionKey, file, "main", operation);
+    attach(sibling, operations[1]!);
     const captured = await operatorCapture.captureGatewayOperatorRunAuthority({
       client: owner,
       context,
@@ -368,18 +386,14 @@ describe("sessions_send dispatch admission", () => {
       },
     });
     const nativeReady = createDeferredCore();
-    const native = (async () => {
-      try {
-        await withPreparedEmbeddedRunToolAuthority(
-          {
-            admittedRunContext: await admission.admit("embedded", "steering-custody-test"),
-            replyOperation: operations[0],
-          },
+    const native = admission
+      .admit("embedded", "steering-custody-test")
+      .then((admittedRunContext) =>
+        withPreparedEmbeddedRunToolAuthority(
+          { admittedRunContext, replyOperation: operations[0] },
           {
             config,
-            agentId: "main",
-            sessionId: "target-session",
-            sessionKey: targetSessionKey,
+            ...targetIdentity,
             runId: "selected-steer-run",
             sessionFile,
             workspaceDir: "/synthetic/steering-custody",
@@ -390,29 +404,17 @@ describe("sessions_send dispatch admission", () => {
           undefined,
           async (prepared) => {
             selected.toolAuthorityFingerprint = prepared.toolAuthorityFingerprint;
-            attachActiveEmbeddedRun(
-              "target-session",
-              selected,
-              targetSessionKey,
-              sessionFile,
-              "main",
-              prepared.replyOperation,
-            );
+            attach(selected, prepared.replyOperation, sessionFile);
             nativeReady.resolve();
             await receipt.promise;
           },
-        );
-      } finally {
+        ),
+      )
+      .finally(() => {
         admission.close();
         captured.release();
-      }
-    })();
-    const gateway = vi
-      .spyOn(inProcessGateway, "callAgentToolGatewayRequest")
-      .mockImplementation(mockGateway(undefined, true));
-    const mutation = vi
-      .spyOn(sessionsSendDelivery, "callSessionsSendGateway")
-      .mockImplementation(gateway);
+      });
+    const restoreGateway = interceptGateway(mockGateway(undefined, true));
     const pending = (async () => {
       await awaitGateBeforeSettlement(nativeReady.promise, native, "Native owner was not prepared");
       return await inOperatorScope(context, owner, source, () =>
@@ -431,15 +433,7 @@ describe("sessions_send dispatch admission", () => {
       );
     })();
     try {
-      await awaitGateBeforeSettlement(
-        accepted.promise,
-        pending.then((result) => {
-          throw new Error(
-            `Steering ended before native acceptance: ${JSON.stringify(result.details)}`,
-          );
-        }),
-        "Steering did not reach native acceptance",
-      );
+      await assertPendingAtGate(accepted.promise, pending, "Native acceptance");
       expect(continuationSignal?.aborted).toBe(false);
       vi.useFakeTimers();
       detachActiveEmbeddedRun("target-session", sibling, targetSessionKey);
@@ -459,8 +453,7 @@ describe("sessions_send dispatch admission", () => {
           detachActiveEmbeddedRun("target-session", handle, targetSessionKey);
           operations[index]!.complete();
         }
-        gateway.mockRestore();
-        mutation.mockRestore();
+        restoreGateway();
         observeCapture.mockRestore();
         source.release();
       }
@@ -483,17 +476,9 @@ describe("sessions_send dispatch admission", () => {
       requesterSessionKey,
       config,
     );
-    const callGateway = mockGateway(async (request) => {
-      if (request.method !== "agent") {
-        throw new Error(`Unexpected Gateway method: ${request.method}`);
-      }
+    const callGateway = mockAgentGateway(async () => {
       expect(
-        readSessionSendDeliveryAdmission({
-          agentId: "main",
-          sessionKey: targetSessionKey,
-          sessionId: "target-session",
-          runId,
-        })?.delivery,
+        readSessionSendDeliveryAdmission({ ...targetIdentity, runId })?.delivery,
       ).toMatchObject({
         source: { sessionKey: requesterSessionKey, sessionId: "requester-session" },
         target: { sessionKey: targetSessionKey, sessionId: "target-session" },
@@ -511,9 +496,7 @@ describe("sessions_send dispatch admission", () => {
       );
       expect(result.details).toMatchObject({ status: "accepted", targetDisposition: "queued" });
       expect(queueMessage).not.toHaveBeenCalled();
-      expect(callGateway.mock.calls.filter(([request]) => request.method === "agent")).toHaveLength(
-        1,
-      );
+      expect(requestParams(callGateway, "agent")).toHaveLength(1);
     } finally {
       await close();
     }
@@ -529,15 +512,7 @@ describe("sessions_send dispatch admission", () => {
         spawnedBy: sourceKey,
       });
     }
-    const context = createContext();
-    // The admitted Gateway owns one current snapshot, not the factory's fresh {} per read.
-    context.getRuntimeConfig = () => config;
-    const owner = createOperatorClient({ profileName: "send-owner", scopes: ["operator.write"] });
-    const source = captureGatewayDeviceRevocation(
-      context,
-      { deviceId: "send-device", role: "operator" },
-      () => true,
-    );
+    const { context, owner, source } = operatorFixture("send");
     const finish = createDeferredCore();
     let completion: SessionFollowupCompletion | undefined;
     const capturing = createDeferredCore();
@@ -556,23 +531,20 @@ describe("sessions_send dispatch admission", () => {
         return captured;
       });
     vi.mocked(runSessionsSendA2AFlow).mockImplementationOnce(() => finish.promise);
-    const callGateway = mockGateway(async (request) => {
-      if (request.method === "agent") {
-        const followup = readFollowupRequest(runId, targetSessionKey);
-        if (followup) {
-          completion = SessionFollowupCompletion.bind(followup);
-          followup.completion = completion;
-          completion.markAccepted(runId);
-          await completion.settle(runId, {
-            status: "ok",
-            replyText: "Task complete",
-            terminalReply: { disposition: "visible", text: "Task complete" },
-          });
-          completion.finishExecution(runId);
-        }
-        return { runId, status: "accepted" };
+    const callGateway = mockAgentGateway(async () => {
+      const followup = readFollowupRequest(runId, targetSessionKey);
+      if (followup) {
+        completion = SessionFollowupCompletion.bind(followup);
+        followup.completion = completion;
+        completion.markAccepted(runId);
+        await completion.settle(runId, {
+          status: "ok",
+          replyText: "Task complete",
+          terminalReply: { disposition: "visible", text: "Task complete" },
+        });
+        completion.finishExecution(runId);
       }
-      throw new Error(`Unexpected Gateway method: ${request.method}`);
+      return { runId, status: "accepted" };
     }, true);
     try {
       const pending = inOperatorScope(context, owner, source, async () => {
@@ -602,15 +574,7 @@ describe("sessions_send dispatch admission", () => {
           participants.close();
         }
       });
-      await awaitGateBeforeSettlement(
-        capturing.promise,
-        pending.then((result) => {
-          throw new Error(
-            `Send settled before reply-source capture: ${JSON.stringify(result.details)}`,
-          );
-        }),
-        "Send completed without reaching reply-source capture",
-      );
+      await assertPendingAtGate(capturing.promise, pending, "Reply-source capture");
       vi.useFakeTimers();
       await vi.advanceTimersByTimeAsync(0);
       vi.useRealTimers();
@@ -651,6 +615,7 @@ describe("sessions_send dispatch admission", () => {
   ])("preserves the admitted $name route after a later inbound turn", async (scenario) => {
     const { sourceKey } = scenario;
     const self = "self" in scenario;
+    const fallback = "fallback" in scenario;
     const targetKey = self ? sourceKey : targetSessionKey;
     const sourceId = self ? "self-session" : "requester-session";
     const targetId = self ? sourceId : "target-session";
@@ -701,7 +666,7 @@ describe("sessions_send dispatch admission", () => {
             return { messageId: "final-reply" };
           }
       }
-      throw new Error(`Unexpected Gateway method: ${request.method}`);
+      unexpectedRequest(request);
     });
     const restoreGateway = interceptGateway(callGateway);
     // Cross-session routing has a transport fixture, not a native custody receipt.
@@ -714,21 +679,11 @@ describe("sessions_send dispatch admission", () => {
         sessionId: sourceId,
         agentChannel: originalRoute.channel,
         agentAccountId: originalRoute.accountId,
-        ...(self
-          ? { currentMessagingTarget: originalRoute.to }
-          : {
-              agentTo: originalRoute.to,
-              agentThreadId: scenario.threadId,
-            }),
-        ...("fallback" in scenario
-          ? {
-              agentTo: "stale-recipient",
-              agentThreadId: 99,
-              currentMessagingTarget: originalRoute.to,
-              currentChannelId: "native-channel-id",
-              currentThreadTs: "42",
-            }
-          : {}),
+        agentTo: self ? undefined : fallback ? "stale-recipient" : originalRoute.to,
+        agentThreadId: self ? undefined : fallback ? 99 : scenario.threadId,
+        currentMessagingTarget: self || fallback ? originalRoute.to : undefined,
+        currentChannelId: fallback ? "native-channel-id" : undefined,
+        currentThreadTs: fallback ? "42" : undefined,
         config,
         disableMessageTool: true,
         disablePluginTools: true,
@@ -751,27 +706,22 @@ describe("sessions_send dispatch admission", () => {
           sourceReplyDeliveryMode: "message_tool_only",
         });
       } else {
-        const requests = callGateway.mock.calls.map(([request]) => request);
-        expect.soft(requests.filter((request) => request.method === "agent")).toEqual([
+        expect.soft(requestParams(callGateway, "agent")).toEqual([
           expect.objectContaining({
-            params: expect.objectContaining({
-              ...originalRoute,
-              sessionKey: sourceKey,
-              deliver: false,
-              sourceReplyDeliveryMode: "message_tool_only",
-              inputProvenance: expect.objectContaining({
-                kind: "inter_session",
-                sourceSessionKey: sourceKey,
-              }),
+            ...originalRoute,
+            sessionKey: sourceKey,
+            deliver: false,
+            sourceReplyDeliveryMode: "message_tool_only",
+            inputProvenance: expect.objectContaining({
+              kind: "inter_session",
+              sourceSessionKey: sourceKey,
             }),
           }),
         ]);
-        expect.soft(requests.filter((request) => request.method === "send")).toEqual([
-          expect.objectContaining({
-            params: expect.objectContaining({ ...originalRoute, message: "Task complete" }),
-          }),
-        ]);
-        const sendParams = requests.find((request) => request.method === "send")?.params;
+        expect
+          .soft(requestParams(callGateway, "send"))
+          .toEqual([expect.objectContaining({ ...originalRoute, message: "Task complete" })]);
+        const [sendParams] = requestParams(callGateway, "send");
         expect(readInProcessSessionDeliveryGeneration(sendParams)).toMatchObject({
           agentId: "main",
           sessionKey: sourceKey,
@@ -787,29 +737,26 @@ describe("sessions_send dispatch admission", () => {
     }
   });
 
-  it.each([
-    { admission: "rejected", timeoutSeconds: 1 },
-    { admission: "pending", timeoutSeconds: 1 },
-  ] as const)(
-    "does not install a watch or start A2A when admission is $admission (wait $timeoutSeconds)",
-    async ({ admission, timeoutSeconds }) => {
+  it.each(["rejected", "pending"] as const)(
+    "does not install a watch or start A2A when admission is %s",
+    async (admission) => {
       const callGateway = mockGateway(async (request) => {
-        if (request.method === "agent") {
-          if (admission === "rejected") {
-            throw new Error("Task admission failed before dispatch");
-          }
-          return { runId, status: "in_flight", admissionPending: true };
+        switch (request.method) {
+          case "agent":
+            if (admission === "rejected") {
+              throw new Error("Task admission failed before dispatch");
+            }
+            return { runId, status: "in_flight", admissionPending: true };
+          case "agent.wait":
+            return { status: "timeout" };
+          default:
+            return unexpectedRequest(request);
         }
-        if (request.method === "agent.wait") {
-          return { status: "timeout" };
-        }
-        throw new Error(`Unexpected Gateway method: ${request.method}`);
       }, true);
-      const tool = createTool({ callGateway });
-
-      const result = await execute(tool, "send-followup", { watch: true, timeoutSeconds });
-
-      const requests = callGateway.mock.calls.map(([request]) => request);
+      const result = await execute(createTool({ callGateway }), "send-followup", {
+        watch: true,
+        timeoutSeconds: 1,
+      });
       expect.soft(result.details).toMatchObject({
         status: "error",
         runId,
@@ -829,8 +776,8 @@ describe("sessions_send dispatch admission", () => {
       }
       expect.soft(registerWatch).not.toHaveBeenCalled();
       expect.soft(runSessionsSendA2AFlow).not.toHaveBeenCalled();
-      expect.soft(requests.filter((request) => request.method === "agent")).toHaveLength(1);
-      expect.soft(requests.some((request) => request.method === "agent.wait")).toBe(false);
+      expect.soft(requestParams(callGateway, "agent")).toHaveLength(1);
+      expect.soft(requestParams(callGateway, "agent.wait")).toHaveLength(0);
     },
   );
 });
