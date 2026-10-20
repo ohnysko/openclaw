@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { vi } from "vitest";
 import { captureRuntimeConfigAsyncReader, getRuntimeConfig } from "../../config/io.js";
@@ -67,30 +68,27 @@ export async function createReplyTranscriptFixture(
     updatedAt: 1,
   };
   await replaceSessionEntry(scope, sessionEntry);
+  const messageEvent = (
+    messageId: string,
+    message: Record<string, unknown>,
+    parentId?: string,
+  ) => ({
+    eventId: messageId,
+    message: attachSessionTranscriptRunId(message, runId),
+    ...(parentId ? { parentId } : {}),
+  });
   const appendSync = (messageId: string, message: Record<string, unknown>, parentId?: string) => {
-    const persisted = attachSessionTranscriptRunId(message, runId);
-    const result = appendTranscriptMessageSync(scope, {
-      eventId: messageId,
-      message: persisted,
-      ...(parentId ? { parentId } : {}),
-    });
-    if (!result?.ok) {
-      throw new Error("Expected committed receipt fixture message");
-    }
-    return persisted;
+    const event = messageEvent(messageId, message, parentId);
+    const result = appendTranscriptMessageSync(scope, event);
+    assert(result?.ok, "Expected committed receipt fixture message");
+    return event.message;
   };
   const append = async (messageId: string, message: Record<string, unknown>, parentId?: string) => {
-    const persisted = attachSessionTranscriptRunId(message, runId);
-    const result = await appendTranscriptMessage(scope, {
-      eventId: messageId,
-      message: persisted,
-      ...(parentId ? { parentId } : {}),
-    });
-    if (!result.messageId) {
-      throw new Error("Expected committed receipt fixture message");
-    }
+    const event = messageEvent(messageId, message, parentId);
+    const result = await appendTranscriptMessage(scope, event);
+    assert(result.messageId, "Expected committed receipt fixture message");
     // Tool-bearing assistant updates intentionally have no top-level runId.
-    await publishTranscriptUpdate(scope, { message: persisted, messageId });
+    await publishTranscriptUpdate(scope, { message: event.message, messageId });
   };
   const rewriteSync = (messageId: string, content: string) => {
     const resolved = resolveSqliteTranscriptScope(scope);
@@ -98,9 +96,7 @@ export async function createReplyTranscriptFixture(
       const row = readTranscriptEventRows(database, scope.sessionId).find(
         ({ eventJson }) => asOptionalRecord(JSON.parse(eventJson))?.id === messageId,
       );
-      if (!row) {
-        throw new Error("Expected committed receipt fixture to rewrite");
-      }
+      assert(row, "Expected committed receipt fixture to rewrite");
       const event = asOptionalRecord(JSON.parse(row.eventJson));
       rewriteSqliteTranscriptEventRowsInTransaction(database, resolved, [
         {
@@ -112,16 +108,11 @@ export async function createReplyTranscriptFixture(
     }, toDatabaseOptions(resolved));
   };
   const userTurnRecorder = createUserTurnTranscriptRecorder({
-    input: {
-      text: "Inspect the synthetic fixture.",
-      idempotencyKey: `${runId}:user`,
-    },
+    input: { text: "Inspect the synthetic fixture.", idempotencyKey: `${runId}:user` },
     target: { ...scope, sessionEntry },
   });
   const persistedInput = await userTurnRecorder.persistApproved();
-  if (!persistedInput?.messageId) {
-    throw new Error("Expected committed input admission");
-  }
+  assert(persistedInput?.messageId, "Expected committed input admission");
   const loaded = retainSource
     ? await sessionStoreReaders.loadGatewaySessionEntryReadOnlyInWorker({
         cfg: getRuntimeConfig(),
@@ -146,9 +137,7 @@ export async function createReplyTranscriptFixture(
     isRunCurrent: () => current,
     assertWorkCurrent: qualified
       ? () => {
-          if (!current || abortController.signal.aborted) {
-            throw new Error("Reply fixture work ended");
-          }
+          assert(current && !abortController.signal.aborted, "Reply fixture work ended");
         }
       : undefined,
     abortSignal: abortController.signal,
@@ -157,12 +146,10 @@ export async function createReplyTranscriptFixture(
       entry: sessionEntry,
       backingSessionId: scope.sessionId,
       cfg: loaded?.cfg ?? {},
-      ...(qualified
-        ? {
-            sessionTarget: qualified,
-            capturedReadSources: loaded?.capturedReadSources,
-          }
-        : {}),
+      ...(qualified && {
+        sessionTarget: qualified,
+        capturedReadSources: loaded?.capturedReadSources,
+      }),
       clientRunId: runId,
       sessionLoadOptions: { agentId: "main" },
     },
@@ -178,12 +165,8 @@ export async function createReplyTranscriptFixture(
     rewriteSync,
     dispatch,
     abortController,
-    release: () => {
-      current = false;
-    },
-    retire: () => {
-      current = false;
-    },
+    release: () => void (current = false),
+    retire: () => void (current = false),
   };
 }
 

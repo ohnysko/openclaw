@@ -21,11 +21,8 @@ import {
   recordSessionProviderReview,
   retireProviderReviewAcknowledgment,
 } from "../../sessions/provider-review.js";
-import { createReplyOperation, type ReplyOperation } from "../../sessions/session-controller.js";
-import {
-  retireSessionControllerInput,
-  type SessionControllerInput,
-} from "../../sessions/session-controller.mailbox.js";
+import { createReplyOperation } from "../../sessions/session-controller.js";
+import { retireSessionControllerInput } from "../../sessions/session-controller.mailbox.js";
 import { getRpcSource } from "../../sessions/session-controller.rpc-sources.js";
 import { captureSessionTarget } from "../../sessions/session-controller.target.js";
 import {
@@ -351,8 +348,7 @@ it.each([
           })
         : undefined;
       request.providerReviewAcknowledgment = acknowledgment;
-      const operations: ReplyOperation[] = [];
-      const inputs: SessionControllerInput[] = [];
+      const occupied: Array<{ release: () => void; settled: Promise<unknown> }> = [];
       const occupy = (storePath: string) => {
         if (kind === "active") {
           const operation = createReplyOperation({
@@ -361,7 +357,10 @@ it.each([
             resetTriggered: false,
             target: captureSessionTarget({ storeScope: storePath, sessionKey, agentId: "main" }),
           });
-          operations.push(operation);
+          occupied.push({
+            release: () => operation.complete(),
+            settled: operation.ownerSettlement,
+          });
           return;
         }
         const source = createQueueTestRun({ prompt: "Waiting input" });
@@ -375,7 +374,11 @@ it.each([
         expect(
           enqueueFollowupRun(sessionKey, source, createQueueSettings(), "none", undefined, false),
         ).toBe(true);
-        inputs.push(expectDefined(source.controllerInput, "queued source"));
+        const input = expectDefined(source.controllerInput, "queued source");
+        occupied.push({
+          release: () => retireSessionControllerInput(input),
+          settled: input.settlement.promise,
+        });
       };
       try {
         occupy(`${session.storePath}.foreign`);
@@ -396,16 +399,10 @@ it.each([
         if (acknowledgment) {
           retireProviderReviewAcknowledgment(acknowledgment);
         }
-        for (const input of inputs) {
-          retireSessionControllerInput(input);
+        for (const work of occupied) {
+          work.release();
         }
-        for (const operation of operations) {
-          operation.complete();
-        }
-        await Promise.all([
-          ...inputs.map((input) => input.settlement.promise),
-          ...operations.map((operation) => operation.ownerSettlement),
-        ]);
+        await Promise.all(occupied.map((work) => work.settled));
         session.releaseSessionStorage?.();
       }
     }),
