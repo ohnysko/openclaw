@@ -56,6 +56,13 @@ it("preserves a contract-declared provider and its identity metadata", async () 
     },
   ];
   const identity = { cacheKeyData: cacheKey("virtual-model", 7), aliases: aliases(7) };
+  const runtime = {
+    id: "virtual-generic",
+    inlineQueryTimeoutMs: 1234,
+    inlineBatchTimeoutMs: 5678,
+    cacheKeyData: identity.cacheKeyData,
+    indexIdentityAliases: identity.aliases,
+  };
   const embed = vi.fn(async () => [1, 2, 3]);
   const embedBatch = vi.fn(async (inputs: EmbeddingInput[]) =>
     inputs.map((_input, index) => [index, 7]),
@@ -94,9 +101,7 @@ it("preserves a contract-declared provider and its identity metadata", async () 
               embedBatch,
             },
             runtime: {
-              id: "virtual-generic",
-              inlineQueryTimeoutMs: 1234,
-              inlineBatchTimeoutMs: 5678,
+              ...runtime,
               cacheKeyData: cacheKey(options.model, options.dimensions),
               indexIdentityAliases: aliases(options.dimensions),
             },
@@ -127,13 +132,7 @@ it("preserves a contract-declared provider and its identity metadata", async () 
     dimensions: 7,
     maxInputTokens: 2048,
   });
-  expect(result.runtime).toEqual({
-    id: "virtual-generic",
-    inlineQueryTimeoutMs: 1234,
-    inlineBatchTimeoutMs: 5678,
-    cacheKeyData: identity.cacheKeyData,
-    indexIdentityAliases: identity.aliases,
-  });
+  expect(result.runtime).toEqual(runtime);
 
   await expect(result.provider?.embed("query", { inputType: "query" })).resolves.toEqual([1, 2, 3]);
   expect(embed).toHaveBeenCalledExactlyOnceWith("query", { inputType: "query" });

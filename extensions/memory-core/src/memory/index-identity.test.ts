@@ -7,17 +7,11 @@ import {
 import type { MemoryIndexMeta } from "./manager-reindex-state.js";
 import type { MemoryIndexManager } from "./manager.js";
 
-// Install the fixture's embedding mocks before loading the manager.
-const { closeAllMemorySearchManagers, getMemorySearchManager } = await import("./index.js");
-
 const {
   provider: providerFixture,
   createConfig: createCfg,
   getFreshManager,
-} = createManagerIndexFixture({
-  getMemorySearchManager,
-  closeAllMemorySearchManagers,
-});
+} = createManagerIndexFixture(await import("./index.js"));
 const { provider, canonicalModel, cacheModel } = providerFixture.identityAlias;
 const config = (model: string) =>
   createCfg({
@@ -78,13 +72,11 @@ it.each([
 
     const nextManager = await getFreshManager(nextCfg);
     const results = await nextManager.search("zebra");
-
     expect(results.length).toBeGreaterThan(0);
     expect(results[0]?.path).toContain("memory/2026-01-12.md");
     expect(nextManager.status().custom?.indexIdentity).toEqual({ status: "valid" });
 
     await nextManager.sync({ reason: "test", force: true });
-
     expect(providerFixture.embedBatchCalls).toBe(embedsBeforeReuse);
     await nextManager.close?.();
   },

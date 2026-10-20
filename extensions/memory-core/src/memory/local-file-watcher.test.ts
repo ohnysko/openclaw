@@ -42,6 +42,10 @@ class FakeWorker extends EventEmitter {
   receive(event: LocalWatchEvent): void {
     this.emit("message", event);
   }
+  async flush(...events: LocalWatchEvent[]): Promise<void> {
+    events.forEach((event) => this.receive(event));
+    await yieldToEventLoop();
+  }
 }
 
 const workers: FakeWorker[] = [];
@@ -60,10 +64,12 @@ const readyFacts: MemoryWatchFacts = {
 };
 
 function watcher(options: Partial<MemoryFileWatcherOptions> = {}) {
-  const onChange = vi.fn<() => void | Promise<void>>();
-  const onDirty = vi.fn();
-  const onUnavailable = vi.fn();
-  const onState = vi.fn();
+  const callbacks = {
+    onChange: vi.fn<() => void | Promise<void>>(),
+    onDirty: vi.fn(),
+    onUnavailable: vi.fn(),
+    onState: vi.fn(),
+  };
   const instance = new LocalMemoryFileWatcher({
     workspaceDir: "/fixture/workspace",
     agentId: "main",
@@ -73,13 +79,42 @@ function watcher(options: Partial<MemoryFileWatcherOptions> = {}) {
       sync: { watchDebounceMs: 0 },
     },
     runInBackgroundContext: AsyncLocalStorage.snapshot(),
-    onChange,
-    onDirty,
-    onUnavailable,
-    onState,
+    ...callbacks,
     ...options,
   });
-  return { instance, onChange, onDirty, onUnavailable, onState };
+  return { instance, ...callbacks };
+}
+
+function track<T>(promise: Promise<T>) {
+  const result = { settled: false, promise };
+  result.promise = promise.finally(() => {
+    result.settled = true;
+  });
+  void result.promise.catch(() => undefined);
+  return result;
+}
+
+function indexingWatcher() {
+  const indexed = createDeferred<void>();
+  const entered = createDeferred<void>();
+  const onChange = vi.fn(async () => {
+    entered.resolve();
+    await indexed.promise;
+  });
+  return { ...watcher({ onChange }), onChange, indexed, entered };
+}
+
+async function sharedWatchers() {
+  const first = watcher();
+  const second = watcher();
+  const worker = await start(first.instance);
+  await start(second.instance, 2);
+  return { first, second, worker };
+}
+
+async function replaceWatcher() {
+  const { instance } = watcher();
+  await close(instance, await start(instance));
 }
 
 function activeWorker(): FakeWorker {
@@ -144,19 +179,15 @@ describe("local Memory watcher transport", () => {
         },
       }),
     );
-    let ready = false;
-    const starting = instance.start().then(() => {
-      ready = true;
-    });
+    const starting = track(instance.start());
     const worker = activeWorker();
     const facts = { ...readyFacts, capacityDegraded: true };
-    worker.receive({ type: "state", id: 1, facts });
-    await yieldToEventLoop();
-    expect(ready).toBe(false);
+    await worker.flush({ type: "state", id: 1, facts });
+    expect(starting.settled).toBe(false);
     expect(instance.health()).toEqual(facts.health);
     expect(instance.capacityDegraded).toBe(true);
     worker.receive({ type: "started", id: 1, facts });
-    await starting;
+    await starting.promise;
     context.run("transport", () => worker.receive({ type: "dirty", id: 1 }));
     expect(events).toEqual(["dirty:owner"]);
     context.run("transport", () => worker.receive({ type: "change", id: 1 }));
@@ -166,13 +197,7 @@ describe("local Memory watcher transport", () => {
   });
 
   it("drops a queued settled notification when a newer dirty event arrives during indexing", async () => {
-    const indexed = createDeferred<void>();
-    const entered = createDeferred<void>();
-    const onChange = vi.fn(async () => {
-      entered.resolve();
-      await indexed.promise;
-    });
-    const { instance, onDirty } = watcher({ onChange });
+    const { instance, onDirty, onChange, indexed, entered } = indexingWatcher();
     const worker = await start(instance);
     worker.receive({ type: "change", id: 1 });
     await entered.promise;
@@ -182,38 +207,30 @@ describe("local Memory watcher transport", () => {
     indexed.resolve();
     await yieldToEventLoop();
     expect(onChange).toHaveBeenCalledOnce();
-    worker.receive({ type: "change", id: 1 });
-    await yieldToEventLoop();
+    await worker.flush({ type: "change", id: 1 });
     expect(onChange).toHaveBeenCalledTimes(2);
     await close(instance, worker);
   });
 
   it("shares one worker across instances, keeps peers live, and joins final exit before replacement", async () => {
-    const first = watcher();
-    const second = watcher();
-    const worker = await start(first.instance);
-    await start(second.instance, 2);
+    const { first, second, worker } = await sharedWatchers();
     expect(transport.createWorker).toHaveBeenCalledOnce();
     await close(first.instance, worker, 1, false);
     worker.receive({ type: "dirty", id: 1 });
     worker.receive({ type: "dirty", id: 2 });
     expect(first.onDirty).not.toHaveBeenCalled();
     expect(second.onDirty).toHaveBeenCalledOnce();
-    let closed = false;
-    const closing = second.instance.close().then(() => {
-      closed = true;
-    });
+    const closing = track(second.instance.close());
     await yieldToEventLoop();
-    worker.receive({ type: "closed", id: 2 });
-    await yieldToEventLoop();
+    await worker.flush({ type: "closed", id: 2 });
     expect(worker.commands.at(-1)).toEqual({ type: "shutdown" });
     const replacement = watcher();
     const starting = replacement.instance.start();
     await yieldToEventLoop();
-    expect(closed).toBe(false);
+    expect(closing.settled).toBe(false);
     expect(transport.createWorker).toHaveBeenCalledOnce();
     worker.emit("exit", 0);
-    await closing;
+    await closing.promise;
     await yieldToEventLoop();
     expect(transport.createWorker).toHaveBeenCalledTimes(2);
     const nextWorker = activeWorker();
@@ -236,8 +253,7 @@ describe("local Memory watcher transport", () => {
     await starting;
     await yieldToEventLoop();
     expect(worker.commands.at(-1)).toEqual({ type: "shutdown" });
-    expect(onDirty).not.toHaveBeenCalled();
-    expect(onChange).not.toHaveBeenCalled();
+    expect([onDirty.mock.calls, onChange.mock.calls]).toEqual([[], []]);
     worker.emit("exit", 0);
     await closing;
   });
@@ -248,28 +264,19 @@ describe("local Memory watcher transport", () => {
     const worker = activeWorker();
     worker.receive({ type: "closed", id: 1, error: "workspace discovery failed" });
     await starting;
-    let settled = false;
-    const closing = instance.close().catch((error: unknown) => {
-      settled = true;
-      return error;
-    });
+    const closing = track(instance.close());
     await yieldToEventLoop();
     expect(worker.commands.at(-1)).toEqual({ type: "shutdown" });
-    expect(settled).toBe(false);
+    expect(closing.settled).toBe(false);
     worker.emit("exit", 0);
-    expect(await closing).toMatchObject({ message: "workspace discovery failed" });
-    const replacement = watcher();
-    const nextWorker = await start(replacement.instance);
+    await expect(closing.promise).rejects.toMatchObject({ message: "workspace discovery failed" });
+    await replaceWatcher();
     expect(transport.createWorker).toHaveBeenCalledTimes(2);
-    await close(replacement.instance, nextWorker);
   });
 
   it("restores live subscriptions after exit and stops after repeated failures within a minute", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    const first = watcher();
-    const second = watcher();
-    const worker = await start(first.instance);
-    await start(second.instance, 2);
+    const { first, second, worker } = await sharedWatchers();
     worker.emit("error", new Error("worker crashed"));
     worker.emit("exit", 1);
     expect(first.instance.health()).toMatchObject([{ state: "unavailable" }]);
@@ -283,9 +290,7 @@ describe("local Memory watcher transport", () => {
     const recovered = activeWorker();
     expect(recovered.commands).toHaveLength(1);
     expect(recovered.commands[0]).toMatchObject({ type: "open", id: 2 });
-    recovered.receive({ type: "started", id: 2, facts: readyFacts });
-    recovered.receive({ type: "change", id: 2 });
-    await yieldToEventLoop();
+    await recovered.flush({ type: "started", id: 2, facts: readyFacts }, { type: "change", id: 2 });
     expect(second.onChange).toHaveBeenCalledOnce();
     expect(second.instance.capacityDegraded).toBe(false);
     // Readiness alone must not reset a crash-loop budget.
@@ -334,61 +339,38 @@ describe("local Memory watcher transport", () => {
     await vi.advanceTimersByTimeAsync(120_000);
     expect(transport.createWorker).toHaveBeenCalledTimes(3);
     // Explicit retirement/reload receives a fresh owner, not a sticky failed one.
-    const replacement = watcher();
-    const nextWorker = await start(replacement.instance);
-    await close(replacement.instance, nextWorker);
+    await replaceWatcher();
     await vi.advanceTimersByTimeAsync(120_000);
     expect(transport.createWorker).toHaveBeenCalledTimes(4);
   });
 
   it("joins a shared worker failure for subscriptions closing before and after the failure", async () => {
-    const first = watcher();
-    const second = watcher();
-    const worker = await start(first.instance);
-    await start(second.instance, 2);
-    const settled: string[] = [];
-    const firstClose = first.instance.close().catch((error: unknown) => {
-      settled.push("first");
-      return error;
-    });
+    const { first, second, worker } = await sharedWatchers();
+    const firstClose = track(first.instance.close());
     await yieldToEventLoop();
     worker.emit("error", new Error("shared worker failed"));
-    const secondClose = second.instance.close().catch((error: unknown) => {
-      settled.push("second");
-      return error;
-    });
+    const secondClose = track(second.instance.close());
     await yieldToEventLoop();
-    expect(settled).toEqual([]);
+    expect([firstClose.settled, secondClose.settled]).toEqual([false, false]);
     worker.emit("exit", 1);
-    expect(await firstClose).toMatchObject({ message: "shared worker failed" });
-    expect(await secondClose).toMatchObject({ message: "shared worker failed" });
+    await expect(firstClose.promise).rejects.toMatchObject({ message: "shared worker failed" });
+    await expect(secondClose.promise).rejects.toMatchObject({ message: "shared worker failed" });
   });
 
   it("joins accepted indexing as well as worker exit when the live worker fails", async () => {
-    const indexed = createDeferred<void>();
-    const entered = createDeferred<void>();
-    const { instance, onDirty, onUnavailable } = watcher({
-      onChange: async () => {
-        entered.resolve();
-        await indexed.promise;
-      },
-    });
+    const { instance, onDirty, onUnavailable, indexed, entered } = indexingWatcher();
     const worker = await start(instance);
     worker.receive({ type: "change", id: 1 });
     await entered.promise;
     worker.emit("error", new Error("watch transport failed"));
-    let settled = false;
-    const closing = instance.close().then(() => {
-      settled = true;
-    });
+    const closing = track(instance.close());
     worker.emit("exit", 1);
     await yieldToEventLoop();
-    expect(settled).toBe(false);
-    expect(onDirty).not.toHaveBeenCalled();
-    expect(onUnavailable).not.toHaveBeenCalled();
+    expect(closing.settled).toBe(false);
+    expect([onDirty.mock.calls, onUnavailable.mock.calls]).toEqual([[], []]);
     indexed.resolve();
-    await closing;
-    expect(settled).toBe(true);
+    await closing.promise;
+    expect(closing.settled).toBe(true);
   });
 
   it("terminates after failed native cleanup, joins exit, and keeps the cleanup failure sticky", async () => {
@@ -400,23 +382,18 @@ describe("local Memory watcher transport", () => {
       worker.emit("exit", 0);
       return 0;
     });
-    let settled = false;
-    const closing = instance.close().catch((error: unknown) => {
-      settled = true;
-      return error;
-    });
+    const closing = track(instance.close());
     await yieldToEventLoop();
-    worker.receive({ type: "closed", id: 1, error: "native close failed" });
-    await yieldToEventLoop();
+    await worker.flush({ type: "closed", id: 1, error: "native close failed" });
     expect(worker.commands.at(-1)).toEqual({ type: "shutdown" });
     worker.receive({ type: "shutdown", error: "native close failed" });
     expect(worker.terminate).toHaveBeenCalledOnce();
     await yieldToEventLoop();
-    expect(settled).toBe(false);
+    expect(closing.settled).toBe(false);
     const replacement = watcher();
     const starting = expect(replacement.instance.start()).rejects.toThrow("native close failed");
     exiting.resolve();
-    expect(await closing).toMatchObject({ message: "native close failed" });
+    await expect(closing.promise).rejects.toMatchObject({ message: "native close failed" });
     await starting;
     await expect(instance.close()).rejects.toThrow("native close failed");
     expect(transport.createWorker).toHaveBeenCalledOnce();
