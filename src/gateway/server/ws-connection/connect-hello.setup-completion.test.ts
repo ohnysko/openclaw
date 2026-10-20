@@ -137,6 +137,10 @@ function createFailedHelloContext(
   };
 }
 
+async function rejectHello() {
+  throw new Error("socket closed");
+}
+
 afterEach(() => vi.clearAllMocks());
 
 aroundEach((runTest) =>
@@ -247,13 +251,7 @@ it("keeps correlated setup completion uncertain when hello delivery fails", asyn
   });
 
   const broadcast = vi.fn();
-  const context = createFailedHelloContext(
-    "setup-send-failure",
-    async () => {
-      throw new Error("socket closed");
-    },
-    broadcast,
-  );
+  const context = createFailedHelloContext("setup-send-failure", rejectHello, broadcast);
   const { onHelloDelivered } = context;
   const { close } = context.handler;
 
@@ -300,14 +298,10 @@ it.each(["preparation", "transport"] as const)(
   "restores an uncorrelated bootstrap token when hello %s fails",
   async (failure) => {
     const paired = createPaired("generic-send-failure");
-    const issued = await issueDeviceBootstrapToken({
-      profile: bootstrapProfile,
-    });
+    const issued = await issueDeviceBootstrapToken({ profile: bootstrapProfile });
     const verifyParams = await verifyBootstrap(paired, issued.token);
 
-    const context = createFailedHelloContext("generic-send-failure", async () => {
-      throw new Error("socket closed");
-    });
+    const context = createFailedHelloContext("generic-send-failure", rejectHello);
     const { close } = context.handler;
     const state = createBootstrapState(paired, issued.token);
 

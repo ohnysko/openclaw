@@ -14,6 +14,9 @@ const setupRejected =
 function format(params: Partial<MessageParams>) {
   return formatGatewayAuthFailureMessage({ authMode: "token", authProvided: "token", ...params });
 }
+function nodeRejection(reason: string): Partial<MessageParams> {
+  return { authMode: "trusted-proxy", authProvided: "none", reason, client: node };
+}
 
 it.each(["token_redacted_config", "password_redacted_config"])(
   "names redaction corruption and its remedy for %s within the close limit",
@@ -62,23 +65,10 @@ it.each([
     "unauthorized: gateway password mismatch (use this gateway's gateway.auth.password)",
   ],
   [
-    {
-      authMode: "trusted-proxy",
-      authProvided: "none",
-      reason: "trusted_proxy_missing_header_cf-access-jwt-assertion",
-      client: node,
-    },
+    nodeRejection("trusted_proxy_missing_header_cf-access-jwt-assertion"),
     "gateway rejected this node: trusted-proxy identity-header authentication is required and no usable machine credential was accepted; run `openclaw doctor` on the Gateway",
   ],
-  [
-    {
-      authMode: "trusted-proxy",
-      authProvided: "none",
-      reason: "trusted_proxy_local_interface_check_failed",
-      client: node,
-    },
-    "unauthorized",
-  ],
+  [nodeRejection("trusted_proxy_local_interface_check_failed"), "unauthorized"],
 ] satisfies [Partial<MessageParams>, string, boolean?, string?][])(
   "formats an actionable auth failure for %j",
   (params, expected, closeLimit, excluded) => {

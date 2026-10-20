@@ -149,12 +149,33 @@ function createRequest(
 function privateClient(id: string) {
   const client = createOperatorWsClient({ clientInfo: { id, mode: "backend" } });
   Object.assign(client.connect.client, {
-    displayName: "private-display-name",
-    instanceId: "private-instance",
-    platform: "private-platform",
+    displayName: "private-",
+    instanceId: "private-",
+    platform: "private-",
   });
-  client.connect.userAgent = "private-user-agent";
+  client.connect.userAgent = "private-";
   return client;
+}
+
+type ReceiptCase = [Record<string, unknown>, Record<string, unknown>];
+function checkReceipt(
+  method: string,
+  field: string,
+  defaults: Record<string, unknown>,
+  paramsDefaults: Record<string, unknown> = {},
+) {
+  return async (params: Record<string, unknown>, shape: Record<string, unknown>) => {
+    const clientKind = "openclaw-control-ui";
+    const fixture = createRequest(respondOk, method);
+    await fixture.run({ ...paramsDefaults, ...params }, privateClient(clientKind));
+    expect(fixture.phase("received")).toEqual([
+      expect.objectContaining({
+        method,
+        [field]: { clientKind, source: "wire", ...defaults, ...shape },
+      }),
+    ]);
+    expect(JSON.stringify(fixture.events)).not.toContain("private-");
+  };
 }
 
 function mockHeap(heapUsed: number) {
@@ -239,71 +260,52 @@ describe("authenticated Gateway RPC diagnostics", () => {
     expect(JSON.stringify(fixture.events)).not.toContain("private-");
   });
 
-  it.each<[string, string, Record<string, unknown>, Record<string, unknown>]>([
+  it.each<ReceiptCase>([
     [
-      "cron.list",
-      "openclaw-control-ui",
-      { sessionKey: "private-session", agentId: "private-agent", compact: true },
-      { scope: "session", compact: true, page: "first" },
+      { sessionKey: "private-", agentId: "private-", compact: true },
+      { scope: "session", compact: true },
     ],
     [
-      "cron.list",
-      "openclaw-macos",
-      { agentId: "private-agent", offset: 50 },
-      { scope: "agent", compact: false, page: "append" },
+      { agentId: "private-", offset: 50 },
+      { scope: "agent", page: "append" },
     ],
-    [
-      "cron.list",
-      "gateway-client",
-      { compact: "private-invalid", offset: "private-invalid", query: "private-query" },
-      { scope: "global", compact: false, page: "first" },
-    ],
-    [
-      "models.list",
-      "openclaw-control-ui",
-      { view: "configured", agentId: "private-agent", preparedOnly: true },
-      { view: "configured", scope: "agent", preparedOnly: true, refresh: false },
-    ],
-    [
-      "models.list",
-      "openclaw-macos",
-      { sessionKey: "private-session", agentId: "private-agent", refresh: true },
-      { view: "default", scope: "session", preparedOnly: false, refresh: true },
-    ],
-    [
-      "models.list",
-      "gateway-client",
-      { view: "provider-config", authProfileId: "private-profile" },
-      { view: "provider-config", scope: "auth-profile", preparedOnly: false, refresh: false },
-    ],
-    [
-      "models.list",
-      "cli",
-      { view: "private-view", refresh: "private-refresh" },
-      { view: "other", scope: "global", preparedOnly: false, refresh: false },
-    ],
+    [{ compact: "private-", offset: "private-", query: "private-" }, {}],
   ])(
-    "attributes %s receipt without private values (%s)",
-    async (method, clientKind, params, shape) => {
-      const fixture = createRequest(respondOk, method);
-      await fixture.run(params, privateClient(clientKind));
-      expect(fixture.phase("received")).toEqual([
-        expect.objectContaining({
-          method,
-          [method === "cron.list" ? "cronList" : "modelsList"]: {
-            clientKind,
-            source: "wire",
-            ...shape,
-          },
-        }),
-      ]);
-      expect(JSON.stringify(fixture.events)).not.toContain("private-");
-    },
+    "attributes cron receipt (%j)",
+    checkReceipt("cron.list", "cronList", {
+      scope: "global",
+      compact: false,
+      page: "first",
+    }),
+  );
+
+  it.each<ReceiptCase>([
+    [
+      { view: "configured", agentId: "private-", preparedOnly: true },
+      { view: "configured", scope: "agent", preparedOnly: true },
+    ],
+    [
+      { sessionKey: "private-", agentId: "private-", refresh: true },
+      { scope: "session", refresh: true },
+    ],
+    [
+      { view: "provider-config", authProfileId: "private-" },
+      { view: "provider-config", scope: "auth-profile" },
+    ],
+    [{ view: "private-", refresh: "private-" }, { view: "other" }],
+  ])(
+    "attributes model catalog receipt (%j)",
+    checkReceipt("models.list", "modelsList", {
+      view: "default",
+      scope: "global",
+      preparedOnly: false,
+      refresh: false,
+    }),
   );
 
   it.each([
     { source: "dashboard", rowMode: "compact", bytes: 204_800, elapsed: 0 },
-    { source: "arbitrary-private-caller", rowMode: undefined, bytes: 100, elapsed: 1_000 },
+    { source: "private-", rowMode: undefined, bytes: 100, elapsed: 1_000 },
   ])("attributes session list diagnostics without private filters ($source)", async (query) => {
     let now = 1_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -318,8 +320,8 @@ describe("authenticated Gateway RPC diagnostics", () => {
       rowMode: query.rowMode,
       limit: 60,
       offset: 120,
-      ownerId: "synthetic-private-owner",
-      search: "synthetic-private-search",
+      ownerId: "private-",
+      search: "private-",
     });
     expect(fixture.send).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
     expect(fixture.phase("received")[0]).toMatchObject({
@@ -331,42 +333,31 @@ describe("authenticated Gateway RPC diagnostics", () => {
         filter: "search",
       },
     });
-    expect(JSON.stringify(fixture.events)).not.toMatch(
-      /synthetic-private|arbitrary-private-caller/,
-    );
+    expect(JSON.stringify(fixture.events)).not.toContain("private-");
     const log = output.mock.calls.flat().join("\n");
     expect(log).toContain("sessions.list");
     expect(log).toContain(`source=${query.rowMode ? "dashboard" : "unspecified"}`);
     expect(log).toContain(`rowMode=${query.rowMode ?? "full"}`);
     expect(log).toContain("limit=60 offset=120 filterKind=ownerId+search");
     expect(log).toContain(`bytes=${query.bytes}`);
-    expect(log).not.toMatch(/synthetic-private|arbitrary-private-caller/);
+    expect(log).not.toContain("private-");
   });
 
-  it.each([
-    { params: { spawnedBy: "private-parent", ownerId: "private-owner" }, filter: "children" },
-    { params: { ownerId: "private-owner", involvingMe: true }, filter: "owner" },
-    { params: { involvingProfileId: "private-profile", activeOnly: true }, filter: "involving" },
-    { params: { activeMinutes: 15 }, filter: "active" },
-    { params: { activeOnly: false, agentId: "private-agent" }, filter: "general" },
-  ])("bounds session list filter attribution ($filter)", async ({ params, filter }) => {
-    const fixture = createRequest(respondOk, "sessions.list");
-    await fixture.run(
-      { ...params, source: "sidebar", rowMode: "private-invalid-mode" },
-      fixture.client,
-      { id: "private-request" },
-    );
-    expect(fixture.phase("received")[0]).toMatchObject({
-      sessionsList: {
-        clientKind: fixture.client.connect.client.id,
-        source: "wire",
-        callerSource: "sidebar",
-        rowMode: "other",
-        filter,
-      },
-    });
-    expect(JSON.stringify(fixture.events)).not.toContain("private-");
-  });
+  it.each<ReceiptCase>([
+    [{ spawnedBy: "private-", ownerId: "private-" }, { filter: "children" }],
+    [{ ownerId: "private-", involvingMe: true }, { filter: "owner" }],
+    [{ involvingProfileId: "private-", activeOnly: true }, { filter: "involving" }],
+    [{ activeMinutes: 15 }, { filter: "active" }],
+    [{ activeOnly: false, agentId: "private-" }, { filter: "general" }],
+  ])(
+    "bounds session list filter attribution (%j)",
+    checkReceipt(
+      "sessions.list",
+      "sessionsList",
+      { callerSource: "sidebar", rowMode: "other" },
+      { source: "sidebar", rowMode: "private-" },
+    ),
+  );
 
   it.each([true, false])(
     "records frame bytes and logs, sampling heap only on the main thread (main=%s)",

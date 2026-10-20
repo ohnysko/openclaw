@@ -3,8 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
-  GATEWAY_CLIENT_MODES,
-  GATEWAY_CLIENT_NAMES,
+  GATEWAY_CLIENT_MODES as MODES,
+  GATEWAY_CLIENT_NAMES as NAMES,
 } from "../../../../packages/gateway-protocol/src/client-info.js";
 import type { HelloOk } from "../../../../packages/gateway-protocol/src/schema/frames.js";
 import type {
@@ -84,19 +84,11 @@ installGatewayTestHooks({ scope: "suite" });
 
 await import("../../server.js");
 
-const BACKEND_CLIENT = {
-  id: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-  version: "1.0.0",
-  platform: "node",
-  mode: GATEWAY_CLIENT_MODES.BACKEND,
-} as const;
-
-const TUI_CLIENT = {
-  id: GATEWAY_CLIENT_NAMES.TUI,
-  version: "1.0.0",
-  platform: "test",
-  mode: GATEWAY_CLIENT_MODES.CLI,
-} as const;
+function clientInfo(id: string, mode: string, platform = "test") {
+  return { id, mode, platform, version: "1.0.0" };
+}
+const BACKEND_CLIENT = clientInfo(NAMES.GATEWAY_CLIENT, MODES.BACKEND, "node");
+const TUI_CLIENT = clientInfo(NAMES.TUI, MODES.CLI);
 
 function operatorRoles(name = "guest", agents = ["guest"]) {
   return {
@@ -137,7 +129,21 @@ function deadline<T>(message: string) {
   const deferred = createDeferred<T>();
   const timer = setTimeout(() => deferred.reject(new Error(message)), 2_500);
   cleanups.push(() => clearTimeout(timer));
-  return { ...deferred, done: () => clearTimeout(timer) };
+  return { ...deferred, promise: deferred.promise.finally(() => clearTimeout(timer)) };
+}
+
+function connectClient(options: GatewayClientOptions, timeoutMessage?: string) {
+  const hello = timeoutMessage ? deadline<HelloOk>(timeoutMessage) : createDeferred<HelloOk>();
+  const client = trackedClient({
+    ...options,
+    onHelloOk: hello.resolve,
+    onConnectError: hello.reject,
+  });
+  return { client, hello: hello.promise };
+}
+
+function cachedDeviceToken(deviceId: string) {
+  return readDeviceAuthTokenForTest({ deviceId, role: "operator" })?.token;
 }
 
 async function expectRpcError(
@@ -299,35 +305,26 @@ describe("gateway connect pairing exemptions", () => {
             await decide("device.pair.reject", { requestId: pending.requestId });
           } else {
             let requestId = pending.requestId;
-            if (
-              [
-                "different key",
-                "different role",
-                "narrower scopes",
-                "different client identity",
-              ].includes(decision)
-            ) {
+            const replacement =
+              decision === "different key"
+                ? { publicKey: loadDeviceIdentity("concurrent-pairing-other-key").publicKey }
+                : decision === "different role"
+                  ? { role: "node", roles: ["node"], scopes: [] }
+                  : decision === "narrower scopes"
+                    ? { scopes: ["operator.read"] }
+                    : decision === "different client identity"
+                      ? { clientId: NAMES.BROWSER_COPILOT }
+                      : undefined;
+            if (replacement) {
               await decide("device.pair.reject", { requestId });
-              const replacement = await devicePairing.requestDevicePairing({
+              const replaced = await devicePairing.requestDevicePairing({
                 ...pending,
-                publicKey:
-                  decision === "different key"
-                    ? loadDeviceIdentity("concurrent-pairing-other-key").publicKey
-                    : pending.publicKey,
-                role: decision === "different role" ? "node" : "operator",
-                roles: decision === "different role" ? ["node"] : ["operator"],
-                scopes:
-                  decision === "different role"
-                    ? []
-                    : decision === "narrower scopes"
-                      ? ["operator.read"]
-                      : scopes,
-                clientId:
-                  decision === "different client identity"
-                    ? GATEWAY_CLIENT_NAMES.BROWSER_COPILOT
-                    : pending.clientId,
+                role: "operator",
+                roles: ["operator"],
+                scopes,
+                ...replacement,
               });
-              requestId = replacement.request.requestId;
+              requestId = replaced.request.requestId;
             }
             await decide("device.pair.approve", { requestId });
             if (decision === "revoked") {
@@ -577,16 +574,14 @@ describe("gateway connect pairing exemptions", () => {
     const started = trackServer(await startServer(undefined, { auth, controlUiEnabled: true }));
     const loaded = loadDeviceIdentity("durable-gateway-owner");
     const scopes = ["operator.read", "operator.write"];
-    const connect = (token?: string) =>
-      new Promise<{ client: GatewayClient; hello: HelloOk }>((resolve, reject) => {
-        const client = trackedClient({
-          ...controlUiOptions(started.port, origin, loaded.identity),
-          token,
-          scopes,
-          onHelloOk: (hello) => resolve({ client, hello }),
-          onConnectError: reject,
-        });
+    const connect = async (token?: string) => {
+      const { client, hello } = connectClient({
+        ...controlUiOptions(started.port, origin, loaded.identity),
+        token,
+        scopes,
       });
+      return { client, hello: await hello };
+    };
     const first = await connect(auth.token);
     expect(first.hello.auth.scopes).toEqual(scopes);
     const { profile } = await first.client.request<UsersSelfResult>("users.self", {});
@@ -599,10 +594,7 @@ describe("gateway connect pairing exemptions", () => {
       profileId: profile.id,
       displayName: "Ada Owner",
     });
-    const cachedToken = readDeviceAuthTokenForTest({
-      deviceId: loaded.identity.deviceId,
-      role: "operator",
-    })?.token;
+    const cachedToken = cachedDeviceToken(loaded.identity.deviceId);
     expect(cachedToken).toBe(first.hello.auth.deviceToken);
     expect(cachedToken).toBeTruthy();
 
@@ -718,20 +710,13 @@ describe("gateway connect pairing exemptions", () => {
       ...controlUiOptions(started.port, origin, loaded.identity),
       scopes: ["operator.read"],
     } satisfies GatewayClientOptions;
-    const provisioned = deadline<void>("timeout waiting for the shared-secret client to connect");
-    const provisionClient = trackedClient({
-      ...baseClientOptions,
-      token: auth.token,
-      onHelloOk: () => provisioned.resolve(),
-      onConnectError: provisioned.reject,
-    });
-    await provisioned.promise;
-    provisioned.done();
-    await provisionClient.stopAndWait();
-    const deviceToken = readDeviceAuthTokenForTest({
-      deviceId: loaded.identity.deviceId,
-      role: "operator",
-    })?.token;
+    const provisioned = connectClient(
+      { ...baseClientOptions, token: auth.token },
+      "timeout waiting for the shared-secret client to connect",
+    );
+    await provisioned.hello;
+    await provisioned.client.stopAndWait();
+    const deviceToken = cachedDeviceToken(loaded.identity.deviceId);
     expect(deviceToken).toBe(
       (await getPairedDevice(loaded.identity.deviceId))?.tokens?.operator?.token,
     );
@@ -755,9 +740,7 @@ describe("gateway connect pairing exemptions", () => {
       setTimeout(resolve, 1_100);
     });
     expect(connectAttempts).toHaveBeenCalledTimes(1);
-    expect(
-      readDeviceAuthTokenForTest({ deviceId: loaded.identity.deviceId, role: "operator" })?.token,
-    ).toBe(deviceToken);
+    expect(cachedDeviceToken(loaded.identity.deviceId)).toBe(deviceToken);
   });
 
   test("admits an auth-none TUI operator client before and after a narrower pairing row exists", async () => {
@@ -810,22 +793,12 @@ describe("gateway connect pairing exemptions", () => {
     {
       name: "auth-none CLI client",
       auth: { mode: "none" } as const,
-      client: {
-        id: GATEWAY_CLIENT_NAMES.CLI,
-        version: "1.0.0",
-        platform: "test",
-        mode: GATEWAY_CLIENT_MODES.CLI,
-      },
+      client: clientInfo(NAMES.CLI, MODES.CLI),
     },
     {
       name: "token-auth native app client",
       auth: { mode: "token", token: "local-secret" } as const,
-      client: {
-        id: GATEWAY_CLIENT_NAMES.MACOS_APP,
-        version: "1.0.0",
-        platform: "darwin",
-        mode: GATEWAY_CLIENT_MODES.UI,
-      },
+      client: clientInfo(NAMES.MACOS_APP, MODES.UI, "darwin"),
     },
   ])("silently widens a narrow local pairing row for a $name", async ({ name, auth, client }) => {
     testState.gatewayAuth = auth;

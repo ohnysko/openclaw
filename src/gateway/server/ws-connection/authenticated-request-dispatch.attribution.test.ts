@@ -27,10 +27,8 @@ function expectWireResponse(
   details: Record<string, unknown>,
   copies = 1,
 ) {
-  const expected = {
-    responseBytes: 1234,
-    [field]: { clientKind: "openclaw-control-ui", source: "wire", ...details },
-  };
+  const attribution = { clientKind: "openclaw-control-ui", source: "wire", ...details };
+  const expected = { responseBytes: 1234, [field]: attribution };
   expect(events).toMatchObject(Array.from({ length: copies }, () => expected));
   expect(JSON.stringify(events)).not.toContain("private-");
 }
@@ -41,21 +39,15 @@ async function dispatch(
   payload: unknown,
   delivery: "wire" | "shared" | "internal" | "error" | "unavailable" | "serialization" = "wire",
 ) {
-  const events: Extract<DiagnosticEventPayload, { type: "gateway.rpc"; phase: "response" }>[] = [];
+  const events: DiagnosticEventPayload[] = [];
   onTestFinished(
-    onInternalDiagnosticEvent(
-      (event) => {
-        if (event.type === "gateway.rpc" && event.phase === "response") {
-          events.push(event);
-        }
-      },
-      { include: ["gateway.rpc"] },
-    ),
+    onInternalDiagnosticEvent((event) => events.push(event), { include: ["gateway.rpc"] }),
   );
   const handler = vi.fn<GatewayRequestHandler>(({ respond }) =>
     respond(delivery !== "error", payload),
   );
   const harness = createDispatchTestHarness({ extraHandlers: { [method]: handler } });
+  const { dispatch: dispatchRequest } = harness.dispatcher;
   harness.send.mockReturnValue(
     delivery === "unavailable" ? { kind: "unavailable" } : { kind: "sent", bytes: 1234 },
   );
@@ -75,12 +67,8 @@ async function dispatch(
     };
   }
   const request = { type: "req", id: "private-request", method, params };
-  await harness.dispatcher.dispatch(
-    request,
-    client,
-    undefined,
-    delivery === "internal" ? (frame) => harness.send(frame) : undefined,
-  );
+  const internalSend = delivery === "internal" ? harness.send : undefined;
+  await dispatchRequest(request, client, undefined, internalSend);
   if (delivery === "shared") {
     await harness.dispatcher.dispatch({ ...request, id: "private-follower" }, client);
     expect(handler).toHaveBeenCalledOnce();
@@ -89,7 +77,7 @@ async function dispatch(
     }
   }
   await waitForDiagnosticEventsDrained();
-  return events;
+  return events.filter((event) => event.type === "gateway.rpc" && event.phase === "response");
 }
 
 it.each(["wire", "shared", "internal"] as const)(
@@ -113,13 +101,10 @@ it.each(["wire", "shared", "internal"] as const)(
         payload,
         delivery,
       );
-      expect(events).toHaveLength(delivery === "shared" ? 2 : 1);
-      for (const event of events) {
-        expect(event.sessionsList).toMatchObject({
-          rowsOutcome: "full-with-base",
-          baseMissReason: reason,
-        });
-      }
+      const expected = { rowsOutcome: "full-with-base", baseMissReason: reason };
+      expect(events.map((event) => event.sessionsList)).toMatchObject(
+        delivery === "shared" ? [expected, expected] : [expected],
+      );
     }
     const noBase = shareSidebarSessionRows(changed);
     const events = await dispatch("sessions.list", { rowMode: "sidebar" }, noBase, delivery);
@@ -157,18 +142,14 @@ it.each([
   },
 );
 
+const receiptQuery = { inputRunIds: ["private-"], cursor: "private-", pendingBefore: 2, limit: 81 };
 it.each([
-  [{ cursor: "private-cursor", limit: 20 }, "delta", "cursor", "<=20"],
+  [{ cursor: "private-c", limit: 20 }, "delta", "cursor", "<=20"],
   [{ offset: 1, limit: 21 }, undefined, "older", "<=80"],
   [{ pendingBefore: 2, offset: 1, limit: 80 }, undefined, "pending", "<=80"],
-  [
-    { inputRunIds: ["private-run"], cursor: "private-cursor", pendingBefore: 2, limit: 81 },
-    "reset",
-    "receipt",
-    "<=200",
-  ],
+  [receiptQuery, "reset", "receipt", "<=200"],
   [{ offset: 0 }, undefined, "tail", "<=200"],
-  [{ messageId: "private-anchor", sessionId: "private-archive" }, undefined, "anchor", "<=200"],
+  [{ messageId: "private-m", sessionId: "private-s" }, undefined, "anchor", "<=200"],
   [{ limit: 201 }, undefined, "tail", ">200"],
 ] as const)(
   "attributes validated history response shape (%j, %s, %s, %s)",

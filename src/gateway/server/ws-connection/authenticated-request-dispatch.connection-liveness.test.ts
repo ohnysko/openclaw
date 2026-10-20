@@ -1,4 +1,4 @@
-import { beforeEach, expect, it, onTestFinished, vi } from "vitest";
+import { expect, it, onTestFinished, vi } from "vitest";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import { createTestGatewayScheduler } from "../../../test-utils/gateway-scheduler-clock.js";
 import { createGatewayConnectionState } from "../../server-connection-state.js";
@@ -31,8 +31,6 @@ vi.mock("./authenticated-request-dispatch.server-methods.runtime.js", async () =
   };
 });
 
-beforeEach(() => runtime.beforeHandler.mockReset());
-
 it.each(["sessions.subscribe", "sessions.messages.subscribe", "sessions.observer.visibility"])(
   "rejects a late %s mutation after disconnect cleanup",
   { concurrent: false },
@@ -42,7 +40,7 @@ it.each(["sessions.subscribe", "sessions.messages.subscribe", "sessions.observer
     const params = visibility ? { visible: true } : messages ? { key: "agent:main:main" } : {};
     const held = createDeferredCore();
     const started = createDeferredCore();
-    runtime.beforeHandler.mockImplementation(() => {
+    runtime.beforeHandler.mockReset().mockImplementation(() => {
       started.resolve();
       return held.promise;
     });
@@ -63,10 +61,7 @@ it.each(["sessions.subscribe", "sessions.messages.subscribe", "sessions.observer
         sessionObserver: { setConnectionVisibility },
       }),
     });
-    const dispatch = harness.dispatcher.dispatch(
-      { type: "req", id: method, method, params },
-      client,
-    );
+    const run = harness.dispatcher.dispatch({ type: "req", id: method, method, params }, client);
     try {
       await started.promise;
       expect(runtime.beforeHandler).toHaveBeenCalledOnce();
@@ -75,7 +70,7 @@ it.each(["sessions.subscribe", "sessions.messages.subscribe", "sessions.observer
       state.sessionMessageSubscribers.unsubscribeAll(client.connId);
     } finally {
       held.resolve();
-      await dispatch;
+      await run;
     }
     expect(await harness.awaitResponseFrame(method)).toMatchObject(
       visibility ? { ok: false, error: { code: "FORBIDDEN" } } : { ok: true },
