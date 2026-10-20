@@ -375,9 +375,7 @@ describe("buildAssistantReplyContentFromInputs", () => {
 describe("createChatSendReplyDispatch", () => {
   it("owns assistant media before transcript publication only during its live dispatch", async () => {
     let current = true;
-    const dispatch = createReplyDispatch("run-media", {
-      isRunCurrent: () => current,
-    });
+    const dispatch = createReplyDispatch("run-media", { isRunCurrent: () => current });
     const rawText =
       "[[reply_to_current]] Artifacts ready\nMEDIA:./artifact.json\n```text\nMEDIA:./example.png\n```";
     const prepare = () =>

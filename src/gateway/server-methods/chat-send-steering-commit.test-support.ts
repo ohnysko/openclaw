@@ -92,9 +92,7 @@ export function registerChatSteeringCommitCases(
           expect(profile.id).not.toBe(creator.id);
           expect(target.id).not.toBe(creator.id);
           client.connect.scopes = ["operator.read", "operator.write"];
-          await patchSessionEntryCore(scope, () => ({
-            visibility: "shared",
-          }));
+          await patchSessionEntryCore(scope, () => ({ visibility: "shared" }));
           expect(loadExactSessionEntryReadOnly(scope)?.entry).toMatchObject({
             visibility: "shared",
             createdActor: { type: "human", source: "profile", id: creator.id },
@@ -348,13 +346,7 @@ export function registerChatSteeringCommitCases(
                   payload.state === "error",
               )
               .map(([, payload]) => payload),
-          ).toMatchObject([
-            {
-              runId,
-              state: "error",
-              errorMessage: sourceError,
-            },
-          ]);
+          ).toMatchObject([{ runId, state: "error", errorMessage: sourceError }]);
           expect(await listSessionPendingInputs(scope)).toMatchObject({
             total: 1,
             items: [{ ...pending.items[0], state: "interrupted" }],

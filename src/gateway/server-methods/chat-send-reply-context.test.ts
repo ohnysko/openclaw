@@ -57,10 +57,7 @@ it.each([
   [
     "user",
     "[Sat 2026-07-18 11:31 MDT] Which stage runs the integration tests?",
-    {
-      ReplyToBody: "Which stage runs the integration tests?",
-      ReplyToSender: "Ada",
-    },
+    { ReplyToBody: "Which stage runs the integration tests?", ReplyToSender: "Ada" },
   ],
   ["assistant", [{ type: "text", text: "NO_REPLY" }], {}],
 ] as const)("projects %s reply targets", async (role, content, expected) => {
