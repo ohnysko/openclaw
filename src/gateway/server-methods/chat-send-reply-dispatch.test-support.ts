@@ -18,20 +18,13 @@ import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { attachSessionTranscriptRunId } from "../../sessions/transcript-events.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { runOpenClawAgentWriteTransaction } from "../../state/openclaw-agent-db.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../../test-utils/openclaw-test-state.js";
 import { loadSessionEntryAsync } from "../session-entry-load.test-support.js";
 import * as sessionStoreReaders from "../session-utils-store-worker.js";
 import { createChatSendReplyDispatch } from "./chat-send-reply-dispatch.js";
-
-function createReplyDispatchSession(clientRunId: string) {
-  return {
-    agentId: "main",
-    backingSessionId: undefined,
-    cfg: {},
-    clientRunId,
-    sessionKey: "agent:main:main",
-    sessionLoadOptions: { agentId: "main" },
-  };
-}
 
 export function createReplyDispatch(
   clientRunId: string,
@@ -43,7 +36,14 @@ export function createReplyDispatch(
     isAgentRunStarted: () => true,
     isRunCurrent: () => true,
     logGateway: { ...createSubsystemLogger("test/chat-send-reply-dispatch"), warn: vi.fn() },
-    session: createReplyDispatchSession(clientRunId),
+    session: {
+      agentId: "main",
+      backingSessionId: undefined,
+      cfg: {},
+      clientRunId,
+      sessionKey: "agent:main:main",
+      sessionLoadOptions: { agentId: "main" },
+    },
     userTurnRecorder: { markBlocked: vi.fn(), getAdmissionReceipt: () => undefined },
     ...overrides,
   });
@@ -142,10 +142,7 @@ export async function createReplyTranscriptFixture(
     ));
   let current = true;
   const abortController = new AbortController();
-  const dispatch = createChatSendReplyDispatch({
-    getRuntimeConfig,
-    accountId: undefined,
-    isAgentRunStarted: () => true,
+  const dispatch = createReplyDispatch(runId, {
     isRunCurrent: () => current,
     assertWorkCurrent: qualified
       ? () => {
@@ -155,7 +152,6 @@ export async function createReplyTranscriptFixture(
         }
       : undefined,
     abortSignal: abortController.signal,
-    logGateway: { ...createSubsystemLogger("test/chat-send-reply-dispatch"), warn: vi.fn() },
     session: {
       ...scope,
       entry: sessionEntry,
@@ -189,4 +185,18 @@ export async function createReplyTranscriptFixture(
       current = false;
     },
   };
+}
+
+type ReplyFixture = Awaited<ReturnType<typeof createReplyTranscriptFixture>>;
+export function withReplyTranscript(
+  run: (fixture: ReplyFixture, state: OpenClawTestState) => Promise<void>,
+  active = false,
+) {
+  return withOpenClawTestState({ label: "reply-transcript" }, async (state) => {
+    const fixture = await createReplyTranscriptFixture();
+    const execute = () => run(fixture, state);
+    await (active
+      ? fixture.dispatch.runAgentMediaTranscript({ run: async (operation) => operation() }, execute)
+      : execute());
+  });
 }

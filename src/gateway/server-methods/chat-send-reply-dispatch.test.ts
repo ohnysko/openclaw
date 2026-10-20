@@ -55,6 +55,7 @@ import {
 import {
   createReplyDispatch,
   createReplyTranscriptFixture,
+  withReplyTranscript,
 } from "./chat-send-reply-dispatch.test-support.js";
 
 function interceptDeliverySnapshot(afterRead: () => void) {
@@ -78,8 +79,7 @@ describe("chat delivery watermark preparation", () => {
   it.each(["rewrite", "replacement"] as const)(
     "reads released durable reply facts through history and rejects the old answer after %s",
     async (change) => {
-      await withOpenClawTestState({ label: "chat-delivery-actor-receipt" }, async () => {
-        const { dispatch, rewriteSync, scope, runId } = await createReplyTranscriptFixture();
+      await withReplyTranscript(async ({ dispatch, rewriteSync, scope, runId }) => {
         const acquired = await acquireSessionInputActor(
           {
             ...scope,
@@ -157,8 +157,7 @@ describe("chat delivery watermark preparation", () => {
   );
 
   it("consumes the committed manager boundary without caller transcript SQL", async () => {
-    await withOpenClawTestState({ label: "chat-prepared-start" }, async () => {
-      const { dispatch, append, scope, runId } = await createReplyTranscriptFixture();
+    await withReplyTranscript(async ({ dispatch, append, scope, runId }) => {
       await append("prior-answer", { role: "assistant", content: "Earlier answer." });
       const manager = await SessionManager.openAsync(scope);
       const observed = observeHostDataSql();
@@ -218,14 +217,13 @@ describe("chat delivery watermark preparation", () => {
               const sql = observeHostDataSql();
               try {
                 expect(await dispatch.resolveReplyDelivery()).toBe("delivered");
-                const transcriptReads = sql.queries.filter((query) =>
-                  /\bfrom\s+"?transcript_events\b/i.test(query),
-                );
-                expect(transcriptReads).toEqual([]);
-                const sessionReads = sql.queries.filter((query) =>
-                  /\bfrom\s+"?session_(?:nodes|participants)\b/i.test(query),
-                );
-                expect(sessionReads).toEqual([]);
+                expect(
+                  sql.queries.filter((query) =>
+                    /\bfrom\s+"?(?:transcript_events|session_nodes|session_participants)\b/i.test(
+                      query,
+                    ),
+                  ),
+                ).toEqual([]);
               } finally {
                 sql.restore();
               }
@@ -261,45 +259,38 @@ describe("chat delivery watermark preparation", () => {
   it.each(["retired", "aborted", "rejected"] as const)(
     "rechecks %s before consuming the delivery snapshot",
     async (change) => {
-      await withOpenClawTestState({ label: "chat-watermark-delay" }, async () => {
-        const { dispatch, append, retire, abortController } = await createReplyTranscriptFixture();
-        await dispatch.runAgentMediaTranscript(
-          { run: async (operation) => operation() },
-          async () => {
-            dispatch.captureAgentTranscriptStart();
-            await append("answer", { role: "assistant", content: "Committed answer." });
-            let reads = 0;
-            const failure = new Error("delivery snapshot read rejected");
-            const readerSpy = interceptDeliverySnapshot(() => {
-              reads++;
-              if (change === "retired") {
-                retire();
-              } else if (change === "aborted") {
-                abortController.abort(failure);
-              } else {
-                throw failure;
-              }
-            });
-            try {
-              const delivery = dispatch.resolveReplyDelivery();
-              if (change === "rejected" || change === "aborted") {
-                await expect(delivery).rejects.toBe(failure);
-              } else {
-                expect(await delivery).toBe("missing");
-              }
-              expect(reads).toBe(1);
-            } finally {
-              readerSpy.mockRestore();
-            }
-          },
-        );
-      });
+      await withReplyTranscript(async ({ dispatch, append, retire, abortController }) => {
+        dispatch.captureAgentTranscriptStart();
+        await append("answer", { role: "assistant", content: "Committed answer." });
+        let reads = 0;
+        const failure = new Error("delivery snapshot read rejected");
+        const readerSpy = interceptDeliverySnapshot(() => {
+          reads++;
+          if (change === "retired") {
+            retire();
+          } else if (change === "aborted") {
+            abortController.abort(failure);
+          } else {
+            throw failure;
+          }
+        });
+        try {
+          const delivery = dispatch.resolveReplyDelivery();
+          if (change === "rejected" || change === "aborted") {
+            await expect(delivery).rejects.toBe(failure);
+          } else {
+            expect(await delivery).toBe("missing");
+          }
+          expect(reads).toBe(1);
+        } finally {
+          readerSpy.mockRestore();
+        }
+      }, true);
     },
   );
 
   it("uses admitted metadata with detached history and refreshes a changed tail", async () => {
-    await withOpenClawTestState({ label: "chat-delivery-cohort" }, async () => {
-      const { dispatch, append, appendSync, scope } = await createReplyTranscriptFixture();
+    await withReplyTranscript(async ({ dispatch, append, appendSync, scope }) => {
       dispatch.captureAgentTranscriptStart();
       await append("answer", { role: "assistant", content: "Committed answer." });
       const { databaseClaim } = await loadSessionEntryForAdmission(scope);
@@ -339,6 +330,10 @@ describe("buildAssistantReplyContentFromInputs", () => {
   const notice =
     "Model Fallback: backup/model (selected primary/model; selected model unavailable)";
   const answer = "The workspace check is complete.";
+  const statusContent = [
+    { type: "text", text: notice, openclawStatusNotice: true },
+    { type: "text", text: answer },
+  ];
   it.each([
     ...(
       [
@@ -366,14 +361,8 @@ describe("buildAssistantReplyContentFromInputs", () => {
       payloads: [{ text: notice, isFallbackNotice: true }, { text: answer }],
       payloadTexts: undefined,
       expected: {
-        assistantContent: [
-          { type: "text", text: notice, openclawStatusNotice: true },
-          { type: "text", text: answer },
-        ],
-        persistedAssistantContent: [
-          { type: "text", text: notice, openclawStatusNotice: true },
-          { type: "text", text: answer },
-        ],
+        assistantContent: statusContent,
+        persistedAssistantContent: statusContent,
       },
     },
   ])("projects $name", async ({ kind, payloads, payloadTexts, expected }) => {
@@ -691,46 +680,37 @@ describe("createChatSendReplyDispatch", () => {
   ])(
     "uses committed display answers, not tool progress ($phase, $text)",
     async ({ phase, text, expected }) => {
-      await withOpenClawTestState({ label: "webchat-receipt" }, async () => {
-        const { dispatch, append } = await createReplyTranscriptFixture();
-        await dispatch.runAgentMediaTranscript(
-          { run: async (operation) => operation() },
-          async () => {
-            dispatch.captureAgentTranscriptStart();
-            await append("answer", {
-              role: "assistant",
-              stopReason: "toolUse",
-              content: [
-                {
-                  type: "text",
-                  text,
-                  ...(phase
-                    ? { textSignature: JSON.stringify({ v: 1, id: "answer", phase }) }
-                    : {}),
-                },
-                { type: "toolCall", id: "read-fixture", name: "read", arguments: {} },
-              ],
-            });
-            await append("tool-result", {
-              role: "toolResult",
-              toolCallId: "read-fixture",
-              content: [{ type: "text", text: "Fixture exists." }],
-            });
-            await append("silent-terminal", {
-              role: "assistant",
-              stopReason: "stop",
-              content: [{ type: "text", text: "NO_REPLY" }],
-            });
-            expect(await dispatch.resolveReplyDelivery()).toBe(expected);
-          },
-        );
-      });
+      await withReplyTranscript(async ({ dispatch, append }) => {
+        dispatch.captureAgentTranscriptStart();
+        await append("answer", {
+          role: "assistant",
+          stopReason: "toolUse",
+          content: [
+            {
+              type: "text",
+              text,
+              ...(phase ? { textSignature: JSON.stringify({ v: 1, id: "answer", phase }) } : {}),
+            },
+            { type: "toolCall", id: "read-fixture", name: "read", arguments: {} },
+          ],
+        });
+        await append("tool-result", {
+          role: "toolResult",
+          toolCallId: "read-fixture",
+          content: [{ type: "text", text: "Fixture exists." }],
+        });
+        await append("silent-terminal", {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "NO_REPLY" }],
+        });
+        expect(await dispatch.resolveReplyDelivery()).toBe(expected);
+      }, true);
     },
   );
 
   it("retains pending custody when committed answer projection is unavailable", async () => {
-    await withOpenClawTestState({ label: "webchat-receipt-unavailable" }, async () => {
-      const { dispatch, append, scope } = await createReplyTranscriptFixture();
+    await withReplyTranscript(async ({ dispatch, append, scope }) => {
       dispatch.captureAgentTranscriptStart();
       await append("answer", { role: "assistant", content: "Committed answer." });
       let unavailable = true;
@@ -752,8 +732,7 @@ describe("createChatSendReplyDispatch", () => {
   });
 
   it("requires a committed answer after the current input, not an earlier input or preview", async () => {
-    await withOpenClawTestState({ label: "webchat-input-receipt" }, async () => {
-      const { dispatch, append, scope, runId } = await createReplyTranscriptFixture();
+    await withReplyTranscript(async ({ dispatch, append, scope, runId }) => {
       await append("prior-answer", { role: "assistant", content: "Earlier answer." });
       await dispatch.runAgentMediaTranscript(
         { run: async (operation) => operation() },
@@ -802,117 +781,106 @@ describe("createChatSendReplyDispatch", () => {
     "answer-rewrite",
     "input-rewrite",
   ] as const)("rechecks accepted history against %s changes", async (change) => {
-    await withOpenClawTestState({ label: "webchat-receipt-lifetime" }, async () => {
-      const { dispatch, append, scope, inputId, abortController, retire } =
-        await createReplyTranscriptFixture();
-      await dispatch.runAgentMediaTranscript(
-        { run: async (operation) => operation() },
-        async () => {
-          dispatch.captureAgentTranscriptStart();
-          await append("answer", { role: "assistant", content: "Committed answer." });
-          expect(await dispatch.resolveReplyDelivery()).toBe("delivered");
-          const inFlightReceipt =
-            change === "retired" || change === "aborted"
-              ? dispatch.resolveReplyDelivery()
-              : undefined;
-          if (change === "retired") {
-            retire();
-          } else if (change === "aborted") {
-            abortController.abort();
-          } else if (change === "lifecycle") {
-            await replaceSessionEntry(scope, {
-              sessionId: scope.sessionId,
-              lifecycleRevision: "replacement",
-              updatedAt: 2,
-            });
-          } else if (change === "reset") {
-            await replaceSessionEntry(scope, {
-              sessionId: "replacement-session",
-              lifecycleRevision: "replacement",
-              updatedAt: 2,
-            });
-          } else if (change === "foreign-lifecycle") {
-            const foreign = new DatabaseSync(resolveSessionTranscriptDatabasePath(scope));
-            try {
-              foreign
-                .prepare(
-                  "UPDATE session_nodes SET entry_json = json_set(entry_json, '$.lifecycleRevision', ?) WHERE session_key = ?",
-                )
-                .run("foreign-replacement", scope.sessionKey);
-            } finally {
-              foreign.close();
-            }
-          } else if (change === "branch") {
-            await append("other-branch", { role: "assistant", content: "NO_REPLY" }, inputId);
-          } else {
-            const anchor = readActiveTranscriptEntryAnchor({
-              ...scope,
-              entryId: change === "answer-rewrite" ? "answer" : inputId,
-            });
-            if (!anchor) {
-              throw new Error("Expected active rewrite fixture");
-            }
-            await rewriteTranscriptMessageAtAnchor(anchor, (message) => ({
-              ...asOptionalRecord(message),
-              content: change === "answer-rewrite" ? "NO_REPLY" : "Edited input display.",
-            }));
+    await withReplyTranscript(
+      async ({ dispatch, append, scope, inputId, abortController, retire }) => {
+        dispatch.captureAgentTranscriptStart();
+        await append("answer", { role: "assistant", content: "Committed answer." });
+        expect(await dispatch.resolveReplyDelivery()).toBe("delivered");
+        const inFlightReceipt =
+          change === "retired" || change === "aborted"
+            ? dispatch.resolveReplyDelivery()
+            : undefined;
+        if (change === "retired") {
+          retire();
+        } else if (change === "aborted") {
+          abortController.abort();
+        } else if (change === "lifecycle") {
+          await replaceSessionEntry(scope, {
+            sessionId: scope.sessionId,
+            lifecycleRevision: "replacement",
+            updatedAt: 2,
+          });
+        } else if (change === "reset") {
+          await replaceSessionEntry(scope, {
+            sessionId: "replacement-session",
+            lifecycleRevision: "replacement",
+            updatedAt: 2,
+          });
+        } else if (change === "foreign-lifecycle") {
+          const foreign = new DatabaseSync(resolveSessionTranscriptDatabasePath(scope));
+          try {
+            foreign
+              .prepare(
+                "UPDATE session_nodes SET entry_json = json_set(entry_json, '$.lifecycleRevision', ?) WHERE session_key = ?",
+              )
+              .run("foreign-replacement", scope.sessionKey);
+          } finally {
+            foreign.close();
           }
-          if (inFlightReceipt) {
-            expect(await inFlightReceipt).toBe("missing");
+        } else if (change === "branch") {
+          await append("other-branch", { role: "assistant", content: "NO_REPLY" }, inputId);
+        } else {
+          const anchor = readActiveTranscriptEntryAnchor({
+            ...scope,
+            entryId: change === "answer-rewrite" ? "answer" : inputId,
+          });
+          if (!anchor) {
+            throw new Error("Expected active rewrite fixture");
           }
-          expect(await dispatch.resolveReplyDelivery()).toBe(
-            change === "input-rewrite" ? "delivered" : "missing",
-          );
-        },
-      );
-    });
+          await rewriteTranscriptMessageAtAnchor(anchor, (message) => ({
+            ...asOptionalRecord(message),
+            content: change === "answer-rewrite" ? "NO_REPLY" : "Edited input display.",
+          }));
+        }
+        if (inFlightReceipt) {
+          expect(await inFlightReceipt).toBe("missing");
+        }
+        expect(await dispatch.resolveReplyDelivery()).toBe(
+          change === "input-rewrite" ? "delivered" : "missing",
+        );
+      },
+      true,
+    );
   });
 
   it.each(["new-input", "branch", "answer-rewrite", "unrelated-rewrite", "append"] as const)(
     "retains factual delivery while rechecking a concurrent %s",
     async (change) => {
-      await withOpenClawTestState({ label: "webchat-receipt-freshness" }, async () => {
-        const { dispatch, append, appendSync, rewriteSync, inputId } =
-          await createReplyTranscriptFixture();
-        await dispatch.runAgentMediaTranscript(
-          { run: async (operation) => operation() },
-          async () => {
-            dispatch.captureAgentTranscriptStart();
-            await append("answer", { role: "assistant", content: "Committed answer." });
-            let changed = false;
-            const selectedRead = interceptDeliverySnapshot(() => {
-              changed = true;
-              if (change === "new-input") {
-                appendSync("next-input", {
-                  role: "user",
-                  content: "Inspect the synthetic fixture.",
-                  idempotencyKey: "next-input:user",
-                });
-              } else if (change === "branch" || change === "append") {
-                appendSync(
-                  "later-answer",
-                  { role: "assistant", content: "NO_REPLY" },
-                  change === "branch" ? inputId : undefined,
-                );
-              } else {
-                rewriteSync(
-                  change === "answer-rewrite" ? "answer" : inputId,
-                  change === "answer-rewrite" ? "NO_REPLY" : "Edited input display.",
-                );
-              }
+      await withReplyTranscript(async ({ dispatch, append, appendSync, rewriteSync, inputId }) => {
+        dispatch.captureAgentTranscriptStart();
+        await append("answer", { role: "assistant", content: "Committed answer." });
+        let changed = false;
+        const selectedRead = interceptDeliverySnapshot(() => {
+          changed = true;
+          if (change === "new-input") {
+            appendSync("next-input", {
+              role: "user",
+              content: "Inspect the synthetic fixture.",
+              idempotencyKey: "next-input:user",
             });
-            try {
-              expect(await dispatch.resolveReplyDelivery()).toBe("pending");
-              expect(changed).toBe(true);
-            } finally {
-              selectedRead.mockRestore();
-            }
-            expect(await dispatch.resolveReplyDelivery()).toBe(
-              change === "append" || change === "unrelated-rewrite" ? "delivered" : "missing",
+          } else if (change === "branch" || change === "append") {
+            appendSync(
+              "later-answer",
+              { role: "assistant", content: "NO_REPLY" },
+              change === "branch" ? inputId : undefined,
             );
-          },
+          } else {
+            rewriteSync(
+              change === "answer-rewrite" ? "answer" : inputId,
+              change === "answer-rewrite" ? "NO_REPLY" : "Edited input display.",
+            );
+          }
+        });
+        try {
+          expect(await dispatch.resolveReplyDelivery()).toBe("pending");
+          expect(changed).toBe(true);
+        } finally {
+          selectedRead.mockRestore();
+        }
+        expect(await dispatch.resolveReplyDelivery()).toBe(
+          change === "append" || change === "unrelated-rewrite" ? "delivered" : "missing",
         );
-      });
+      }, true);
     },
   );
 });
@@ -924,8 +892,7 @@ it.each([
 ])(
   "enriches $replyCount exact document replies after input projection changes (streaming=$streaming, silentTail=$silentTail)",
   async ({ replyCount, streaming, silentTail }) => {
-    await withOpenClawTestState({ label: "webchat-projected-input-media" }, async (state) => {
-      const { dispatch, scope, runId, userTurnRecorder } = await createReplyTranscriptFixture();
+    await withReplyTranscript(async ({ dispatch, scope, runId, userTurnRecorder }, state) => {
       const filename = state.statePath("media", "contributor-checklist.md");
       await mkdir(path.dirname(filename), { recursive: true });
       await writeFile(filename, "# Contributor checklist\n- [ ] Run the focused check\n");

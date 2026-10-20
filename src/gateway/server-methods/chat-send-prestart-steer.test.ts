@@ -73,6 +73,41 @@ function createControlUiRequestClient() {
   };
 }
 
+function createRequestClients() {
+  const client = createControlUiRequestClient();
+  const clients = new Set<GatewayClient & { connId: string }>([client]);
+  return {
+    client,
+    clients,
+    getClientConnIds: (filter?: (client: GatewayClient) => boolean) =>
+      new Set(
+        [...clients].filter((entry) => !filter || filter(entry)).map((entry) => entry.connId),
+      ),
+  };
+}
+
+function expectSingleUserInput(storePath: string, sessionKey: string, text: string) {
+  const entry = expectDefined(
+    loadSessionEntry({ agentId: "main", sessionKey, storePath }),
+    "session",
+  );
+  const events = loadTranscriptEventsSync({
+    agentId: "main",
+    sessionKey,
+    sessionId: entry.sessionId,
+    storePath,
+  });
+  expect(
+    events.filter(
+      (event) =>
+        isRecord(event) &&
+        isRecord(event.message) &&
+        event.message.role === "user" &&
+        extractTextFromChatContent(event.message.content) === text,
+    ),
+  ).toHaveLength(1);
+}
+
 test.for(["accepted", "unavailable", "rejected"] as const)(
   "preserves a prestart steer through workspace preparation when late injection is %s",
   async (injection, { signal }) => {
@@ -103,12 +138,9 @@ test.for(["accepted", "unavailable", "rejected"] as const)(
     let clock = 0;
     const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
     const logGateway = { ...createSubsystemLogger("test/gateway"), info: vi.fn() };
-    const clients = new Set<GatewayClient & { connId: string }>();
+    const { client, clients, getClientConnIds } = createRequestClients();
     const context = {
-      getClientConnIds: (filter?: (client: GatewayClient) => boolean) =>
-        new Set(
-          [...clients].filter((client) => !filter || filter(client)).map((client) => client.connId),
-        ),
+      getClientConnIds,
       logGateway,
       getSessionEventSubscriberConnIds: () => new Set(["custody-observer"]),
       broadcastToConnIds: vi.fn((event: string, payload: unknown) => {
@@ -125,11 +157,8 @@ test.for(["accepted", "unavailable", "rejected"] as const)(
       broadcast: vi.fn((event: string, payload: unknown) => {
         if (
           event === "chat" &&
-          typeof payload === "object" &&
-          payload !== null &&
-          "runId" in payload &&
+          isRecord(payload) &&
           payload.runId === steerRunId &&
-          "state" in payload &&
           (payload.state === "final" || payload.state === "error" || payload.state === "aborted")
         ) {
           terminalBeforeConsumption.push(consumed.length === 0);
@@ -139,9 +168,8 @@ test.for(["accepted", "unavailable", "rejected"] as const)(
     };
     const requestOptions = {
       context,
-      client: createControlUiRequestClient(),
+      client,
     };
-    clients.add(requestOptions.client);
     // Read through the public handler with the same live custody and physical session.
     const readInputCustody = async () => {
       const response = await directSessionReq<{
@@ -165,6 +193,13 @@ test.for(["accepted", "unavailable", "rejected"] as const)(
         ),
         queuedCount: history.pendingInputs.queuedCount,
       };
+    };
+    const expectPendingCustody = async () => {
+      const custody = await readInputCustody();
+      expect.soft(custody.input).not.toHaveProperty("queued");
+      expect.soft(custody.receipt).toEqual({ runId: steerRunId, state: "pending" });
+      expect.soft(custody.queuedCount).toBe(0);
+      return custody;
     };
     const createWorktree = captureMethodCall("createWithOutcome")(ManagedWorktreeService.prototype);
     const worktreeSpy = vi
@@ -294,10 +329,7 @@ test.for(["accepted", "unavailable", "rejected"] as const)(
       expect(isRpcSourceQueued(rpcSourceTesting.get(steerRunId))).toBe(true);
       expect(initialOperation?.phase).toBe("running");
       expect(consumed).toEqual([]);
-      const parked = await readInputCustody();
-      expect.soft(parked.input).not.toHaveProperty("queued");
-      expect.soft(parked.receipt).toEqual({ runId: steerRunId, state: "pending" });
-      expect.soft(parked.queuedCount).toBe(0);
+      await expectPendingCustody();
       releaseInitialBackend.resolve();
       if (injection === "accepted") {
         await withinTest(steerAccepted.promise, signal);
@@ -306,10 +338,7 @@ test.for(["accepted", "unavailable", "rejected"] as const)(
         // Accepted steering retains cancellation custody but is not a follow-up queue item.
         expect(rpcSourceTesting.get(steerRunId)).toBe(steerEntry);
         expect(isRpcSourceQueued(steerEntry)).toBe(true);
-        const accepted = await readInputCustody();
-        expect.soft(accepted.input).not.toHaveProperty("queued");
-        expect.soft(accepted.receipt).toEqual({ runId: steerRunId, state: "pending" });
-        expect.soft(accepted.queuedCount).toBe(0);
+        await expectPendingCustody();
         releaseSteerCommit.resolve();
         await withinTest(steerTerminal.promise, signal);
         expect(consumed).toEqual([
@@ -370,25 +399,7 @@ test.for(["accepted", "unavailable", "rejected"] as const)(
         ]),
       );
       expect(dispatchInboundMessageMock).toHaveBeenCalledTimes(2);
-      const entry = expectDefined(
-        loadSessionEntry({ agentId: "main", sessionKey, storePath }),
-        "session",
-      );
-      const messages = loadTranscriptEventsSync({
-        agentId: "main",
-        sessionKey,
-        sessionId: entry.sessionId,
-        storePath,
-      });
-      expect(
-        messages.filter(
-          (event) =>
-            isRecord(event) &&
-            isRecord(event.message) &&
-            event.message.role === "user" &&
-            extractTextFromChatContent(event.message.content) === steerText,
-        ),
-      ).toHaveLength(1);
+      expectSingleUserInput(storePath, sessionKey, steerText);
     } finally {
       const released = captureSessionControllerSettlement({
         scope: storePath,
@@ -446,12 +457,9 @@ test("queues a fresh follow-up while stopped preparation still owns the reply sl
   let stopping: ReturnType<typeof directSessionReq> | undefined;
   let sessionKey: string | undefined;
   const consumed: string[] = [];
-  const clients = new Set<GatewayClient & { connId: string }>();
+  const { client, clients, getClientConnIds } = createRequestClients();
   const context = {
-    getClientConnIds: (filter?: (client: GatewayClient) => boolean) =>
-      new Set(
-        [...clients].filter((client) => !filter || filter(client)).map((client) => client.connId),
-      ),
+    getClientConnIds,
     broadcast: vi.fn((event: string, payload: unknown) => {
       if (
         event === "chat" &&
@@ -463,8 +471,7 @@ test("queues a fresh follow-up while stopped preparation still owns the reply sl
       }
     }),
   };
-  const requestOptions = { client: createControlUiRequestClient(), context };
-  clients.add(requestOptions.client);
+  const requestOptions = { client, context };
   runtime.execute.mockImplementation(async ({ followupRun, opts, replyOperation }) => {
     const runId = expectDefined(opts?.runId, "runtime run ID");
     if (!initialOperation) {
@@ -530,25 +537,7 @@ test("queues a fresh follow-up while stopped preparation still owns the reply sl
     expect(consumed).toEqual([expect.stringContaining(followupText)]);
     expect(runtime.execute).toHaveBeenCalledTimes(2);
     expect(initialOperation?.result).toMatchObject({ kind: "aborted", code: "aborted_by_user" });
-    const entry = expectDefined(
-      loadSessionEntry({ agentId: "main", sessionKey, storePath }),
-      "session",
-    );
-    const messages = loadTranscriptEventsSync({
-      agentId: "main",
-      sessionKey,
-      sessionId: entry.sessionId,
-      storePath,
-    });
-    expect(
-      messages.filter(
-        (event) =>
-          isRecord(event) &&
-          isRecord(event.message) &&
-          event.message.role === "user" &&
-          extractTextFromChatContent(event.message.content) === followupText,
-      ),
-    ).toHaveLength(1);
+    expectSingleUserInput(storePath, sessionKey, followupText);
   } finally {
     const released = captureSessionControllerSettlement({
       scope: storePath,
