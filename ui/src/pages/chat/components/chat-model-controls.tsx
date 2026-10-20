@@ -8,6 +8,7 @@ import type {
 } from "../../../api/types.ts";
 import { registerModelControlsEnglish } from "../../../i18n/locales/en-model-controls.ts";
 import {
+  normalizeChatModelAvailabilityKey,
   normalizeChatModelProviderId,
   resolvePreferredServerChatModelValue,
 } from "../../../lib/chat/model-ref.ts";
@@ -147,14 +148,7 @@ function prepareChatModelCatalog(catalog: ModelCatalogEntry[]) {
       return "other";
     },
     entry(value: string): ModelCatalogEntry | undefined {
-      const trimmedValue = value.trim().toLowerCase();
-      const separator = trimmedValue.indexOf("/");
-      const normalizedValue =
-        separator > 0
-          ? `${normalizeChatModelProviderId(trimmedValue.slice(0, separator))}/${trimmedValue.slice(
-              separator + 1,
-            )}`
-          : trimmedValue;
+      const normalizedValue = normalizeChatModelAvailabilityKey(value);
       if (!normalizedValue) {
         return undefined;
       }

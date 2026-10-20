@@ -35,6 +35,10 @@ type ReadEntry<T> = {
   value?: T;
 };
 
+type ReadCacheFreshness =
+  | number
+  | { milliseconds: number; joinPending?: true; versionedMilliseconds?: number };
+
 function gitEnvironmentKey(input: unknown): string {
   return JSON.stringify([
     input,
@@ -70,7 +74,7 @@ function diffRevisionMissReason(previous: string, current: string): DiffReadCach
 
 function createReadCache<Input, Output>(
   load: (input: Input, signal: AbortSignal, timing?: DiffReadTiming) => Promise<Output>,
-  freshness: number | { milliseconds: number; joinPending?: true; versionedMilliseconds?: number },
+  freshness: ReadCacheFreshness,
   revision?: (
     input: Input,
     signal: AbortSignal,
@@ -283,6 +287,33 @@ function createReadCache<Input, Output>(
   };
 }
 
+function createDiffReadCache(freshness: ReadCacheFreshness, maxEntries?: number) {
+  return createReadCache(
+    (input: GitReadOperations["checkout.diff"]["input"], signal, diffTiming) =>
+      runGitWorkerOperation({ type: "checkout.diff", input }, { signal, diffTiming }),
+    freshness,
+    (input, signal, diffTiming, previous) =>
+      runGitWorkerOperation(
+        {
+          type: "checkout.revision",
+          input: {
+            root: input.cwd,
+            scope: "diff",
+            summaryOnly: input.summaryOnly,
+            paths: previous?.files.flatMap((file) =>
+              file.oldPath ? [file.path, file.oldPath] : [file.path],
+            ),
+          },
+        },
+        { signal, diffTiming },
+      ),
+    undefined,
+    undefined,
+    (value) => !value.unavailableReason,
+    maxEntries,
+  );
+}
+
 function createReadCaches() {
   const comparisons = createReadCache<
     GitWorkerOperations["pull-request.branch-comparison"]["input"],
@@ -354,59 +385,17 @@ function createReadCaches() {
         ),
       (input) => input.root,
     ),
-    diff: createReadCache(
-      (input: GitReadOperations["checkout.diff"]["input"], signal, diffTiming) =>
-        runGitWorkerOperation({ type: "checkout.diff", input }, { signal, diffTiming }),
+    diff: createDiffReadCache(
       { milliseconds: 0, versionedMilliseconds: Number.POSITIVE_INFINITY },
-      (input, signal, diffTiming, previous) =>
-        runGitWorkerOperation(
-          {
-            type: "checkout.revision",
-            input: {
-              root: input.cwd,
-              scope: "diff",
-              summaryOnly: input.summaryOnly,
-              paths: previous?.files.flatMap((file) =>
-                file.oldPath ? [file.path, file.oldPath] : [file.path],
-              ),
-            },
-          },
-          { signal, diffTiming },
-        ),
-      undefined,
-      undefined,
-      (value) => !value.unavailableReason,
       // Full results may retain 1.5 MB of patches each.
       32,
     ),
-    diffSummary: createReadCache(
-      (input: GitReadOperations["checkout.diff"]["input"], signal, diffTiming) =>
-        runGitWorkerOperation({ type: "checkout.diff", input }, { signal, diffTiming }),
-      // Visible clients share this short-lived summary; never duplicate a slow scan.
-      {
-        milliseconds: 10_000,
-        joinPending: true,
-        versionedMilliseconds: Number.POSITIVE_INFINITY,
-      },
-      (input, signal, diffTiming, previous) =>
-        runGitWorkerOperation(
-          {
-            type: "checkout.revision",
-            input: {
-              root: input.cwd,
-              scope: "diff",
-              summaryOnly: input.summaryOnly,
-              paths: previous?.files.flatMap((file) =>
-                file.oldPath ? [file.path, file.oldPath] : [file.path],
-              ),
-            },
-          },
-          { signal, diffTiming },
-        ),
-      undefined,
-      undefined,
-      (value) => !value.unavailableReason,
-    ),
+    // Visible clients share this short-lived summary; never duplicate a slow scan.
+    diffSummary: createDiffReadCache({
+      milliseconds: 10_000,
+      joinPending: true,
+      versionedMilliseconds: Number.POSITIVE_INFINITY,
+    }),
     branches: createReadCache(
       (input: GitReadOperations["repository.branches"]["input"], signal) =>
         runGitWorkerOperation({ type: "repository.branches", input }, { signal }),

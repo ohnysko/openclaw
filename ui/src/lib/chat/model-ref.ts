@@ -7,6 +7,17 @@ export function normalizeChatModelProviderId(provider: string): string {
   return isLegacyCodexProviderId(normalized) ? "openai" : normalized;
 }
 
+export function normalizeChatModelAvailabilityKey(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  const separator = normalized.indexOf("/");
+  if (separator <= 0) {
+    return normalized;
+  }
+  return `${normalizeChatModelProviderId(normalized.slice(0, separator))}/${normalized.slice(
+    separator + 1,
+  )}`;
+}
+
 export function buildQualifiedChatModelValue(model: string, provider?: string | null): string {
   const trimmedModel = model.trim();
   if (!trimmedModel) {

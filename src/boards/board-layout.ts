@@ -226,14 +226,12 @@ function applyBoardOp(layout: BoardLayout, op: BoardOp): void {
 }
 
 export function applyBoardOps(layout: BoardLayout, ops: readonly BoardOp[]): BoardLayout {
-  const next = structuredClone(layout);
+  let next = structuredClone(layout);
   for (const op of ops) {
     applyBoardOp(next, op);
-    const normalized = normalizeOwnedLayout(next);
-    next.tabs = normalized.tabs;
-    next.widgets = normalized.widgets;
+    next = normalizeOwnedLayout(next);
   }
-  return normalizeOwnedLayout(next);
+  return ops.length > 0 ? next : normalizeOwnedLayout(next);
 }
 
 export function insertBoardWidget(

@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { buildGatewayClawAddPlan, projectGatewayClawAddPlan } from "./gateway-add-plan.js";
+import { plansMatchAcrossSourceRoots } from "./gateway-plan-projection.js";
 import { buildClawAddPlan } from "./lifecycle.js";
 import { readClawManifestFile } from "./reader.js";
 import type { ClawReadResult } from "./types.js";
@@ -32,6 +33,34 @@ async function readGatewayPackageFixture(fixture: string): Promise<ClawReadResul
 }
 
 describe("Gateway Claw Add plan", () => {
+  it("compares relocated plan paths without treating sibling paths as source contents", () => {
+    const previewRoot = path.resolve("preview-claw");
+    const persistedRoot = path.resolve("persisted-claw");
+    const external = path.resolve("external-claw");
+    const plan = (root: string, outside = external) => ({
+      planIntegrity: root,
+      paths: [root, { file: path.join(root, "nested", "asset"), outside }],
+      relative: "nested/asset",
+      scalar: [null, 7, true],
+    });
+    expect(
+      plansMatchAcrossSourceRoots({
+        preview: plan(previewRoot),
+        previewRoot,
+        persisted: plan(persistedRoot),
+        persistedRoot,
+      }),
+    ).toBe(true);
+    expect(
+      plansMatchAcrossSourceRoots({
+        preview: plan(previewRoot, `${previewRoot}-sibling`),
+        previewRoot,
+        persisted: plan(persistedRoot, `${persistedRoot}-sibling`),
+        persistedRoot,
+      }),
+    ).toBe(false);
+  });
+
   it("allocates the next numbered ordinary agent without reusing a missing suffix", async () => {
     const stateDir = tempDirs.make("openclaw-claws-numbered-add-");
     vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
