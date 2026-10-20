@@ -17,12 +17,11 @@ import {
   waitForControlUiGatewayReady,
   waitForControlUiInitialRoster,
 } from "../test-helpers/control-ui-e2e-readiness.ts";
-import { takeControlUiViewportScreenshot } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import { pickerValue } from "../test-helpers/select-picker-e2e.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
+import { pollCount } from "./new-session-page.test-support.ts";
 
 const requireRecord = createRequireRecord("record", "expected-object-value");
-const captureEnabled = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
 const models = (id: string) => [
   { id: "anchor", name: "Anchor" },
   { id, name: id },
@@ -157,12 +156,6 @@ function expectProviderOutcome(payload: Record<string, unknown>, status: "ready"
   expect(payload.providerOutcomes).toContainEqual({ provider: "ollama", status });
 }
 
-async function capturePage(page: Page, name: string) {
-  if (captureEnabled) {
-    await page.screenshot({ path: path.join(suite.artifactDir, name + ".png") });
-  }
-}
-
 suite.define(() => {
   it("opens Settings pickers from publication and acquires only on Refresh or Retry", async () => {
     const requests: Array<{ id: string; params: Record<string, unknown> }> = [];
@@ -212,14 +205,6 @@ suite.define(() => {
           const modelOption = (id: string) =>
             primary.locator(`[role="option"][data-value="ollama/${id}:latest"]`);
           const trigger = primary.locator(".picker-select__trigger");
-          const capture = async (name: string) => {
-            if (captureEnabled) {
-              await fs.writeFile(
-                path.join(suite.artifactDir, name),
-                await takeControlUiViewportScreenshot(page, settings, [primary]),
-              );
-            }
-          };
           await trigger.waitFor({ state: "visible" });
           await expect.poll(() => pickerValue(primary)).toBe("fixture/anchor");
           expect(acquisitions()).toBe(initialAcquisitions);
@@ -274,7 +259,6 @@ suite.define(() => {
           await modelOption("refresh-fixture").waitFor({ state: "visible" });
           expect(acquisitions()).toBe(initialAcquisitions);
           expect(await pickerValue(primary)).toBe("fixture/anchor");
-          await capture("settings-first-open.png");
 
           providerModel = "published-fixture:latest";
           const publicationStart = requests.length;
@@ -302,7 +286,6 @@ suite.define(() => {
           await open();
           expect(acquisitions()).toBe(initialAcquisitions + 1);
           expect(await pickerValue(primary)).toBe("fixture/anchor");
-          await capture("settings-published-reopen.png");
 
           await trigger.click();
           await catalogRefresh(() =>
@@ -334,7 +317,6 @@ suite.define(() => {
           expectProviderOutcome(failed, "unavailable");
           expect(await pickerValue(primary)).toBe("fixture/anchor");
           await retry.scrollIntoViewIfNeeded();
-          await capture("settings-refresh-failed.png");
 
           providerMode = "ready";
           providerModel = "recovered-fixture:latest";
@@ -344,7 +326,6 @@ suite.define(() => {
           await modelOption("recovered-fixture").waitFor({ state: "visible" });
           expect(acquisitions()).toBe(initialAcquisitions + 4);
           expect(await pickerValue(primary)).toBe("fixture/anchor");
-          await capture("settings-retry.png");
         },
       );
     } finally {
@@ -386,7 +367,6 @@ suite.define(() => {
         expect(await page.locator(".cmd-palette").getByText(warning, { exact: true }).count()).toBe(
           0,
         );
-        await capturePage(page, "acquisition-failed");
 
         providerMode = "empty";
         expectProviderOutcome(await publishCatalog(), "ready");
@@ -396,7 +376,6 @@ suite.define(() => {
           .locator(".cmd-palette")
           .getByText(warning, { exact: true })
           .waitFor({ state: "hidden" });
-        await capturePage(page, "acquisition-empty");
       });
     } finally {
       providerMode = "ready";
@@ -501,11 +480,10 @@ suite.define(() => {
             exact: true,
           });
           await retiring.waitFor({ state: "visible" });
-          await capturePage(page, "initial");
+
           await publish(page, "palette-published");
-          await expect.poll(() => published.count()).toBe(1);
+          await pollCount(published).toBe(1);
           expect(await retiring.count()).toBe(0);
-          await capturePage(page, "published");
 
           rejectCatalogReplies = true;
           // Refresh the same catalog owner; a config write retires its display facts.
@@ -522,7 +500,7 @@ suite.define(() => {
             .filter({ hasText: "Model search unavailable" });
           await status.waitFor({ state: "visible" });
           expect(await published.count()).toBe(1);
-          await capturePage(page, "read-failure");
+
           rejectCatalogReplies = false;
           await publish(page, "palette-held");
           await input.fill("palette-held");
@@ -531,10 +509,10 @@ suite.define(() => {
           await status.waitFor({ state: "hidden" });
           await input.press("Enter");
           await expect.poll(() => new URL(page.url()).pathname).toBe("/settings/model-providers");
-          // History changes before the new view commits; capture must not supply that wait.
+          // History changes before the new view commits.
           const settings = page.locator("openclaw-model-providers-page");
           await settings.waitFor({ state: "visible" });
-          await capturePage(page, "recovered");
+
           await page.goBack();
           await settings.waitFor({ state: "hidden" });
           rejectCatalogReplies = true;
@@ -552,7 +530,7 @@ suite.define(() => {
             agentId: "reviewer",
           });
           expect(await recovered.count()).toBe(0);
-          await capturePage(page, "selected-agent-failure");
+
           rejectCatalogReplies = false;
           await input.fill("palette-held");
           await recovered.waitFor({ state: "visible" });

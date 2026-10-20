@@ -11,26 +11,24 @@ import {
   createControlUiE2eContextOptions,
   createControlUiE2eSuite,
 } from "./control-ui-e2e-suite.test-support.ts";
+import {
+  ONE_PIXEL_PNG_B64,
+  pastePng,
+  pollCount,
+  pollEnabled,
+  pollText,
+} from "./new-session-page.test-support.ts";
 
 const suite = createControlUiE2eSuite({ name: "command palette pasted images" });
 
 async function pasteImages(input: Locator, count = 1) {
-  return input.evaluate((element, fileCount) => {
-    const canvas = document.createElement("canvas");
-    canvas.width = canvas.height = 8;
-    const content = canvas.toDataURL("image/png").split(",")[1]!;
-    const clipboard = new DataTransfer();
-    const attachments = Array.from({ length: fileCount }, (_, index) => {
-      const fileName = "image-" + index + ".png";
-      const bytes = Uint8Array.from(atob(content), (character) => character.charCodeAt(0));
-      clipboard.items.add(new File([bytes], fileName, { type: "image/png" }));
-      return { type: "image", mimeType: "image/png", fileName, content };
-    });
-    element.dispatchEvent(
-      new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: clipboard }),
-    );
-    return attachments;
-  }, count);
+  await pastePng(input, count);
+  return Array.from({ length: count }, (_, index) => ({
+    type: "image",
+    mimeType: "image/png",
+    content: ONE_PIXEL_PNG_B64,
+    fileName: count === 1 ? "pixel.png" : `pixel-${index + 1}.png`,
+  }));
 }
 
 suite.define(() => {
@@ -44,20 +42,20 @@ suite.define(() => {
           await page.evaluate(() => document.fonts.ready);
           const images = palette.locator(".chat-attachment-thumb img");
           const start = button(palette, "Start new session in background");
-          const remove = palette.getByRole("button", { name: /^Remove image-/ });
+          const remove = palette.getByRole("button", { name: /^Remove pixel-/ });
           for (const message of [
             "",
             "Compare these images",
             "First line\nSecond line\nThird line\nFourth line",
           ]) {
             await input.fill(message);
-            await expect.poll(() => start.isEnabled()).toBe(Boolean(message));
+            await pollEnabled(start).toBe(Boolean(message));
             const initial = await paletteAnchors(palette);
             await pasteImages(input, 2);
-            await expect.poll(() => images.count()).toBe(2);
+            await pollCount(images).toBe(2);
             expect(await paletteAnchors(palette)).toEqual(initial);
             await pasteImages(input, 10);
-            await expect.poll(() => images.count()).toBe(12);
+            await pollCount(images).toBe(12);
             expect(await paletteAnchors(palette)).toEqual(initial);
             expect(
               await palette
@@ -65,12 +63,12 @@ suite.define(() => {
                 .evaluate((element) => element.scrollWidth > element.clientWidth),
             ).toBe(true);
             await remove.first().click();
-            await expect.poll(() => images.count()).toBe(11);
+            await pollCount(images).toBe(11);
             expect(await paletteAnchors(palette)).toEqual(initial);
             for (let index = 0; index < 11; index += 1) {
               await remove.first().click();
             }
-            await expect.poll(() => images.count()).toBe(0);
+            await pollCount(images).toBe(0);
             expect(await start.isEnabled()).toBe(Boolean(message));
             expect(await paletteAnchors(palette)).toEqual(initial);
           }
@@ -94,7 +92,7 @@ suite.define(() => {
       const attachments = await pasteImages(input, 2);
       const images = palette.locator(".chat-attachment-thumb img");
       const start = button(palette, "Start new session in background");
-      await expect.poll(() => start.isEnabled()).toBe(true);
+      await pollEnabled(start).toBe(true);
       await gateway.deferNext("sessions.create");
       await input.press("ControlOrMeta+Enter");
       expect((await gateway.waitForRequest("sessions.create")).params).toMatchObject({
@@ -108,16 +106,14 @@ suite.define(() => {
         code: "INVALID_REQUEST",
         message: "Could not create session",
       });
-      await expect
-        .poll(() => palette.getByRole("alert").textContent())
-        .toContain("Could not create session");
+      await pollText(palette.getByRole("alert")).toContain("Could not create session");
       expect(await images.count()).toBe(2);
       await input.press("Escape");
       await input.waitFor({ state: "hidden" });
       await page.keyboard.press("ControlOrMeta+K");
       await input.waitFor({ state: "visible" });
       expect(await images.count()).toBe(2);
-      await expect.poll(() => start.isEnabled()).toBe(true);
+      await pollEnabled(start).toBe(true);
       await input.press("ControlOrMeta+Enter");
       expect((await gateway.waitForRequest("sessions.create", { after: 1 })).params).toMatchObject({
         message: "",

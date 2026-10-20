@@ -20,21 +20,18 @@ export const isFocused = (locator: Locator) =>
   locator.evaluate((element) => document.activeElement === element);
 
 export function paletteAnchors(palette: Locator) {
-  return palette.evaluate((element) =>
-    [
-      ".cmd-palette",
-      ".cmd-palette__input",
-      ".cmd-palette__create",
-      'button[aria-label="New session settings"]',
-    ].map((selector) => {
-      const node = element.querySelector(selector);
-      if (!node) {
-        throw new Error("Missing anchor: " + selector);
-      }
+  return palette.evaluate((element) => {
+    const nodes = element.querySelectorAll(
+      '.cmd-palette, .cmd-palette__input, .cmd-palette__create, button[aria-label="New session settings"]',
+    );
+    if (nodes.length !== 4) {
+      throw new Error(`Expected four palette anchors, found ${nodes.length}`);
+    }
+    return Array.from(nodes, (node) => {
       const { x, y } = node.getBoundingClientRect();
       return { x, y };
-    }),
-  );
+    });
+  });
 }
 
 export function scenario(
@@ -129,9 +126,7 @@ export async function openFromForeground(page: Page, baseUrl: string) {
   const palette = page.locator("openclaw-command-palette");
   const input = palette.locator(".cmd-palette__input");
   await input.waitFor({ state: "visible" });
-  await expect
-    .poll(() => input.evaluate((element) => document.activeElement === element))
-    .toBe(true);
+  await expect.poll(() => isFocused(input)).toBe(true);
   return { composer, url, palette, input };
 }
 

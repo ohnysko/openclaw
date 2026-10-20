@@ -23,9 +23,9 @@ import {
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
 import { createRequireRecord } from "../../../test/helpers/record.js";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
-import { takeControlUiViewportScreenshot } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import { enterControlUiSession } from "../test-helpers/control-ui-session-entry.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
+import { pollCount, pollValue, pollAttribute } from "./new-session-page.test-support.ts";
 import { selectAllSidebarSessions } from "./sidebar-navigation.test-support.ts";
 
 const requireRecord = createRequireRecord("record", "expected-object-value");
@@ -47,7 +47,6 @@ const scope = {
   excludeSystem: true,
   excludeDock: true,
 };
-const captureEnabled = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
 let instance: OpenClawTestInstance | undefined;
 
 type RpcObservation = {
@@ -56,7 +55,6 @@ type RpcObservation = {
   startedMs: number;
   elapsedMs?: number;
   ok?: boolean;
-  responseBytes?: number;
   resultCount?: number;
   resultKeys?: unknown[];
   sessionKeys?: unknown[];
@@ -209,17 +207,7 @@ const suite = createControlUiE2eSuite({
               api: "openai-completions",
               apiKey: "synthetic-no-inference-key",
               baseUrl: "http://127.0.0.1:9/v1",
-              models: [
-                {
-                  id: "search-model",
-                  name: "Synthetic search model",
-                  reasoning: false,
-                  input: ["text"],
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                  contextWindow: 8192,
-                  maxTokens: 1024,
-                },
-              ],
+              models: [{ id: "search-model", name: "Synthetic search model" }],
             },
           },
         },
@@ -249,15 +237,6 @@ const suite = createControlUiE2eSuite({
       return await runQaGatewayFixture(
         async (): Promise<never> => {
           await writeFile(diagnostics, sanitized);
-          // Keep all safe probe receipts, not only the last near-deadline attempt.
-          await writeFile(
-            path.join(suite.artifactDir, "gateway-readiness.json"),
-            JSON.stringify(
-              owner.readiness.map(({ logs: _logs, ...receipt }) => receipt),
-              null,
-              2,
-            ),
-          );
           throw failure;
         },
         () => owner.cleanup(),
@@ -309,7 +288,6 @@ function observeSearchTraffic(page: Page, rpc: RpcObservation[]) {
       }
       metric.elapsedMs = performance.now() - metric.startedMs;
       metric.ok = frame.ok === true;
-      metric.responseBytes = Buffer.byteLength(payload);
       const body = isRecord(frame.payload) ? frame.payload : {};
       if (Array.isArray(body.results)) {
         metric.resultCount = body.results.length;
@@ -386,9 +364,6 @@ suite.define(() => {
           serviceWorkers: "block",
           locale: "en-US",
           viewport: { width: 1280, height: 900 },
-          ...(captureEnabled
-            ? { recordVideo: { dir: artifactDir, size: { width: 1280, height: 900 } } }
-            : {}),
         },
         async ({ page }) => {
           observeSearchTraffic(page, rpc);
@@ -434,14 +409,6 @@ suite.define(() => {
             const builtSha256 = createHash("sha256").update(built).digest("hex");
             expect(servedSha256).toBe(builtSha256);
           }
-          const capture = async (filename: string, surface: Locator, content: Locator[]) => {
-            if (captureEnabled) {
-              await writeFile(
-                path.join(artifactDir, filename),
-                await takeControlUiViewportScreenshot(page, surface, content),
-              );
-            }
-          };
           await page.keyboard.press("ControlOrMeta+K");
           const palette = page.locator(".cmd-palette");
           const input = palette.getByRole("textbox", {
@@ -449,13 +416,14 @@ suite.define(() => {
             exact: true,
           });
           const results = palette.locator(".cmd-palette__results");
+          const options = results.getByRole("option");
+          const targetOption = options.filter({ hasText: targetLabel });
           const emptyState = palette.locator(".cmd-palette__no-results");
           await input.waitFor();
           const metadataReceipts = new Map<string, { revision: string; keys: string[] }>();
           const search = async (
             query: string,
             expectedHits: number,
-            filename: string,
             metadataKeys: string[] = [],
           ) => {
             const noMatches = expectedHits === 0 && metadataKeys.length === 0;
@@ -469,7 +437,7 @@ suite.define(() => {
             await expect
               .poll(() => rpc.slice(start).every((entry) => entry.elapsedMs !== undefined))
               .toBe(true);
-            await expect.poll(() => results.getAttribute("aria-busy")).toBe("false");
+            await pollAttribute(results, "aria-busy").toBe("false");
             const notices = await palette
               .locator(".cmd-palette__search")
               .getByRole("status")
@@ -480,18 +448,20 @@ suite.define(() => {
             // by its metadata-search intent, not by arrival time alone.
             const listRequests = traffic.filter((entry) => entry.method === "sessions.list");
             const metadata = listRequests.filter((entry) => entry.params.search === query);
-            const visibleResults = await results.getByRole("option").count();
             queries.push(query);
-            // Capture the settled state before assertions too, retaining useful
-            // before-fix evidence when run against the original regression.
-            await capture(filename, palette, [input, visibleResults === 0 ? emptyState : results]);
+
             expect(searches).toHaveLength(1);
             const response = searches[0]!;
             expect(response.params).toEqual({ query, limit: 25, scope });
-            expect(response.ok).toBe(true);
-            expect(response.resultCount).toBe(expectedHits);
-            expect(response.indexing).toBe(false);
-            expect(response.archivedTranscriptsExcluded).toBe(0);
+            expect(response).toMatchObject({
+              ok: true,
+              resultCount: expectedHits,
+              indexing: false,
+              archivedTranscriptsExcluded: 0,
+            });
+            if (expectedHits === 1) {
+              expect(response.resultKeys).toEqual([targetKey]);
+            }
             expect(response.sessionKeys?.length).toBeLessThanOrEqual(25);
             expect(new Set(response.sessionKeys)).toEqual(new Set(response.resultKeys));
             // The query owns one bounded metadata lookup. The scoped transcript
@@ -549,30 +519,25 @@ suite.define(() => {
             return response;
           };
 
-          await search("per session communi", 0, "00-title-punctuation-prefix.png", [targetKey]);
-          await results.getByRole("option").filter({ hasText: targetLabel }).waitFor();
-          expect(await results.getByRole("option").count()).toBe(1);
+          await search("per session communi", 0, [targetKey]);
+          await targetOption.waitFor();
+          expect(await options.count()).toBe(1);
 
-          const partial = await search(
-            "cross agent message rout",
-            1,
-            "00-message-punctuation-prefix.png",
-          );
-          expect(partial.resultKeys).toEqual([targetKey]);
-          await results.getByRole("option").filter({ hasText: targetLabel }).waitFor();
+          await search("cross agent message rout", 1);
+          await targetOption.waitFor();
           expect(await results.textContent()).toContain(targetMessage);
 
-          const common = await search(commonQuery, 25, "01-common-limited-search.png");
+          const common = await search(commonQuery, 25);
           expect(common.truncated).toBe(true);
-          await expect.poll(() => results.getByRole("option").count()).toBe(10);
+          await pollCount(options).toBe(10);
           expect(
             common.resultKeys?.every(
               (key) => typeof key === "string" && key.includes(":search-roster-"),
             ),
           ).toBe(true);
 
-          await search(targetLabel, 0, "02-grouped-metadata-match.png", [targetKey]);
-          await results.getByRole("option").filter({ hasText: targetLabel }).click();
+          await search(targetLabel, 0, [targetKey]);
+          await targetOption.click();
           await input.waitFor({ state: "hidden" });
           const activePane = () =>
             page.locator("openclaw-chat-pane.chat-pane-cache__pane--active:not([inert])");
@@ -586,38 +551,30 @@ suite.define(() => {
           await page.keyboard.press("ControlOrMeta+K");
           await input.waitFor();
 
-          const unique = await search(uniqueQuery, 1, "02-older-fifth-agent-match.png");
-          expect(unique.resultKeys).toEqual([targetKey]);
+          const unique = await search(uniqueQuery, 1);
           expect(unique.truncated).toBe(false);
-          await results.getByRole("option").filter({ hasText: targetLabel }).waitFor();
-          expect(await results.getByRole("option").count()).toBe(1);
+          await targetOption.waitFor();
+          expect(await options.count()).toBe(1);
           expect(await results.textContent()).toContain("Synthetic fifth assistant");
           expect(await results.textContent()).toContain(targetMessage);
 
-          const upper = await search(uniqueQuery.toUpperCase(), 1, "03-case-insensitive-match.png");
-          expect(upper.resultKeys).toEqual([targetKey]);
-          // The public FTS contract ANDs whitespace-separated words; this proves
-          // multiword narrowing without inventing quoted exact-phrase semantics.
-          const phrase = await search("copperfinch violet lantern", 1, "04-multiword-match.png");
-          expect(phrase.resultKeys).toEqual([targetKey]);
-          const absent = await search("copperfinch absentconstellation", 0, "05-no-match.png");
+          // Case folding and ANDed words both retain the same unique transcript hit.
+          for (const query of [uniqueQuery.toUpperCase(), "copperfinch violet lantern"]) {
+            await search(query, 1);
+          }
+          const absent = await search("copperfinch absentconstellation", 0);
           expect(absent.truncated).toBe(false);
-          expect(await results.getByRole("option").count()).toBe(0);
+          expect(await options.count()).toBe(0);
           await emptyState
             .getByRole("heading", { name: "No results found", exact: true })
             .waitFor();
 
-          await search("copperfinch observatory", 1, "06-selected-search-result.png");
-          await results.getByRole("option").filter({ hasText: targetLabel }).click();
+          await search("copperfinch observatory", 1);
+          await targetOption.click();
           await input.waitFor({ state: "hidden" });
-          const pane = page.locator(
-            "openclaw-chat-pane.chat-pane-cache__pane--active:not([inert])",
-          );
+          const pane = activePane();
           await expectSessionKey(pane, targetKey);
           await pane.locator(".chat-thread").getByText(targetMessage, { exact: true }).waitFor();
-          await capture("07-opened-fifth-agent-transcript.png", pane, [
-            pane.locator(".chat-thread"),
-          ]);
 
           // Category membership spans accessible owners, beyond the default Mine scope.
           await selectAllSidebarSessions(page);
@@ -645,7 +602,7 @@ suite.define(() => {
             const groupRows = page.locator(
               `[data-session-section^="category:"] [data-session-key="${targetKey}"]`,
             );
-            await expect.poll(() => groupRows.count()).toBe(category ? 1 : 0);
+            await pollCount(groupRows).toBe(category ? 1 : 0);
             if (category) {
               await page
                 .locator(
@@ -665,14 +622,8 @@ suite.define(() => {
             expect(inventory.owners).toHaveLength(category ? 1 : 0);
             await page.keyboard.press("ControlOrMeta+K");
             await input.waitFor();
-            const stage = category?.replaceAll(" ", "-") ?? "ungrouped";
-            await search(
-              targetLabel,
-              0,
-              `category-${stage}-metadata.png`,
-              category ? [targetKey] : [],
-            );
-            await search(uniqueQuery, category ? 1 : 0, `category-${stage}-transcript.png`);
+            await search(targetLabel, 0, category ? [targetKey] : []);
+            await search(uniqueQuery, category ? 1 : 0);
             await page.keyboard.press("Escape");
             await input.waitFor({ state: "hidden" });
           }
@@ -683,9 +634,8 @@ suite.define(() => {
             rpc.filter((metric) => metric.method === "chat.send" || metric.method === "agent"),
           ).toEqual([]);
           // Cover the agreed direct shortcuts against the same isolated real Gateway.
-          // The existing capture gate exports these sanitized views on manual proof runs.
           const currentPane = activePane();
-          await capture("direct-01-before.png", currentPane, [currentPane.locator(".chat-thread")]);
+
           await page.keyboard.press("ControlOrMeta+/");
           const helper = page.locator("openclaw-keyboard-shortcuts-dialog");
           const newHint = helper.locator(".shortcut-row").filter({ hasText: "Open New Session" });
@@ -696,11 +646,6 @@ suite.define(() => {
           await archiveHint.waitFor({ state: "visible" });
           expect((await newHint.locator("kbd").allTextContents()).at(-1)).toBe("O");
           expect((await archiveHint.locator("kbd").allTextContents()).at(-1)).toBe("A");
-          // The host is display: contents; the native dialog owns the opening animation.
-          await capture("direct-02-keyboard-helper.png", helper.locator("dialog"), [
-            newHint,
-            archiveHint,
-          ]);
           await page.keyboard.press("Escape");
           await newHint.waitFor({ state: "hidden" });
           await page.keyboard.press("ControlOrMeta+Shift+O");
@@ -710,14 +655,12 @@ suite.define(() => {
             .poll(() => draft.evaluate((element) => element === document.activeElement))
             .toBe(true);
           expect(await draft.inputValue()).toBe("");
-          await capture("direct-03-new-session.png", page.locator("openclaw-new-session-page"), [
-            draft,
-          ]);
+
           await page.goBack();
           await expectSessionKey(currentPane, otherKey);
           const composer = currentPane.locator(".agent-chat__composer-combobox > textarea");
           await composer.fill("Keep this unsent shortcut draft");
-          await capture("direct-04-archive-before.png", currentPane, [composer]);
+
           await page.keyboard.press("ControlOrMeta+Shift+A");
           const archiveRequests = (archived: boolean) =>
             rpc.filter(
@@ -731,14 +674,12 @@ suite.define(() => {
             .toBe(1);
           const undo = page.getByRole("button", { name: "Undo", exact: true });
           await undo.waitFor({ state: "visible" });
-          await capture("direct-05-archive-after.png", currentPane, [
-            currentPane.locator(".chat-thread"),
-          ]);
+
           await undo.click();
           await expect
             .poll(() => archiveRequests(false).filter((metric) => metric.ok === true).length)
             .toBe(1);
-          await expect.poll(() => composer.inputValue()).toBe("Keep this unsent shortcut draft");
+          await pollValue(composer).toBe("Keep this unsent shortcut draft");
           expect(
             rpc.filter((metric) =>
               ["sessions.create", "chat.send", "agent"].includes(metric.method),

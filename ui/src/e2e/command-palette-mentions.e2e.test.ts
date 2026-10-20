@@ -15,20 +15,9 @@ import {
 import { installMockGateway } from "./new-session-page.test-support.ts";
 
 const suite = createControlUiE2eSuite({ name: "command palette people mentions" });
-const people = [
-  "Alex Chen",
-  "Jordan Rivera",
-  "Sam Taylor",
-  "Morgan Lee",
-  "Casey Williams",
-  "Riley Patel",
-  "Avery Thompson",
-  "Quinn Davis",
-  "Jamie Wilson",
-  "Charlie Garcia",
-].map((displayName, index) => ({
+const people = Array.from({ length: 10 }, (_, index) => ({
   profileId: "person-" + index,
-  displayName,
+  displayName: index === 0 ? "Alex Chen" : `Fixture person ${index}`,
   online: index % 2 === 0,
 }));
 function mentionScenario() {
