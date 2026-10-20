@@ -54,6 +54,12 @@ vi.mock("./route-reply.js", () => ({
   routeReply: (...args: unknown[]) => deliveryState.routeReply(...args),
 }));
 
+const missingReply = {
+  text: "No answer was returned. Ask again if you still need one.",
+  isError: true,
+  isStatusNotice: true,
+};
+
 describe("resolveFollowupDeliveryDecision", () => {
   const sourceReplyTarget = {
     tool: "message",
@@ -235,16 +241,7 @@ describe("resolveFollowupDeliveryDecision", () => {
       });
       expect(decision).toMatchObject(
         expectation === "required"
-          ? {
-              kind: "deliver",
-              payloads: [
-                {
-                  text: "No answer was returned. Ask again if you still need one.",
-                  isError: true,
-                  isStatusNotice: true,
-                },
-              ],
-            }
+          ? { kind: "deliver", payloads: [missingReply] }
           : { kind: "suppress", reason: "silent" },
       );
       expect(failMock).toHaveBeenCalledTimes(expectation === "required" ? 1 : 0);
@@ -521,16 +518,7 @@ describe("resolveFollowupDeliveryDecision", () => {
         execution: createSettledExecution(),
         accounting: createAccounting(),
       }),
-    ).toMatchObject({
-      kind: "deliver",
-      payloads: [
-        {
-          text: "No answer was returned. Ask again if you still need one.",
-          isError: true,
-          isStatusNotice: true,
-        },
-      ],
-    });
+    ).toMatchObject({ kind: "deliver", payloads: [missingReply] });
   });
 
   it.each([
@@ -665,16 +653,7 @@ describe("resolveFollowupDeliveryDecision", () => {
 
       expect(decision).toMatchObject(
         expectFallback
-          ? {
-              kind: "deliver",
-              payloads: [
-                {
-                  text: "No answer was returned. Ask again if you still need one.",
-                  isError: true,
-                  isStatusNotice: true,
-                },
-              ],
-            }
+          ? { kind: "deliver", payloads: [missingReply] }
           : { kind: "suppress", reason: "silent" },
       );
     },
@@ -782,10 +761,7 @@ describe("deliverFollowupDecision", () => {
       });
       expect(payloads).toEqual({ kind: "completed", payloads: [{ text: "one" }, { text: "two" }] });
       expect(sourceDispatcher).not.toHaveBeenCalled();
-      turn.queued.queuedFollowupReplyDisposition = {
-        kind: "drop",
-        reason: "source-unavailable",
-      };
+      turn.queued.queuedFollowupReplyDisposition = { kind: "drop", reason: "source-unavailable" };
       await deliverFollowupDecision({
         decision: { kind: "deliver", payloads: [{ text: "must stay dropped" }] },
         turn,

@@ -1,7 +1,6 @@
 // Proves follow-up batch ownership through the real channel route and durable-send boundary.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
-import type { OpenClawConfig } from "../../config/config.js";
 import { OutboundDeliveryError } from "../../infra/outbound/deliver-types.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import { loadBundledPluginFacade } from "../../test-utils/bundled-plugin-public-surface.js";
@@ -14,6 +13,7 @@ import type { ReplyPayload } from "../types.js";
 import { setBlockReplyDelivery } from "./block-reply-delivery.js";
 import { resolveFollowupDeliveryPayloads } from "./followup-delivery-payloads.js";
 import { deliverFollowupDecision, resolveFollowupDeliveryDecision } from "./followup-delivery.js";
+import { createDefaults, createTurn as createBaseTurn } from "./followup-delivery.test-helpers.js";
 import type { AdmittedFollowupTurn } from "./reply-agent-turn-preparation.js";
 
 const { a2aChannelPlugin } = await loadBundledPluginFacade<{ a2aChannelPlugin: ChannelPlugin }>({
@@ -28,9 +28,7 @@ const channelState = vi.hoisted(() => ({
 
 // mock-isolation: channel custody tests provide the follow-up route without loading model or auth plans.
 vi.mock("../../agents/runtime-plan/build.js", () => ({
-  buildAgentRuntimeDeliveryPlan: () => ({
-    resolveFollowupRoute: () => undefined,
-  }),
+  buildAgentRuntimeDeliveryPlan: () => ({ resolveFollowupRoute: () => undefined }),
 }));
 
 vi.mock("../../infra/outbound/deliver.js", () => ({
@@ -66,57 +64,10 @@ function createTurn(params: {
   messageProvider: string;
   originatingChannel: string;
 }): AdmittedFollowupTurn {
-  return {
-    runId: "run-1",
-    queued: {
-      prompt: "queued",
-      enqueuedAt: 1,
-      originatingChannel: params.originatingChannel,
-      originatingTo: "channel:C1",
-      run: {
-        agentId: "agent",
-        agentDir: "/tmp/agent",
-        sessionId: "session",
-        sessionKey: "main",
-        sessionFile: "/tmp/session.jsonl",
-        workspaceDir: "/tmp",
-        config: {},
-        provider: "anthropic",
-        model: "claude",
-        messageProvider: params.messageProvider,
-        timeoutMs: 1_000,
-        blockReplyBreak: "message_end",
-      },
-    },
-    operation: {} as AdmittedFollowupTurn["operation"],
-    config: {} as OpenClawConfig,
-    session: {
-      kind: "session",
-      key: "main",
-      current: () => undefined,
-      publish: () => undefined,
-    },
-    sendPolicy: "allow",
-    preflightCompactionApplied: false,
-  };
-}
-
-function createDefaults(onBlockReply: (payload: ReplyPayload) => Promise<void>) {
-  return {
-    defaultModel: "claude",
-    typingMode: "never" as const,
-    typing: {
-      onReplyStart: vi.fn(async () => {}),
-      startTypingLoop: vi.fn(async () => {}),
-      startTypingOnText: vi.fn(async () => {}),
-      refreshTypingTtl: vi.fn(),
-      isActive: vi.fn(() => false),
-      markRunComplete: vi.fn(),
-      markDispatchIdle: vi.fn(),
-      cleanup: vi.fn(),
-    },
-    opts: { onBlockReply },
-  };
+  const turn = createBaseTurn({ operation: {} as AdmittedFollowupTurn["operation"] });
+  turn.queued.originatingChannel = params.originatingChannel;
+  turn.queued.run.messageProvider = params.messageProvider;
+  return turn;
 }
 
 async function deliverBatch(params: {
