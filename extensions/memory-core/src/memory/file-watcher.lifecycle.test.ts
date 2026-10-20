@@ -16,6 +16,10 @@ vi.mock("openclaw/plugin-sdk/file-access-runtime", async (original) => ({
   watch: observer.watch,
 }));
 const warnings = vi.hoisted(() => vi.fn());
+type Observation = (typeof observer.observations)[number];
+function unavailable(entry: Observation, operation: "scan" | "watch", error: Error, code?: string) {
+  entry.health({ state: "unavailable", failure: { operation, error, code } });
+}
 vi.mock("openclaw/plugin-sdk/memory-core-host-engine-foundation", async (original) => {
   const actual =
     await original<typeof import("openclaw/plugin-sdk/memory-core-host-engine-foundation")>();
@@ -87,6 +91,25 @@ describe("Memory observation lifecycle", () => {
     });
     owners.push(watcher);
     return { watcher, onChange, onDirty, onUnavailable };
+  }
+  function pauseDiscovery(once = false) {
+    const entered = createDeferred<void>();
+    const resume = createDeferred<void>();
+    // oxlint-disable-next-line typescript/unbound-method -- Called with the intercepted policy receiver.
+    const original = MemoryWatchPolicy.prototype.observations;
+    const implementation: typeof original = async function (this: MemoryWatchPolicy, signal) {
+      const groups = await original.call(this, signal);
+      entered.resolve();
+      await resume.promise;
+      return groups;
+    };
+    const spy = vi.spyOn(MemoryWatchPolicy.prototype, "observations");
+    if (once) {
+      spy.mockImplementationOnce(implementation);
+    } else {
+      spy.mockImplementation(implementation);
+    }
+    return { entered, resume };
   }
 
   it.each([
@@ -391,10 +414,7 @@ describe("Memory observation lifecycle", () => {
       const failure = new Error("new scope cannot be observed");
       vi.spyOn(shared.subscription, "setScopes").mockImplementationOnce(async () => {
         if (failureKind === "watch-limit") {
-          shared.health({
-            state: "unavailable",
-            failure: { operation: "watch", code: "watch-limit", error: failure },
-          });
+          unavailable(shared, "watch", failure, "watch-limit");
         }
         throw failure;
       });
@@ -422,10 +442,7 @@ describe("Memory observation lifecycle", () => {
       const failingEntry = independent.find(
         (entry) => entry.options.scopes[0]?.path === "unreadable",
       )!;
-      failingEntry.health({
-        state: "unavailable",
-        failure: { operation: "watch", code: "watch-limit", error: failure },
-      });
+      unavailable(failingEntry, "watch", failure, "watch-limit");
       expect(failing.watcher.capacityDegraded).toBe(true);
       const before = healthy.onDirty.mock.calls.length;
       healthyEntry.dirty([{ path: "healthy/note.md", type: "content" }]);
@@ -539,19 +556,7 @@ describe("Memory observation lifecycle", () => {
   });
 
   it("does not admit a late observer when close races initial Root discovery", async () => {
-    const entered = createDeferred<void>();
-    const resume = createDeferred<void>();
-    // oxlint-disable-next-line typescript/unbound-method -- Invoked below with the intercepted policy receiver via .call.
-    const original = MemoryWatchPolicy.prototype.observations;
-    vi.spyOn(MemoryWatchPolicy.prototype, "observations").mockImplementation(async function (
-      this: MemoryWatchPolicy,
-      signal,
-    ) {
-      const groups = await original.call(this, signal);
-      entered.resolve();
-      await resume.promise;
-      return groups;
-    });
+    const { entered, resume } = pauseDiscovery();
     const { watcher } = owner();
     const starting = watcher.start();
     await entered.promise;
@@ -608,27 +613,12 @@ describe("Memory observation lifecycle", () => {
   it("does not rearm when watch-limit retires observation during source discovery", async () => {
     const { watcher } = owner();
     await watcher.start();
-    const entered = createDeferred<void>();
-    const resume = createDeferred<void>();
-    // oxlint-disable-next-line typescript/unbound-method -- Invoked with the intercepted policy receiver.
-    const original = MemoryWatchPolicy.prototype.observations;
-    vi.spyOn(MemoryWatchPolicy.prototype, "observations").mockImplementationOnce(async function (
-      this: MemoryWatchPolicy,
-      signal,
-    ) {
-      const groups = await original.call(this, signal);
-      entered.resolve();
-      await resume.promise;
-      return groups;
-    });
+    const { entered, resume } = pauseDiscovery(true);
     const entry = observer.observations[0]!;
     entry.dirty();
     await entered.promise;
     try {
-      entry.health({
-        state: "unavailable",
-        failure: { operation: "watch", code: "watch-limit", error: new Error("watch limit") },
-      });
+      unavailable(entry, "watch", new Error("watch limit"), "watch-limit");
       await vi.advanceTimersByTimeAsync(0);
       expect(entry.close).toHaveBeenCalledOnce();
       expect(watcher.capacityDegraded).toBe(true);
@@ -696,10 +686,7 @@ describe("Memory observation lifecycle", () => {
     const { watcher, onChange, onUnavailable } = owner();
     await watcher.start();
     const old = observer.observations[0]!;
-    old.health({
-      state: "unavailable",
-      failure: { operation: "scan", code: "ENOSPC", error: new Error("full disk") },
-    });
+    unavailable(old, "scan", new Error("full disk"), "ENOSPC");
     expect(watcher.capacityDegraded).toBe(false);
     expect(onUnavailable).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(500);
@@ -727,14 +714,12 @@ describe("Memory observation lifecycle", () => {
     const groups = await planning.mock.results[0]!.value;
     planning.mockResolvedValue(groups);
     const fail = () =>
-      observer.observations.at(-1)!.health({
-        state: "unavailable",
-        failure: {
-          operation: "scan",
-          code: "EACCES",
-          error: new Error("temporary metadata failure"),
-        },
-      });
+      unavailable(
+        observer.observations.at(-1)!,
+        "scan",
+        new Error("temporary metadata failure"),
+        "EACCES",
+      );
     for (let round = 0; round < 4; round++) {
       fail();
       await vi.advanceTimersByTimeAsync(500);
@@ -812,10 +797,7 @@ describe("Memory observation lifecycle", () => {
     observer.closeBarrier = physical.promise;
     const { watcher } = owner();
     await watcher.start();
-    observer.observations[0]!.health({
-      state: "unavailable",
-      failure: { operation: "scan", error: new Error("scan") },
-    });
+    unavailable(observer.observations[0]!, "scan", new Error("scan"));
     physical.reject(failure);
     await vi.advanceTimersByTimeAsync(20_000);
     expect(observer.watch).toHaveBeenCalledOnce();

@@ -34,6 +34,22 @@ const memoryFilePath = `memory/${originalHelperId}.md`;
 const helperPath = `sessions/main/${originalHelperId}.jsonl`;
 const expectedPaths = [memoryFilePath, ordinaryPath, unknownArchivePath].toSorted();
 type RetrievalMode = "keyword-only" | "hybrid KNN" | "hybrid embedding scan";
+type Writer = ReturnType<typeof memoryIndexFixtureWriter>;
+
+function helperRows(writer: Writer, table: string, columns: string) {
+  return writer
+    .prepare(`SELECT ${columns} FROM ${table} WHERE path = ? AND source = 'sessions'`)
+    .all(helperPath);
+}
+function validRows(writer: Writer, table: string, columns: string, order: string) {
+  return writer
+    .prepare(`SELECT ${columns} FROM ${table} WHERE path IN (?, ?, ?) ORDER BY ${order}`)
+    .all(...expectedPaths);
+}
+function expectHelperPruned(writer: Writer) {
+  expect(helperRows(writer, "memory_index_sources", "path")).toEqual([]);
+  expect(helperRows(writer, "memory_index_chunks", "id")).toEqual([]);
+}
 
 describe("Active Memory historical search eligibility", () => {
   const fixture = createManagerIndexFixture({
@@ -41,6 +57,23 @@ describe("Active Memory historical search eligibility", () => {
     closeAllMemorySearchManagers,
   });
   afterEach(() => vi.restoreAllMocks());
+  const seedTranscript = (sessionId: string, sessionKey: string, content: string) =>
+    fixture.seedSessionTranscript({
+      sessionId,
+      sessionKey,
+      messages: [{ role: "user", timestamp: Date.now(), content }],
+    });
+  const sessionsManager = (minScore?: number) =>
+    fixture.getFreshManager(
+      fixture.createConfig({
+        provider: "none",
+        sources: ["sessions"],
+        rememberAcrossConversations: true,
+        vectorEnabled: false,
+        minScore,
+      }),
+      "cli",
+    );
 
   async function pollutedIndex(mode: RetrievalMode) {
     const sessionsDir = resolveSessionTranscriptsDirForAgent("main");
@@ -54,10 +87,7 @@ describe("Active Memory historical search eligibility", () => {
       },
       { sessionId: archivedHelperId, sessionKey: archivedHelperKey },
     ]) {
-      await fixture.seedSessionTranscript({
-        ...session,
-        messages: [{ role: "user", timestamp: Date.now(), content: "Alpha beta ordinary fact." }],
-      });
+      await seedTranscript(session.sessionId, session.sessionKey, "Alpha beta ordinary fact.");
     }
     await expect(
       deleteSessionEntry({
@@ -160,17 +190,9 @@ describe("Active Memory historical search eligibility", () => {
       const { manager, writer } = await pollutedIndex(mode);
       const nativeKnn = vi.spyOn(knn, "searchMemoryVectorIndex");
       const validChunks = () =>
-        writer
-          .prepare(
-            "SELECT id, path, hash, embedding, updated_at FROM memory_index_chunks WHERE path IN (?, ?, ?) ORDER BY id",
-          )
-          .all(...expectedPaths);
+        validRows(writer, "memory_index_chunks", "id, path, hash, embedding, updated_at", "id");
       const validSources = () =>
-        writer
-          .prepare(
-            "SELECT path, source, hash, mtime, size FROM memory_index_sources WHERE path IN (?, ?, ?) ORDER BY path",
-          )
-          .all(...expectedPaths);
+        validRows(writer, "memory_index_sources", "path, source, hash, mtime, size", "path");
       const beforeChunks = validChunks();
       const beforeSources = validSources();
       const embeddingBatches = fixture.provider.embedBatchCalls;
@@ -221,16 +243,7 @@ describe("Active Memory historical search eligibility", () => {
         cleanup.mockRestore();
       }
       await manager.close();
-      expect(
-        writer
-          .prepare("SELECT path FROM memory_index_sources WHERE path = ? AND source = 'sessions'")
-          .all(helperPath),
-      ).toEqual([]);
-      expect(
-        writer
-          .prepare("SELECT id FROM memory_index_chunks WHERE path = ? AND source = 'sessions'")
-          .all(helperPath),
-      ).toEqual([]);
+      expectHelperPruned(writer);
       expect(validChunks()).toEqual(beforeChunks);
       expect(validSources()).toEqual(beforeSources);
       expect(fixture.provider.embedBatchCalls).toBe(embeddingBatches);
@@ -256,11 +269,7 @@ describe("Active Memory historical search eligibility", () => {
   }) => {
     const { manager, writer } = await pollutedIndex("hybrid embedding scan");
     const validChunks = () =>
-      writer
-        .prepare(
-          "SELECT id, path, hash, text, embedding FROM memory_index_chunks WHERE path IN (?, ?, ?) ORDER BY id",
-        )
-        .all(...expectedPaths);
+      validRows(writer, "memory_index_chunks", "id, path, hash, text, embedding", "id");
     const beforeChunks = validChunks();
     await fs.writeFile(
       path.join(fixture.paths.workspace, memoryFilePath),
@@ -287,16 +296,7 @@ describe("Active Memory historical search eligibility", () => {
         }),
       ]);
       expect(embedding).toHaveBeenCalled();
-      expect(
-        writer
-          .prepare("SELECT path FROM memory_index_sources WHERE path = ? AND source = 'sessions'")
-          .all(helperPath),
-      ).toEqual([]);
-      expect(
-        writer
-          .prepare("SELECT id FROM memory_index_chunks WHERE path = ? AND source = 'sessions'")
-          .all(helperPath),
-      ).toEqual([]);
+      expectHelperPruned(writer);
       expect(validChunks()).toEqual(beforeChunks);
       release();
       await expect(sync).rejects.toThrow(failure.message);
@@ -320,11 +320,7 @@ describe("Active Memory historical search eligibility", () => {
       sessionKey: `agent:main:explicit:${ownerId}`,
       storePath,
     };
-    await fixture.seedSessionTranscript({
-      sessionId: ownerId,
-      sessionKey: ownerScope.sessionKey,
-      messages: [{ role: "user", timestamp: Date.now(), content: "Alpha ordinary older archive." }],
-    });
+    await seedTranscript(ownerId, ownerScope.sessionKey, "Alpha ordinary older archive.");
     await expect(
       deleteSessionEntry({
         ...ownerScope,
@@ -348,11 +344,7 @@ describe("Active Memory historical search eligibility", () => {
       { sessionId: migratedId, pluginOwnerId: "active-memory" },
     ]) {
       const sessionKey = `agent:main:explicit:${sessionId}`;
-      await fixture.seedSessionTranscript({
-        sessionId,
-        sessionKey,
-        messages: [{ role: "user", timestamp: Date.now(), content: "Alpha ownership canary." }],
-      });
+      await seedTranscript(sessionId, sessionKey, "Alpha ownership canary.");
       await upsertSessionEntry({
         agentId: "main",
         sessionKey,
@@ -369,15 +361,7 @@ describe("Active Memory historical search eligibility", () => {
     const currentEntry = await getSessionEntryAsync(ownerScope);
     expect(currentEntry?.sessionId).toBe(ownerId);
     expect(currentEntry?.pluginOwnerId).toBeUndefined();
-    const manager = await fixture.getFreshManager(
-      fixture.createConfig({
-        provider: "none",
-        sources: ["sessions"],
-        rememberAcrossConversations: true,
-        vectorEnabled: false,
-      }),
-      "cli",
-    );
+    const manager = await sessionsManager();
     const writer = memoryIndexFixtureWriter(manager);
     expect(
       writer
@@ -416,11 +400,7 @@ describe("Active Memory historical search eligibility", () => {
     const sessionId = "9cb304af-7567-4c98-8c93-a1b373f39348";
     const helperKey = "agent:main:explicit:retired:active-memory:0123456789ab";
     const storePath = path.join(resolveSessionTranscriptsDirForAgent("main"), "sessions.json");
-    await fixture.seedSessionTranscript({
-      sessionId,
-      sessionKey: helperKey,
-      messages: [{ role: "user", timestamp: Date.now(), content: "Alpha internal recall prompt." }],
-    });
+    await seedTranscript(sessionId, helperKey, "Alpha internal recall prompt.");
     await expect(
       deleteSessionEntry({
         agentId: "main",
@@ -442,24 +422,13 @@ describe("Active Memory historical search eligibility", () => {
       sessionKey: "agent:main:explicit:ordinary-reuse",
       storePath,
     };
-    await fixture.seedSessionTranscript({
+    await seedTranscript(
       sessionId,
-      sessionKey: ordinaryScope.sessionKey,
-      messages: [
-        { role: "user", timestamp: Date.now(), content: "Alpha ordinary current conversation." },
-      ],
-    });
-    // CLI managers leave transcript notifications to the next explicit sync.
-    const manager = await fixture.getFreshManager(
-      fixture.createConfig({
-        provider: "none",
-        sources: ["sessions"],
-        rememberAcrossConversations: true,
-        vectorEnabled: false,
-        minScore: 0,
-      }),
-      "cli",
+      ordinaryScope.sessionKey,
+      "Alpha ordinary current conversation.",
     );
+    // CLI managers leave transcript notifications to the next explicit sync.
+    const manager = await sessionsManager(0);
     await manager.sync({ reason: "index-reused-identity", force: true });
     const writer = memoryIndexFixtureWriter(manager);
     const pathname = `sessions/main/${sessionId}.jsonl`;

@@ -33,7 +33,7 @@ let providerEmbeddingError: Error | null = null;
 let providerQueryError: Error | null = null;
 let providerQueryCalls = 0;
 let providerBatchCalls = 0;
-const createEmbeddingProviderMock = vi.hoisted(() =>
+const createProvider = vi.hoisted(() =>
   vi.fn(async () => {
     await providerConstructionGate;
     if (providerConstructionError) {
@@ -93,7 +93,7 @@ function restoreFtsOnlyStateDir(): void {
 }
 
 vi.mock("./embeddings.js", () => ({
-  createEmbeddingProvider: createEmbeddingProviderMock,
+  createEmbeddingProvider: createProvider,
   resolveEmbeddingProviderAdapterTransport: (providerId: string) =>
     providerId === "local" ? "local" : "remote",
   resolveEmbeddingProviderIndexIdentity: () => undefined,
@@ -106,13 +106,28 @@ describe("memory manager FTS-only reindex", () => {
   let workspaceDir = "";
   let indexPath = "";
   let managers: MemoryIndexManager[] = [];
+  const restoreClocks: Array<() => void> = [];
+  function mockClock() {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    restoreClocks.push(() => clock.mockRestore());
+    return { now, clock };
+  }
+  const keywordResult = [expect.objectContaining({ path: "MEMORY.md", source: "memory" })];
+  function expectBootstrap(debug: unknown[], details: Record<string, unknown>) {
+    expect(debug).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ embeddingBootstrap: expect.objectContaining(details) }),
+      ]),
+    );
+  }
 
   beforeAll(async () => {
     fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-mem-fts-only-"));
   });
 
   beforeEach(async () => {
-    createEmbeddingProviderMock.mockClear();
+    createProvider.mockClear();
     providerConstructionError = null;
     providerConstructionGate = null;
     providerAvailable = false;
@@ -128,6 +143,9 @@ describe("memory manager FTS-only reindex", () => {
   });
 
   afterEach(async () => {
+    for (const restore of restoreClocks.splice(0)) {
+      restore();
+    }
     for (const manager of managers.toReversed()) {
       await manager.close();
     }
@@ -209,11 +227,8 @@ describe("memory manager FTS-only reindex", () => {
     }
   }
 
-  async function writeExistingMeta(
-    memoryManager: MemoryIndexManager,
-    model: string,
-  ): Promise<void> {
-    const metaWriter = memoryManager as unknown as {
+  async function writeExistingMeta(manager: MemoryIndexManager, model: string): Promise<void> {
+    const metaWriter = manager as unknown as {
       writeMeta(meta: MemoryIndexMeta): Promise<void>;
     };
     await metaWriter.writeMeta({
@@ -232,7 +247,7 @@ describe("memory manager FTS-only reindex", () => {
     expect(indexed.status().chunks).toBeGreaterThan(0);
     await indexed.close();
     await closeAllMemorySearchManagers();
-    createEmbeddingProviderMock.mockClear();
+    createProvider.mockClear();
 
     const reopened = await createManager({ provider: "openai", purpose: "status" });
     expect(reopened.status().custom?.indexIdentity).toEqual({ status: "valid" });
@@ -240,7 +255,7 @@ describe("memory manager FTS-only reindex", () => {
       mode: "pending",
       requestedProvider: "openai",
     });
-    expect(createEmbeddingProviderMock).not.toHaveBeenCalled();
+    expect(createProvider).not.toHaveBeenCalled();
   });
 
   it.each(["first search", "failed background sync"])(
@@ -248,195 +263,163 @@ describe("memory manager FTS-only reindex", () => {
     async (phase) => {
       providerAvailable = true;
       providerEmbeddingError = new Error("embedding request failed during bootstrap");
-      const memoryManager = await createManager();
+      const manager = await createManager();
       const debug: unknown[] = [];
       if (phase === "failed background sync") {
-        await expect(memoryManager.sync({ reason: "watch" })).rejects.toThrow(
+        await expect(manager.sync({ reason: "watch" })).rejects.toThrow(
           "embedding request failed during bootstrap",
         );
       }
 
-      const results = await memoryManager.search("Alpha topic", {
+      const results = await manager.search("Alpha topic", {
         onDebug: (entry) => debug.push(entry),
       });
 
-      expect(results).toEqual([expect.objectContaining({ path: "MEMORY.md", source: "memory" })]);
+      expect(results).toEqual(keywordResult);
       expect(providerQueryCalls).toBe(0);
-      expect(debug).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            embeddingBootstrap: expect.objectContaining({
-              degradedTo: "keyword-only",
-              provider: "openai",
-              reason: expect.stringContaining("embedding request failed during bootstrap"),
-            }),
-          }),
-        ]),
-      );
+      expectBootstrap(debug, {
+        degradedTo: "keyword-only",
+        provider: "openai",
+        reason: expect.stringContaining("embedding request failed during bootstrap"),
+      });
     },
   );
 
   it("backs off when the first keyword-only publication also fails", async () => {
-    const now = Date.now();
-    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
-    try {
-      providerAvailable = true;
-      providerEmbeddingError = new Error("embedding request failed during bootstrap");
-      const memoryManager = await createManager();
-      const metadata = vi
-        .spyOn(
-          memoryManager as unknown as { writeMeta(meta: MemoryIndexMeta): Promise<void> },
-          "writeMeta",
-        )
-        .mockImplementationOnce(() => {
-          throw new Error("keyword publication failed");
-        });
+    const { now, clock } = mockClock();
+    providerAvailable = true;
+    providerEmbeddingError = new Error("embedding request failed during bootstrap");
+    const manager = await createManager();
+    const metadata = vi
+      .spyOn(manager as unknown as { writeMeta(meta: MemoryIndexMeta): Promise<void> }, "writeMeta")
+      .mockImplementationOnce(() => {
+        throw new Error("keyword publication failed");
+      });
 
-      await expect(memoryManager.search("Alpha topic")).resolves.toEqual([]);
-      await expect(memoryManager.search("Alpha topic")).resolves.toEqual([]);
-      expect(metadata).toHaveBeenCalledOnce();
+    await expect(manager.search("Alpha topic")).resolves.toEqual([]);
+    await expect(manager.search("Alpha topic")).resolves.toEqual([]);
+    expect(metadata).toHaveBeenCalledOnce();
 
-      providerAvailable = false;
-      nowSpy.mockReturnValue(now + 60_000);
-      await expect(memoryManager.search("Alpha topic")).resolves.toEqual([
-        expect.objectContaining({ path: "MEMORY.md", source: "memory" }),
-      ]);
-    } finally {
-      nowSpy.mockRestore();
-    }
+    providerAvailable = false;
+    clock.mockReturnValue(now + 60_000);
+    await expect(manager.search("Alpha topic")).resolves.toEqual([
+      expect.objectContaining({ path: "MEMORY.md", source: "memory" }),
+    ]);
   });
 
   it.each(["watch", "search maintenance"])(
     "retains the original embedding cooldown after a quota failure in %s",
     async (origin) => {
       providerAvailable = true;
-      const memoryManager = await createManager();
-      await memoryManager.sync({ force: true });
-      const idle = memoryManager as unknown as { awaitManagerIdle(): Promise<void> };
-      const now = Date.now();
-      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-      try {
-        const quotaError = Object.assign(new Error("embedding quota exhausted"), {
-          status: 429,
-          errorCode: "insufficient_quota",
-        });
-        providerEmbeddingError = quotaError;
-        providerQueryError = quotaError;
-        await fs.writeFile(
-          path.join(workspaceDir, "MEMORY.md"),
-          "Alpha topic\n\nPending quota update.",
-        );
-        // The observation fixture leaves dirty notification to the test.
-        Reflect.set(memoryManager, "dirty", true);
-        if (origin === "watch") {
-          await expect(memoryManager.sync({ reason: "watch" })).rejects.toThrow(
-            "embedding quota exhausted",
-          );
-        } else {
-          await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
-          await idle.awaitManagerIdle();
-        }
-        const requestsAfterFailure = providerBatchCalls + providerQueryCalls;
-
-        for (const elapsed of [10_000, 29_999]) {
-          clock.mockReturnValue(now + elapsed);
-          await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
-          await idle.awaitManagerIdle();
-          expect(providerBatchCalls + providerQueryCalls).toBe(requestsAfterFailure);
-          expect(memoryManager.getCachedEmbeddingAvailability()?.cacheExpiresAtMs).toBe(
-            now + 30_000,
-          );
-          expect(countChunksContaining("Pending quota update")).toBe(0);
-        }
-
-        providerEmbeddingError = null;
-        providerQueryError = null;
-        clock.mockReturnValue(now + 30_000);
-        await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
-        await idle.awaitManagerIdle();
-        expect(providerBatchCalls + providerQueryCalls).toBeGreaterThan(requestsAfterFailure);
-        expect(countChunksContaining("Pending quota update")).toBeGreaterThan(0);
-        expect(memoryManager.status().custom?.providerState).toEqual({
-          mode: "active",
-          providerId: "openai",
-        });
-      } finally {
-        clock.mockRestore();
-      }
-    },
-  );
-
-  it("updates a keyword-only index during the original embedding cooldown", async () => {
-    const now = Date.now();
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-    try {
-      providerAvailable = true;
+      const manager = await createManager();
+      await manager.sync({ force: true });
+      const idle = manager as unknown as { awaitManagerIdle(): Promise<void> };
+      const { now, clock } = mockClock();
       const quotaError = Object.assign(new Error("embedding quota exhausted"), {
         status: 429,
         errorCode: "insufficient_quota",
       });
       providerEmbeddingError = quotaError;
       providerQueryError = quotaError;
-      const memoryManager = await createManager();
-      const idle = memoryManager as unknown as { awaitManagerIdle(): Promise<void> };
-      await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
-      await idle.awaitManagerIdle();
+      await fs.writeFile(
+        path.join(workspaceDir, "MEMORY.md"),
+        "Alpha topic\n\nPending quota update.",
+      );
+      // The observation fixture leaves dirty notification to the test.
+      Reflect.set(manager, "dirty", true);
+      if (origin === "watch") {
+        await expect(manager.sync({ reason: "watch" })).rejects.toThrow(
+          "embedding quota exhausted",
+        );
+      } else {
+        await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
+        await idle.awaitManagerIdle();
+      }
       const requestsAfterFailure = providerBatchCalls + providerQueryCalls;
 
-      for (const [elapsed, marker] of [
-        [10_000, "Gamma keyword update"],
-        [29_999, "Delta keyword update"],
-      ] as const) {
+      for (const elapsed of [10_000, 29_999]) {
         clock.mockReturnValue(now + elapsed);
-        await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), `${marker}\n\nKeep this note.`);
-        Reflect.set(memoryManager, "dirty", true);
-        await memoryManager.search(marker);
+        await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
         await idle.awaitManagerIdle();
         expect(providerBatchCalls + providerQueryCalls).toBe(requestsAfterFailure);
-        expect(countChunksContaining(marker)).toBeGreaterThan(0);
-        await expect(memoryManager.search(marker)).resolves.toHaveLength(1);
-        expect(memoryManager.getCachedEmbeddingAvailability()?.cacheExpiresAtMs).toBe(now + 30_000);
+        expect(manager.getCachedEmbeddingAvailability()?.cacheExpiresAtMs).toBe(now + 30_000);
+        expect(countChunksContaining("Pending quota update")).toBe(0);
       }
-    } finally {
-      clock.mockRestore();
+
+      providerEmbeddingError = null;
+      providerQueryError = null;
+      clock.mockReturnValue(now + 30_000);
+      await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
+      await idle.awaitManagerIdle();
+      expect(providerBatchCalls + providerQueryCalls).toBeGreaterThan(requestsAfterFailure);
+      expect(countChunksContaining("Pending quota update")).toBeGreaterThan(0);
+      expect(manager.status().custom?.providerState).toEqual({
+        mode: "active",
+        providerId: "openai",
+      });
+    },
+  );
+
+  it("updates a keyword-only index during the original embedding cooldown", async () => {
+    const { now, clock } = mockClock();
+    providerAvailable = true;
+    const quotaError = Object.assign(new Error("embedding quota exhausted"), {
+      status: 429,
+      errorCode: "insufficient_quota",
+    });
+    providerEmbeddingError = quotaError;
+    providerQueryError = quotaError;
+    const manager = await createManager();
+    const idle = manager as unknown as { awaitManagerIdle(): Promise<void> };
+    await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
+    await idle.awaitManagerIdle();
+    const requestsAfterFailure = providerBatchCalls + providerQueryCalls;
+
+    for (const [elapsed, marker] of [
+      [10_000, "Gamma keyword update"],
+      [29_999, "Delta keyword update"],
+    ] as const) {
+      clock.mockReturnValue(now + elapsed);
+      await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), `${marker}\n\nKeep this note.`);
+      Reflect.set(manager, "dirty", true);
+      await manager.search(marker);
+      await idle.awaitManagerIdle();
+      expect(providerBatchCalls + providerQueryCalls).toBe(requestsAfterFailure);
+      expect(countChunksContaining(marker)).toBeGreaterThan(0);
+      await expect(manager.search(marker)).resolves.toHaveLength(1);
+      expect(manager.getCachedEmbeddingAvailability()?.cacheExpiresAtMs).toBe(now + 30_000);
     }
   });
 
-  it("falls back to keyword results when the default query embedding fails", async () => {
-    providerAvailable = true;
-    const memoryManager = await createManager();
-    await memoryManager.sync({ force: true });
-    expect(countChunksContaining("Alpha topic")).toBeGreaterThan(0);
-    await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
-    expect(providerQueryCalls).toBeGreaterThan(0);
-
-    providerQueryError = new Error("query embedding request failed at runtime");
-    const results = await memoryManager.search("Alpha topic");
-
-    expect(results).toEqual([expect.objectContaining({ path: "MEMORY.md", source: "memory" })]);
-  });
-
-  it("keeps explicit providers fail-closed when a runtime query embedding fails", async () => {
-    providerAvailable = true;
-    const memoryManager = await createManager({ provider: "openai" });
-    await memoryManager.sync({ force: true });
-    expect(countChunksContaining("Alpha topic")).toBeGreaterThan(0);
-
-    providerQueryError = new Error("query embedding request failed at runtime");
-
-    await expect(memoryManager.search("Alpha topic")).rejects.toThrow(
-      "query embedding request failed at runtime",
-    );
-  });
+  it.each([undefined, "openai"])(
+    "handles query embedding failure for provider %s",
+    async (provider) => {
+      providerAvailable = true;
+      const manager = await createManager({ provider });
+      await manager.sync({ force: true });
+      expect(countChunksContaining("Alpha topic")).toBeGreaterThan(0);
+      if (provider === undefined) {
+        await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
+        expect(providerQueryCalls).toBeGreaterThan(0);
+      }
+      providerQueryError = new Error("query embedding request failed at runtime");
+      const search = manager.search("Alpha topic");
+      if (provider === undefined) {
+        expect(await search).toEqual(keywordResult);
+      } else {
+        await expect(search).rejects.toThrow("query embedding request failed at runtime");
+      }
+    },
+  );
 
   it("keeps explicit required providers fail-closed when construction fails", async () => {
     providerConstructionError = missingProviderAuth();
-    const memoryManager = await createManager({ provider: "openai" });
+    const manager = await createManager({ provider: "openai" });
 
-    await expect(
-      memoryManager.sync({ reason: "session-startup-catchup", force: true }),
-    ).rejects.toThrow('No API key resolved for provider "openai"');
-    await expect(memoryManager.search("Alpha topic")).rejects.toThrow(
+    await expect(manager.sync({ reason: "session-startup-catchup", force: true })).rejects.toThrow(
+      'No API key resolved for provider "openai"',
+    );
+    await expect(manager.search("Alpha topic")).rejects.toThrow(
       'No API key resolved for provider "openai"',
     );
     expect(countChunksContaining("Alpha topic")).toBe(0);
@@ -444,87 +427,71 @@ describe("memory manager FTS-only reindex", () => {
 
   it("uses keyword search when provider construction fails against an existing semantic index", async () => {
     const credential = "sk-test-abcdefghijklmnopqrstuvwxyz123456";
-    const now = Date.now();
-    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
-    try {
-      providerAvailable = true;
-      const firstManager = await createManager();
-      await firstManager.sync({ force: true });
-      await expect(firstManager.probeVectorAvailability()).resolves.toBe(true);
-      await firstManager.close();
-      await closeAllMemorySearchManagers();
-      providerAvailable = false;
-      providerConstructionError = missingProviderAuth();
-      providerConstructionError.message += ` apiKey=${credential}`;
-      const memoryManager = await createManager();
-      const debug: unknown[] = [];
+    const { now, clock } = mockClock();
+    providerAvailable = true;
+    const firstManager = await createManager();
+    await firstManager.sync({ force: true });
+    await expect(firstManager.probeVectorAvailability()).resolves.toBe(true);
+    await firstManager.close();
+    await closeAllMemorySearchManagers();
+    providerAvailable = false;
+    providerConstructionError = missingProviderAuth();
+    providerConstructionError.message += ` apiKey=${credential}`;
+    const manager = await createManager();
+    const debug: unknown[] = [];
 
-      await expect(
-        memoryManager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) }),
-      ).resolves.toEqual([expect.objectContaining({ path: "MEMORY.md", source: "memory" })]);
-      expect(debug).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            embeddingBootstrap: expect.objectContaining({ degradedTo: "keyword-only" }),
-          }),
-        ]),
-      );
-      expect(JSON.stringify(debug)).not.toContain(credential);
-      expect(
-        memoryManager as unknown as {
-          embeddingBootstrapFailure?: unknown;
-          provider?: { id: string } | null;
-        },
-      ).toMatchObject({
-        embeddingBootstrapFailure: expect.objectContaining({ degradedTo: "keyword-only" }),
-        provider: null,
-      });
-      expect(memoryManager.status()).toMatchObject({
-        provider: "none",
-        model: undefined,
-        vector: { semanticAvailable: false },
-        custom: { indexIdentity: { status: "valid" }, searchMode: "fts-only" },
-      });
+    await expect(
+      manager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) }),
+    ).resolves.toEqual(keywordResult);
+    expectBootstrap(debug, { degradedTo: "keyword-only" });
+    expect(JSON.stringify(debug)).not.toContain(credential);
+    expect(
+      manager as unknown as {
+        embeddingBootstrapFailure?: unknown;
+        provider?: { id: string } | null;
+      },
+    ).toMatchObject({
+      embeddingBootstrapFailure: expect.objectContaining({ degradedTo: "keyword-only" }),
+      provider: null,
+    });
+    expect(manager.status()).toMatchObject({
+      provider: "none",
+      model: undefined,
+      vector: { semanticAvailable: false },
+      custom: { indexIdentity: { status: "valid" }, searchMode: "fts-only" },
+    });
 
-      providerConstructionError = null;
-      providerAvailable = true;
-      nowSpy.mockReturnValue(now + 31_000);
-      await expect(memoryManager.probeEmbeddingAvailability()).resolves.toEqual({ ok: true });
-      await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
+    providerConstructionError = null;
+    providerAvailable = true;
+    clock.mockReturnValue(now + 31_000);
+    await expect(manager.probeEmbeddingAvailability()).resolves.toEqual({ ok: true });
+    await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
 
-      expect(providerQueryCalls).toBeGreaterThan(0);
-      expect(memoryManager.status()).toMatchObject({
-        provider: "openai",
-        vector: { semanticAvailable: true },
-        custom: { providerState: { mode: "active", providerId: "openai" } },
-      });
-    } finally {
-      nowSpy.mockRestore();
-    }
+    expect(providerQueryCalls).toBeGreaterThan(0);
+    expect(manager.status()).toMatchObject({
+      provider: "openai",
+      vector: { semanticAvailable: true },
+      custom: { providerState: { mode: "active", providerId: "openai" } },
+    });
   });
 
   it("caches a normal no-provider result after an expired bootstrap failure", async () => {
-    const now = Date.now();
-    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
-    try {
-      providerConstructionError = missingProviderAuth();
-      const memoryManager = await createManager();
-      await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
+    const { now, clock } = mockClock();
+    providerConstructionError = missingProviderAuth();
+    const manager = await createManager();
+    await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
 
-      providerConstructionError = null;
-      nowSpy.mockReturnValue(now + 31_000);
-      const debug: unknown[] = [];
-      await expect(
-        memoryManager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) }),
-      ).resolves.toHaveLength(1);
-      const callsAfterRetry = createEmbeddingProviderMock.mock.calls.length;
-      await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
+    providerConstructionError = null;
+    clock.mockReturnValue(now + 31_000);
+    const debug: unknown[] = [];
+    await expect(
+      manager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) }),
+    ).resolves.toHaveLength(1);
+    const callsAfterRetry = createProvider.mock.calls.length;
+    await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
 
-      expect(createEmbeddingProviderMock).toHaveBeenCalledTimes(callsAfterRetry);
-      expect(JSON.stringify(debug)).toContain("No embeddings provider available.");
-    } finally {
-      nowSpy.mockRestore();
-    }
+    expect(createProvider).toHaveBeenCalledTimes(callsAfterRetry);
+    expect(JSON.stringify(debug)).toContain("No embeddings provider available.");
   });
 
   it("degrades concurrent bootstrap waiters to the same keyword index", async () => {
@@ -533,128 +500,107 @@ describe("memory manager FTS-only reindex", () => {
       releaseProviderConstruction = resolve;
     });
     providerConstructionError = missingProviderAuth();
-    const memoryManager = await createManager();
+    const manager = await createManager();
 
-    const backgroundSync = memoryManager.sync({ reason: "startup" }).catch((err: unknown) => err);
-    await vi.waitFor(() => expect(createEmbeddingProviderMock).toHaveBeenCalledOnce());
-    const firstSearch = memoryManager.search("Alpha topic");
-    const secondSearch = memoryManager.search("Alpha topic");
+    const backgroundSync = manager.sync({ reason: "startup" }).catch((err: unknown) => err);
+    await vi.waitFor(() => expect(createProvider).toHaveBeenCalledOnce());
+    const firstSearch = manager.search("Alpha topic");
+    const secondSearch = manager.search("Alpha topic");
     releaseProviderConstruction();
 
     await expect(backgroundSync).resolves.toBeUndefined();
     const results = await Promise.all([firstSearch, secondSearch]);
-    expect(results).toEqual([
-      [expect.objectContaining({ path: "MEMORY.md", source: "memory" })],
-      [expect.objectContaining({ path: "MEMORY.md", source: "memory" })],
-    ]);
-    expect(createEmbeddingProviderMock).toHaveBeenCalledOnce();
+    expect(results).toEqual([keywordResult, keywordResult]);
+    expect(createProvider).toHaveBeenCalledOnce();
   });
 
   it("serializes provider construction when concurrent probes retry an expired failure", async () => {
-    const now = Date.now();
-    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
-    try {
-      providerConstructionError = missingProviderAuth();
-      const memoryManager = await createManager();
-      await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
-      const callsBeforeRetry = createEmbeddingProviderMock.mock.calls.length;
+    const { now, clock } = mockClock();
+    providerConstructionError = missingProviderAuth();
+    const manager = await createManager();
+    await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
+    const callsBeforeRetry = createProvider.mock.calls.length;
 
-      providerConstructionError = null;
-      providerAvailable = true;
-      nowSpy.mockReturnValue(now + 31_000);
-      let releaseProviderConstruction!: () => void;
-      providerConstructionGate = new Promise<void>((resolve) => {
-        releaseProviderConstruction = resolve;
-      });
-      const firstProbe = memoryManager.probeEmbeddingAvailability();
-      const secondProbe = memoryManager.probeEmbeddingAvailability();
-      await vi.waitFor(() =>
-        expect(createEmbeddingProviderMock).toHaveBeenCalledTimes(callsBeforeRetry + 1),
-      );
-      releaseProviderConstruction();
+    providerConstructionError = null;
+    providerAvailable = true;
+    clock.mockReturnValue(now + 31_000);
+    let releaseProviderConstruction!: () => void;
+    providerConstructionGate = new Promise<void>((resolve) => {
+      releaseProviderConstruction = resolve;
+    });
+    const firstProbe = manager.probeEmbeddingAvailability();
+    const secondProbe = manager.probeEmbeddingAvailability();
+    await vi.waitFor(() => expect(createProvider).toHaveBeenCalledTimes(callsBeforeRetry + 1));
+    releaseProviderConstruction();
 
-      await expect(Promise.all([firstProbe, secondProbe])).resolves.toEqual([
-        { ok: true },
-        { ok: true },
-      ]);
-      expect(createEmbeddingProviderMock).toHaveBeenCalledTimes(callsBeforeRetry + 1);
-      await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
-      expect(memoryManager.status()).toMatchObject({
-        provider: "openai",
-        custom: {
-          indexIdentity: { status: "valid" },
-          providerState: { mode: "active", providerId: "openai" },
-        },
-      });
-    } finally {
-      nowSpy.mockRestore();
-    }
+    await expect(Promise.all([firstProbe, secondProbe])).resolves.toEqual([
+      { ok: true },
+      { ok: true },
+    ]);
+    expect(createProvider).toHaveBeenCalledTimes(callsBeforeRetry + 1);
+    await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
+    expect(manager.status()).toMatchObject({
+      provider: "openai",
+      custom: {
+        indexIdentity: { status: "valid" },
+        providerState: { mode: "active", providerId: "openai" },
+      },
+    });
   });
 
   it("keeps keyword results when semantic recovery reindex fails", async () => {
-    const now = Date.now();
-    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
-    try {
-      providerConstructionError = missingProviderAuth();
-      const memoryManager = await createManager();
-      await expect(memoryManager.search("Alpha topic")).resolves.toHaveLength(1);
+    const { now, clock } = mockClock();
+    providerConstructionError = missingProviderAuth();
+    const manager = await createManager();
+    await expect(manager.search("Alpha topic")).resolves.toHaveLength(1);
 
-      providerConstructionError = null;
-      providerAvailable = true;
-      nowSpy.mockReturnValue(now + 31_000);
-      await expect(memoryManager.probeEmbeddingAvailability()).resolves.toEqual({ ok: true });
-      providerEmbeddingError = new Error("embedding request failed during rebuild");
-      const queryCallsAfterProbe = providerQueryCalls;
-      const debug: unknown[] = [];
+    providerConstructionError = null;
+    providerAvailable = true;
+    clock.mockReturnValue(now + 31_000);
+    await expect(manager.probeEmbeddingAvailability()).resolves.toEqual({ ok: true });
+    providerEmbeddingError = new Error("embedding request failed during rebuild");
+    const queryCallsAfterProbe = providerQueryCalls;
+    const debug: unknown[] = [];
 
-      await expect(
-        memoryManager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) }),
-      ).resolves.toHaveLength(1);
-      expect(providerQueryCalls).toBe(queryCallsAfterProbe);
-      expect(debug).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            embeddingBootstrap: expect.objectContaining({
-              degradedTo: "keyword-only",
-              reason: expect.stringContaining("embedding request failed during rebuild"),
-            }),
-          }),
-        ]),
-      );
-      expect(JSON.stringify(debug)).not.toContain("No API key resolved");
-      expect(memoryManager.status().custom?.indexIdentity).toEqual({ status: "valid" });
+    await expect(
+      manager.search("Alpha topic", { onDebug: (entry) => debug.push(entry) }),
+    ).resolves.toHaveLength(1);
+    expect(providerQueryCalls).toBe(queryCallsAfterProbe);
+    expectBootstrap(debug, {
+      degradedTo: "keyword-only",
+      reason: expect.stringContaining("embedding request failed during rebuild"),
+    });
+    expect(JSON.stringify(debug)).not.toContain("No API key resolved");
+    expect(manager.status().custom?.indexIdentity).toEqual({ status: "valid" });
 
-      await fs.writeFile(
-        path.join(workspaceDir, "MEMORY.md"),
-        "Gamma fallback refresh\n\nIndexed while embeddings remain degraded.",
-      );
-      await expect(memoryManager.sync({ reason: "watch", force: true })).resolves.toBeUndefined();
-      await expect(memoryManager.search("Gamma fallback refresh")).resolves.toHaveLength(1);
-      expect(providerQueryCalls).toBe(queryCallsAfterProbe);
+    await fs.writeFile(
+      path.join(workspaceDir, "MEMORY.md"),
+      "Gamma fallback refresh\n\nIndexed while embeddings remain degraded.",
+    );
+    await expect(manager.sync({ reason: "watch", force: true })).resolves.toBeUndefined();
+    await expect(manager.search("Gamma fallback refresh")).resolves.toHaveLength(1);
+    expect(providerQueryCalls).toBe(queryCallsAfterProbe);
 
-      nowSpy.mockReturnValue(now + 62_000);
-      await fs.writeFile(
-        path.join(workspaceDir, "MEMORY.md"),
-        "Delta fallback refresh\n\nRetry remains keyword-only while embeddings still fail.",
-      );
-      await expect(memoryManager.sync({ reason: "watch", force: true })).resolves.toBeUndefined();
-      await expect(memoryManager.search("Delta fallback refresh")).resolves.toHaveLength(1);
-      expect(providerQueryCalls).toBe(queryCallsAfterProbe);
+    clock.mockReturnValue(now + 62_000);
+    await fs.writeFile(
+      path.join(workspaceDir, "MEMORY.md"),
+      "Delta fallback refresh\n\nRetry remains keyword-only while embeddings still fail.",
+    );
+    await expect(manager.sync({ reason: "watch", force: true })).resolves.toBeUndefined();
+    await expect(manager.search("Delta fallback refresh")).resolves.toHaveLength(1);
+    expect(providerQueryCalls).toBe(queryCallsAfterProbe);
 
-      providerEmbeddingError = null;
-      nowSpy.mockReturnValue(now + 93_000);
-      await expect(memoryManager.sync({ reason: "watch", force: true })).resolves.toBeUndefined();
-      await expect(memoryManager.search("Delta fallback refresh")).resolves.toHaveLength(1);
-      expect(providerQueryCalls).toBeGreaterThan(queryCallsAfterProbe);
-      const recoveredStatus = memoryManager.status();
-      expect(recoveredStatus.custom?.providerState).toEqual({
-        mode: "active",
-        providerId: "openai",
-      });
-      expect(recoveredStatus.custom?.providerUnavailableReason).toBeUndefined();
-    } finally {
-      nowSpy.mockRestore();
-    }
+    providerEmbeddingError = null;
+    clock.mockReturnValue(now + 93_000);
+    await expect(manager.sync({ reason: "watch", force: true })).resolves.toBeUndefined();
+    await expect(manager.search("Delta fallback refresh")).resolves.toHaveLength(1);
+    expect(providerQueryCalls).toBeGreaterThan(queryCallsAfterProbe);
+    const recoveredStatus = manager.status();
+    expect(recoveredStatus.custom?.providerState).toEqual({
+      mode: "active",
+      providerId: "openai",
+    });
+    expect(recoveredStatus.custom?.providerUnavailableReason).toBeUndefined();
   });
 
   it.skipIf(process.platform === "win32")(
@@ -663,9 +609,9 @@ describe("memory manager FTS-only reindex", () => {
       const linkedUserPath = path.join(workspaceDir, "shared-user.md");
       await fs.writeFile(linkedUserPath, "Linked user content must not be indexed.");
       await fs.symlink(linkedUserPath, path.join(workspaceDir, "USER.md"));
-      const memoryManager = await createManager({ provider: "none", vectorEnabled: false });
+      const manager = await createManager({ provider: "none", vectorEnabled: false });
 
-      await expect(memoryManager.sync({ reason: "cli", force: true })).resolves.toBeUndefined();
+      await expect(manager.sync({ reason: "cli", force: true })).resolves.toBeUndefined();
 
       expect(countChunksContaining("Alpha topic")).toBeGreaterThan(0);
       expect(countChunksContaining("Linked user content")).toBe(0);
@@ -673,30 +619,30 @@ describe("memory manager FTS-only reindex", () => {
   );
 
   it("forces provider-none memory to FTS-only when vector config is omitted", async () => {
-    const memoryManager = await createManager({ provider: "none" });
+    const manager = await createManager({ provider: "none" });
 
-    await memoryManager.sync({ force: true });
+    await manager.sync({ force: true });
 
-    await expect(memoryManager.probeEmbeddingAvailability()).resolves.toEqual({
+    await expect(manager.probeEmbeddingAvailability()).resolves.toEqual({
       ok: false,
       error: "No embedding provider available (FTS-only mode)",
     });
-    const status = memoryManager.status();
-    expect(createEmbeddingProviderMock).not.toHaveBeenCalled();
+    const status = manager.status();
+    expect(createProvider).not.toHaveBeenCalled();
     expect(status.vector).toMatchObject({ enabled: false });
     expect(status.custom?.indexIdentity).toEqual({ status: "valid" });
     expect(countChunksContaining("Alpha topic")).toBeGreaterThan(0);
   });
 
   it("ignores persisted vector rebuild debt after reopening an FTS-only index", async () => {
-    const memoryManager = await createManager({ provider: "none" });
+    const manager = await createManager({ provider: "none" });
     const db = openOpenClawAgentDatabase({ agentId: "main" }).db;
     db.prepare(
       `INSERT INTO memory_index_meta (key, value) VALUES ('memory_vector_rebuild_v1', '1')`,
     ).run();
 
-    await memoryManager.sync({ force: true });
-    await memoryManager.close();
+    await manager.sync({ force: true });
+    await manager.close();
     await closeAllMemorySearchManagers();
 
     const reopened = await createManager({ provider: "none", purpose: "status" });
@@ -709,19 +655,17 @@ describe("memory manager FTS-only reindex", () => {
   });
 
   it("aborts instead of downgrading an existing semantic index to FTS-only", async () => {
-    const memoryManager = await createManager();
-    await writeExistingMeta(memoryManager, "mock-embed");
+    const manager = await createManager();
+    await writeExistingMeta(manager, "mock-embed");
 
-    await expect(memoryManager.sync({ force: true })).rejects.toThrow(
+    await expect(manager.sync({ force: true })).rejects.toThrow(
       "Refusing to run sync in fts-only fallback mode to protect existing vector index (current model: mock-embed).",
     );
-    expect(memoryManager.status().provider).toBe("openai");
+    expect(manager.status().provider).toBe("openai");
   });
 
-  function indexIdentityStatus(memoryManager: MemoryIndexManager): string | undefined {
-    const identity = memoryManager.status().custom?.indexIdentity as
-      | { status?: string }
-      | undefined;
+  function indexIdentityStatus(manager: MemoryIndexManager): string | undefined {
+    const identity = manager.status().custom?.indexIdentity as { status?: string } | undefined;
     return identity?.status;
   }
 
@@ -735,32 +679,26 @@ describe("memory manager FTS-only reindex", () => {
     `);
   }
 
-  it("self-heals missing identity on non-forced gateway sync when all chunks are FTS-only and provider is unavailable", async () => {
-    seedChunksWithNoMeta();
-    const memoryManager = await createManager({ provider: "auto", vectorEnabled: false });
-
-    expect(indexIdentityStatus(memoryManager)).toBe("missing");
-
-    // Non-forced sync simulates the gateway's periodic sync loop
-    await memoryManager.sync();
-
-    const statusAfter = memoryManager.status();
-    expect(indexIdentityStatus(memoryManager)).toBe("valid");
-    expect(statusAfter.chunks).toBeGreaterThan(0);
-    expect(statusAfter.dirty).toBe(false);
-  });
-
-  it("does not rebuild missing-identity semantic chunks when the provider is unavailable", async () => {
-    seedChunksWithNoMeta("text-embedding-3-small");
-    const memoryManager = await createManager({ provider: "auto", vectorEnabled: false });
-
-    await memoryManager.sync();
-
-    const statusAfter = memoryManager.status();
-    expect(indexIdentityStatus(memoryManager)).toBe("missing");
-    expect(statusAfter.chunks).toBe(1);
-    expect(statusAfter.dirty).toBe(true);
-  });
+  it.each(["fts-only", "text-embedding-3-small"])(
+    "reconciles missing identity for %s without a provider",
+    async (model) => {
+      seedChunksWithNoMeta(model);
+      const manager = await createManager({ provider: "auto", vectorEnabled: false });
+      if (model === "fts-only") {
+        expect(indexIdentityStatus(manager)).toBe("missing");
+      }
+      // Non-forced sync simulates the Gateway's periodic sync loop.
+      await manager.sync();
+      const facts = manager.status();
+      expect(indexIdentityStatus(manager)).toBe(model === "fts-only" ? "valid" : "missing");
+      expect(facts.dirty).toBe(model !== "fts-only");
+      if (model === "fts-only") {
+        expect(facts.chunks).toBeGreaterThan(0);
+      } else {
+        expect(facts.chunks).toBe(1);
+      }
+    },
+  );
 
   it("removes chunks and FTS rows when the dirty source file is already deleted", async () => {
     const seedDb = requireNativeSqliteDatabase(openOpenClawAgentDatabase({ agentId: "main" }).db);
