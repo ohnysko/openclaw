@@ -17,7 +17,6 @@ import { createReplyDispatcher } from "./reply-dispatcher.js";
 import { buildTestCtx } from "./test-ctx.js";
 
 beforeAll(globalBeforeAll0);
-
 beforeEach(describe0BeforeEach0);
 
 it("strips split private prompt context before routing live ACP replies through its dispatch hook", async () => {
@@ -78,13 +77,7 @@ it("strips split private prompt context before routing live ACP replies through 
     return routed.payload.text ?? "";
   });
   expect(routedPayloads.slice(0, 2)).toEqual(["Visible answer before.", "Visible answer after."]);
-  for (const secret of [
-    "[Chat messages since your last reply",
-    "private history",
-    marker,
-    "private XML",
-    privateInbound,
-  ]) {
-    expect(routedPayloads.join(" ")).not.toContain(secret);
-  }
+  expect(routedPayloads.join(" ")).not.toMatch(
+    /\[Chat messages since your last reply|private history|\[Current message - respond to this\]|private XML|private inbound paragraph/,
+  );
 });

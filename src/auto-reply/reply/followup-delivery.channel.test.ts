@@ -1,4 +1,3 @@
-// Proves follow-up batch ownership through the real channel route and durable-send boundary.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
 import { OutboundDeliveryError } from "../../infra/outbound/deliver-types.js";
@@ -35,12 +34,8 @@ vi.mock("../../infra/outbound/deliver.js", () => ({
   deliverOutboundPayloadsInternal: (...args: unknown[]) => channelState.deliver(...args),
 }));
 
-function createChannelPlugin(id: ChannelPlugin["id"]): ChannelPlugin {
-  return createChannelTestPluginBase({
-    id,
-    config: { listAccountIds: () => [] },
-  });
-}
+const createChannelPlugin = (id: ChannelPlugin["id"]): ChannelPlugin =>
+  createChannelTestPluginBase({ id, config: { listAccountIds: () => [] } });
 
 function register(...plugins: ChannelPlugin[]) {
   setActivePluginRegistry(
@@ -72,10 +67,7 @@ function registerCurrentReplyThreading() {
   register(slack);
 }
 
-function createTurn(
-  messageProvider = "discord",
-  originatingChannel = messageProvider,
-): AdmittedFollowupTurn {
+function createTurn(messageProvider = "discord", originatingChannel = messageProvider) {
   const turn = createBaseTurn({ operation: {} as AdmittedFollowupTurn["operation"] });
   turn.queued.originatingChannel = originatingChannel;
   turn.queued.run.messageProvider = messageProvider;
@@ -154,9 +146,7 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
-  setActivePluginRegistry(createTestRegistry());
-});
+afterEach(() => setActivePluginRegistry(createTestRegistry()));
 
 describe("follow-up delivery channel boundary", () => {
   it.each(["suppressed", "delivered", "failed", "held", "ambiguous"] as const)(
@@ -343,8 +333,7 @@ describe("follow-up delivery channel boundary", () => {
     const payload = { text: "queued answer" };
     channelState.outcomes = ["delivered"];
     await sendToOrigin(turn, [payload]);
-    expect(channelState.deliver).toHaveBeenCalledOnce();
-    expect(channelState.deliver).toHaveBeenCalledWith(
+    expect(channelState.deliver).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         channel,
         to: "dm:qa-peer",
