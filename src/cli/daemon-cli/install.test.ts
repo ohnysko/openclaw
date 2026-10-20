@@ -406,8 +406,13 @@ describe("runDaemonInstall", () => {
   });
 
   it("returns already-installed when the embedded gateway token matches the install plan", async () => {
-    const command = loadedService({ environment: { OPENCLAW_GATEWAY_TOKEN: "durable-token" } });
-    buildGatewayInstallPlanMock.mockResolvedValueOnce({ ...command, workingDirectory: "/tmp" });
+    const environment = { OPENCLAW_GATEWAY_TOKEN: "durable-token" };
+    const command = loadedService({ environment });
+    buildGatewayInstallPlanMock.mockResolvedValueOnce({
+      ...command,
+      environment,
+      workingDirectory: "/tmp",
+    });
     await runDaemonInstall({ json: true });
     expect(buildGatewayInstallPlanMock).toHaveBeenCalledTimes(1);
     expectNoCalls(replaceConfigFileMock, installDaemonServiceAndEmitMock);

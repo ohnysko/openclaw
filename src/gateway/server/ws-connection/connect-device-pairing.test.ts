@@ -107,14 +107,14 @@ function updateGateway(overrides: NonNullable<OpenClawConfig["gateway"]>) {
   setRuntimeConfigSnapshot({ ...current, gateway: { ...current.gateway, ...overrides } });
 }
 
-const cleanups: (() => unknown | Promise<unknown>)[] = [];
+const cleanups: (() => unknown)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).toReversed()) {
     await cleanup();
   }
 });
 
-function track<T>(resource: T, cleanup: (resource: T) => unknown | Promise<unknown>): T {
+function track<T>(resource: T, cleanup: (resource: T) => unknown): T {
   cleanups.push(() => cleanup(resource));
   return resource;
 }

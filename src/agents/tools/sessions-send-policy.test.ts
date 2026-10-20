@@ -339,9 +339,10 @@ describe("sessions_send directed policy at the tool boundary", () => {
   it.each(["send-only", "readable", "raw-target"] as const)(
     "reports the requested watch for a %s target",
     async (access) => {
-      const watch = vi
-        .spyOn(sessionStateEvents, "registerSessionStateWatch")
-        .mockResolvedValue(true);
+      const watch = vi.spyOn(sessionStateEvents, "registerSessionStateWatch");
+      if (access !== "raw-target") {
+        watch.mockResolvedValue(true);
+      }
       const config = configFor(["worker"], access === "send-only" ? "self" : "all");
       const result = await send(config, {
         agentId: "worker",

@@ -666,7 +666,7 @@ describe("sessions_send dispatch admission", () => {
             return { messageId: "final-reply" };
           }
       }
-      unexpectedRequest(request);
+      return unexpectedRequest(request);
     });
     const restoreGateway = interceptGateway(callGateway);
     // Cross-session routing has a transport fixture, not a native custody receipt.

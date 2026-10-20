@@ -28,7 +28,7 @@ it.each(["token_redacted_config", "password_redacted_config"])(
   },
 );
 
-it.each([
+it.each<[Partial<MessageParams>, string, boolean?, string?]>([
   [{ authProvided: "bootstrap-token", reason: "bootstrap_token_invalid" }, setupRejected, true],
   [{ authProvided: "bootstrap-token" }, setupRejected, true],
   [
@@ -69,16 +69,13 @@ it.each([
     "gateway rejected this node: trusted-proxy identity-header authentication is required and no usable machine credential was accepted; run `openclaw doctor` on the Gateway",
   ],
   [nodeRejection("trusted_proxy_local_interface_check_failed"), "unauthorized"],
-] satisfies [Partial<MessageParams>, string, boolean?, string?][])(
-  "formats an actionable auth failure for %j",
-  (params, expected, closeLimit, excluded) => {
-    const message = format(params);
-    expect(message).toBe(expected);
-    if (closeLimit) {
-      expect(truncateCloseReason(message)).toBe(message);
-    }
-    if (excluded) {
-      expect(message).not.toContain(excluded);
-    }
-  },
-);
+])("formats an actionable auth failure for %j", (params, expected, closeLimit, excluded) => {
+  const message = format(params);
+  expect(message).toBe(expected);
+  if (closeLimit) {
+    expect(truncateCloseReason(message)).toBe(message);
+  }
+  if (excluded) {
+    expect(message).not.toContain(excluded);
+  }
+});

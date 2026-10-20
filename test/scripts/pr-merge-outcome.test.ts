@@ -545,7 +545,8 @@ describePosix("repository identity across gh id representations", () => {
     { name: "different name", authority: { full_name: "fixture/other" } },
     { name: "different host", authority: { html_url: "https://elsewhere.invalid/fixture/repo" } },
   ])("rejects $name before intent", ({ authority }) => {
-    const f = fixture({ repoAuthority: { ...f.state().repoAuthority, ...authority } });
+    const f = fixture();
+    configureMerge(f, { repoAuthority: { ...f.state().repoAuthority, ...authority } });
     expectExit(f.run(), 1);
     expect(f.state()).toMatchObject({ mutations: 0, posts: 0 });
     expect(() => f.record()).toThrow();

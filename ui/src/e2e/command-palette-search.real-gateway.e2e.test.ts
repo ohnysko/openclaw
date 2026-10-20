@@ -207,7 +207,17 @@ const suite = createControlUiE2eSuite({
               api: "openai-completions",
               apiKey: "synthetic-no-inference-key",
               baseUrl: "http://127.0.0.1:9/v1",
-              models: [{ id: "search-model", name: "Synthetic search model" }],
+              models: [
+                {
+                  id: "search-model",
+                  name: "Synthetic search model",
+                  reasoning: false,
+                  input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: 8192,
+                  maxTokens: 1024,
+                },
+              ],
             },
           },
         },

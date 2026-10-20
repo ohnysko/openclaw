@@ -315,14 +315,18 @@ describe("authenticated Gateway RPC diagnostics", () => {
       respond(true, {});
     }, "sessions.list");
     fixture.send.mockReturnValue({ kind: "sent", bytes: query.bytes });
-    await fixture.run({
-      source: query.source,
-      rowMode: query.rowMode,
-      limit: 60,
-      offset: 120,
-      ownerId: "private-",
-      search: "private-",
-    });
+    await fixture.run(
+      {
+        source: query.source,
+        rowMode: query.rowMode,
+        limit: 60,
+        offset: 120,
+        ownerId: "private-",
+        search: "private-",
+      },
+      fixture.client,
+      { id: "session-list-diagnostics" },
+    );
     expect(fixture.send).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
     expect(fixture.phase("received")[0]).toMatchObject({
       sessionsList: {

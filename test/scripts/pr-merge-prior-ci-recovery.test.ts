@@ -6,6 +6,8 @@ import {
   configureMerge,
   expectExit,
   pendingGates,
+  readLocal,
+  writeLocal,
 } from "./pr-merge-assertions.test-support.js";
 import { createMergeOutcomeFixtureHarness } from "./pr-merge-outcome.test-support.js";
 import { createPriorCiCandidateFactory } from "./pr-merge-prior-ci.test-support.js";

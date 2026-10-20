@@ -111,7 +111,7 @@ async function withTitle(
 ) {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
     const fixture = await createTitleFixture(state, options);
-    await run(fixture).finally(fixture.finish);
+    await run(fixture).finally(() => fixture.finish());
   });
 }
 

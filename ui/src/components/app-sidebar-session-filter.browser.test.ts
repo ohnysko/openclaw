@@ -28,7 +28,9 @@ const finishAnimations = (element: Element) =>
   Promise.all(element.getAnimations().map((animation) => animation.finished));
 function mockNative() {
   vi.stubGlobal("webkit", { messageHandlers: { openclawBrowser: { postMessage: vi.fn() } } });
-  onTestFinished(() => vi.unstubAllGlobals());
+  onTestFinished(() => {
+    vi.unstubAllGlobals();
+  });
 }
 function nativeOcclusion() {
   const values: boolean[] = [];
