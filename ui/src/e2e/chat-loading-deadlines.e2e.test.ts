@@ -20,25 +20,33 @@ const startupPath = "/chat/main/startup-conversation";
 const withPage = (run: (page: Page) => Promise<void>) =>
   suite.withPage(createControlUiE2eContextOptions(), ({ page }) => run(page));
 
+async function startPending(page: Page, options: Parameters<typeof installMockGateway>[1]) {
+  await page.clock.install();
+  const gateway = await installMockGateway(page, {
+    sessionKey: startupSessionKey,
+    startupPendingResponses: 20,
+    ...options,
+  });
+  await page.goto(new URL(startupPath, suite.server.baseUrl).href);
+  const startup = page.locator(".agent-startup-state");
+  await startup.waitFor();
+  return { gateway, startup, sidebar: page.locator("openclaw-app-sidebar") };
+}
+const catalogMethods = [...defaultControlUiFeatureMethods, "sessions.catalog.list"];
+const sidebarErrors = ".callout.danger, .sidebar-session-catalog-error";
+
 suite.define(() => {
   it("automatically loads the route and sidebar after prolonged agent startup", async () => {
     await withPage(async (page) => {
-      await page.clock.install();
-      const gateway = await installMockGateway(page, {
-        startupPendingResponses: 20,
-        featureMethods: [...defaultControlUiFeatureMethods, "sessions.catalog.list"],
+      const { gateway, startup, sidebar } = await startPending(page, {
+        featureMethods: catalogMethods,
         methodResponses: { "sessions.catalog.list": { catalogs: [] } },
-        sessionKey: startupSessionKey,
         historyMessages: [{ role: "assistant", content: readyText }],
         sessions: [
           { key: "agent:main:main", label: "Main" },
           { key: startupSessionKey, label: "Startup conversation" },
         ],
       });
-      await page.goto(new URL(startupPath, suite.server.baseUrl).href);
-      const startup = page.locator(".agent-startup-state");
-      await startup.waitFor();
-      const sidebar = page.locator("openclaw-app-sidebar");
       await sidebar.getByRole("status").filter({ hasText: "Starting up" }).waitFor();
       await pauseVirtualClock(page);
       expect(await startup.getAttribute("role")).toBe("status");
@@ -47,24 +55,21 @@ suite.define(() => {
       expect(await startup.textContent()).toContain("This view will load automatically.");
       expect(await startup.getByRole("button").count()).toBe(0);
       expect(await page.getByText("Panel failed to load", { exact: true }).count()).toBe(0);
-      expect(await sidebar.locator(".callout.danger").count()).toBe(0);
-      expect(await sidebar.locator(".sidebar-session-catalog-error").count()).toBe(0);
+      expect(await sidebar.locator(sidebarErrors).count()).toBe(0);
       expect(await page.locator("body").textContent()).not.toContain("openclaw doctor --fix");
 
       await page.clock.runFor(60_001);
       expect(await startup.isVisible()).toBe(true);
       expect((await gateway.getRequests("sessions.resolve")).length).toBeGreaterThan(1);
       expect((await gateway.getRequests("sessions.list")).length).toBeGreaterThan(1);
-      expect(await sidebar.locator(".callout.danger").count()).toBe(0);
-      expect(await sidebar.locator(".sidebar-session-catalog-error").count()).toBe(0);
+      expect(await sidebar.locator(sidebarErrors).count()).toBe(0);
 
       await page.clock.runFor(150_000);
       await page.getByText(readyText, { exact: true }).waitFor();
       await sidebar.locator(`[data-session-key="${startupSessionKey}"]`).waitFor();
       expect(await startup.count()).toBe(0);
       expect(await sidebar.getByRole("status").filter({ hasText: "Starting up" }).count()).toBe(0);
-      expect(await sidebar.locator(".callout.danger").count()).toBe(0);
-      expect(await sidebar.locator(".sidebar-session-catalog-error").count()).toBe(0);
+      expect(await sidebar.locator(sidebarErrors).count()).toBe(0);
       expect((await gateway.getRequests("sessions.catalog.list")).length).toBeGreaterThan(20);
       expect(await gateway.getRequests("chat.send")).toHaveLength(0);
     });
@@ -72,7 +77,6 @@ suite.define(() => {
 
   it("shows a real inspection failure after pending startup", async () => {
     await suite.withPage({}, async ({ page }) => {
-      await page.clock.install();
       const diagnostic = "Agent main database inspection failed. Run openclaw doctor --fix.";
       const failure = {
         __mockError: {
@@ -82,10 +86,8 @@ suite.define(() => {
           details: { code: "agent-database-inspection-failed", agentId: "main" },
         },
       };
-      const gateway = await installMockGateway(page, {
-        startupPendingResponses: 20,
-        featureMethods: [...defaultControlUiFeatureMethods, "sessions.catalog.list"],
-        sessionKey: startupSessionKey,
+      const { gateway, startup, sidebar } = await startPending(page, {
+        featureMethods: catalogMethods,
         methodResponses: {
           "sessions.resolve": failure,
           "sessions.describe": failure,
@@ -93,20 +95,13 @@ suite.define(() => {
           "sessions.catalog.list": failure,
         },
       });
-      await page.goto(new URL(startupPath, suite.server.baseUrl).href);
-      await page.locator(".agent-startup-state").waitFor();
       await pauseVirtualClock(page);
       await page.clock.runFor(150_000);
 
       await page.getByText("Panel failed to load", { exact: true }).waitFor();
-      expect(await page.locator(".agent-startup-state").count()).toBe(0);
+      expect(await startup.count()).toBe(0);
       expect(await page.getByRole("button", { name: "Retry", exact: true }).isEnabled()).toBe(true);
-      const sidebar = page.locator("openclaw-app-sidebar");
-      await sidebar
-        .locator(".callout.danger, .sidebar-session-catalog-error")
-        .filter({ hasText: diagnostic })
-        .first()
-        .waitFor();
+      await sidebar.locator(sidebarErrors).filter({ hasText: diagnostic }).first().waitFor();
       const attempts = (await gateway.getRequests("sessions.resolve")).length;
       await page.clock.runFor(30_000);
       expect(await gateway.getRequests("sessions.resolve")).toHaveLength(attempts);
@@ -115,13 +110,7 @@ suite.define(() => {
 
   it("cancels route startup retries when navigating away", async () => {
     await suite.withPage({}, async ({ page }) => {
-      await page.clock.install();
-      const gateway = await installMockGateway(page, {
-        startupPendingResponses: 100,
-        sessionKey: startupSessionKey,
-      });
-      await page.goto(new URL(startupPath, suite.server.baseUrl).href);
-      await page.locator(".agent-startup-state").waitFor();
+      const { gateway, startup } = await startPending(page, { startupPendingResponses: 100 });
       await page.locator(".sidebar-new-session").first().click();
       await page.locator("textarea:visible").first().waitFor();
       expect(new URL(page.url()).pathname).toBe("/new");
@@ -129,7 +118,7 @@ suite.define(() => {
       const attempts = (await gateway.getRequests("sessions.resolve")).length;
       await page.clock.runFor(30_000);
       expect(await gateway.getRequests("sessions.resolve")).toHaveLength(attempts);
-      expect(await page.locator(".agent-startup-state").count()).toBe(0);
+      expect(await startup.count()).toBe(0);
       expect(await page.locator("body").textContent()).not.toContain("openclaw doctor --fix");
     });
   });
@@ -283,11 +272,11 @@ suite.define(() => {
   it.each(["before history", "after history"] as const)(
     "accepts an explicit failed-session retry %s and sends it once history is ready",
     async (retryTiming) => {
-      await suite.withPage({}, async ({ page: currentPage }) => {
+      await suite.withPage({}, async ({ page }) => {
         const sessionKey = "agent:main:main";
         const diagnostic = "⚠️ ✉️ Message failed: delivery unavailable near 🧭";
         const renderedDiagnostic = "Message failed: delivery unavailable near 🧭";
-        const gateway = await installMockGateway(currentPage, {
+        const gateway = await installMockGateway(page, {
           sessionKey,
           // Account recovery can replace startup with a scoped history request.
           heldMethods: ["chat.startup", "chat.history", "chat.send"],
@@ -301,21 +290,20 @@ suite.define(() => {
             },
           ],
         });
-        await currentPage.goto(controlUiSessionUrl(suite.server.baseUrl, sessionKey));
+        await page.goto(controlUiSessionUrl(suite.server.baseUrl, sessionKey));
         const startup = await gateway.waitForRequest("chat.startup");
         expect(startup.params).toMatchObject({ sessionKey });
-        const composer = currentPage.locator(".agent-chat__input textarea");
-        const sendButton = currentPage.getByRole("button", { name: "Send message" });
-        const alert = currentPage.getByRole("alert").filter({ hasText: renderedDiagnostic });
+        const composer = page.locator(".agent-chat__input textarea");
+        const sendButton = page.getByRole("button", { name: "Send message" });
+        const alert = page.getByRole("alert").filter({ hasText: renderedDiagnostic });
+        const stop = page.getByRole("button", { name: "Stop generating" });
+        const details = alert.getByLabel("Error details", { exact: true });
         await composer.fill("Try again");
         expect(await sendButton.isEnabled()).toBe(true);
         if (retryTiming === "before history") {
           await sendButton.click();
           await expect.poll(() => composer.inputValue()).toBe("");
-          await currentPage
-            .locator(".chat-queue")
-            .getByText("Try again", { exact: true })
-            .waitFor();
+          await page.locator(".chat-queue").getByText("Try again", { exact: true }).waitFor();
         }
         expect(await gateway.getRequests("chat.send")).toHaveLength(0);
 
@@ -343,10 +331,8 @@ suite.define(() => {
             .waitFor();
           expect(await alert.locator("details").getAttribute("open")).toBeNull();
           await alert.locator("summary").click();
-          await alert.getByLabel("Error details", { exact: true }).waitFor();
-          expect(await alert.getByLabel("Error details", { exact: true }).textContent()).toContain(
-            renderedDiagnostic,
-          );
+          await details.waitFor();
+          expect(await details.textContent()).toContain(renderedDiagnostic);
           await sendButton.click();
         }
         const send = await gateway.waitForRequest("chat.send");
@@ -359,15 +345,15 @@ suite.define(() => {
           await expect.poll(() => alert.count()).toBe(0);
         }
         await gateway.resolveDeferred("chat.send", { runId, status: "started" });
-        await currentPage.getByRole("button", { name: "Stop generating" }).waitFor();
+        await stop.waitFor();
         await expect.poll(() => alert.count()).toBe(0);
         await gateway.emitChatFinal({ sessionKey, runId, text: "Recovery completed." });
-        await currentPage
+        await page
           .locator(".chat-group.assistant")
           .getByText("Recovery completed.", { exact: true })
           .waitFor();
         await expect.poll(() => alert.count()).toBe(0);
-        expect(await currentPage.getByRole("button", { name: "Stop generating" }).count()).toBe(0);
+        expect(await stop.count()).toBe(0);
         expect(await gateway.getRequests("chat.send")).toHaveLength(1);
       });
     },
