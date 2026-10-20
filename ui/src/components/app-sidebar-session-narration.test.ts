@@ -4,11 +4,7 @@ import { GatewaySessionMessageSubscriptionCoordinator } from "../../../packages/
 import { createDeferred } from "../../../test/helpers/promise.js";
 import type { GatewayEventFrame } from "../api/gateway.ts";
 import type { SessionCapability } from "../lib/sessions/index.ts";
-import {
-  browserVisibility,
-  createRunningNarration,
-  runningRow,
-} from "../test-helpers/app-sidebar-session-narration.ts";
+import { browserVisibility, runningRow } from "../test-helpers/app-sidebar-session-narration.ts";
 import {
   createSidebarNarration,
   type SidebarNarrationSyncInput,
@@ -58,12 +54,31 @@ const chatSnapshot = (text: string, fields: Record<string, unknown> = {}) =>
 
 const digest = (text: string) => runEvent("session.narration", { text });
 
-function narrationFixture() {
-  return createRunningNarration({
-    subscribeMessages: vi.fn(() => Promise.resolve({ key: runKey, agentId: null })),
+function messageSource(subscribe = (key: string) => Promise.resolve({ key, agentId: null })) {
+  return {
+    subscribeMessages: vi.fn(subscribe),
     unsubscribeMessages: vi.fn(() => Promise.resolve()),
-  });
+  };
 }
+function startNarration(
+  source: SidebarNarrationSyncInput["source"],
+  fields: Partial<SidebarNarrationSyncInput> = {},
+) {
+  const input: SidebarNarrationSyncInput = {
+    enabled: true,
+    connected: true,
+    connectionIdentity: {},
+    source,
+    openSessionKey: "",
+    rows: [runningRow(runKey)],
+    agentId: "main",
+    ...fields,
+  };
+  const narration = createSidebarNarration();
+  narration.sync(input);
+  return { narration, input };
+}
+const narrationFixture = () => startNarration(messageSource());
 
 function chatFrame(payload: Record<string, unknown>): GatewayEventFrame {
   return runEvent("chat", payload);
@@ -85,29 +100,16 @@ describe("createSidebarNarration", () => {
 
   it("retains pending interests while switching foreground and resets the window on reconnect", async () => {
     const ready = createDeferred();
-    const source = {
-      subscribeMessages: vi.fn(async (key: string) => {
-        await ready.promise;
-        return { key, agentId: null };
-      }),
-      unsubscribeMessages: vi.fn(() => Promise.resolve()),
-    };
+    const source = messageSource(async (key) => {
+      await ready.promise;
+      return { key, agentId: null };
+    });
     const rows = Array.from({ length: 8 }, (_, index) => ({
       ...runningRow(`agent:main:run-${index}`),
       startedAt: undefined,
       updatedAt: index,
     }));
-    const input: SidebarNarrationSyncInput = {
-      enabled: true,
-      connected: true,
-      connectionIdentity: {},
-      source,
-      rows,
-      openSessionKey: "",
-      agentId: "main",
-    };
-    const narration = createSidebarNarration();
-    narration.sync(input);
+    const { narration, input } = startNarration(source, { rows });
     rows[0]!.updatedAt = 100;
     narration.sync({ ...input, rows: rows.toReversed() });
     expect(source.subscribeMessages).toHaveBeenCalledTimes(6);
@@ -163,19 +165,14 @@ describe("createSidebarNarration", () => {
     };
     const selectedPane = await coordinator.acquire("agent:main:open");
     const outbox = await coordinator.acquire("agent:main:background-0");
-    const narration = createSidebarNarration();
-    const input: SidebarNarrationSyncInput = {
-      enabled: true,
-      connected: true,
+    const { narration, input } = startNarration(source, {
       connectionIdentity: coordinator,
-      source,
-      agentId: "main",
       openSessionKey: selectedPane.key,
       rows: [
         runningRow(selectedPane.key),
         ...Array.from({ length: 8 }, (_, index) => runningRow(`agent:main:background-${index}`)),
       ],
-    };
+    });
     const settleSubscriptions = () =>
       Promise.all(source.subscribeMessages.mock.results.map((result) => result.value));
     const snapshot = (text: string) =>
@@ -185,7 +182,6 @@ describe("createSidebarNarration", () => {
         message: { role: "assistant", content: text },
       });
 
-    narration.sync(input);
     const handles = await settleSubscriptions();
     expect(wireKeys.size).toBe(7);
     narration.handleEvent(snapshot("Before hiding."));
@@ -241,7 +237,7 @@ describe("createSidebarNarration", () => {
           Promise.resolve(),
         ),
       };
-      const { narration, input } = createRunningNarration(source);
+      const { narration, input } = startNarration(source);
       if (boundary === "visibility") {
         visibility("hidden");
         visibility("visible");
@@ -279,25 +275,14 @@ describe("createSidebarNarration", () => {
 
   it("defers initial hidden subscriptions and honors disabled intent on return", async () => {
     const visibility = browserVisibility("hidden");
-    const source = {
-      subscribeMessages: vi.fn((key: string) => Promise.resolve({ key, agentId: null })),
-      unsubscribeMessages: vi.fn(() => Promise.resolve()),
-    };
-    const { narration } = createRunningNarration(source);
+    const source = messageSource();
+    const { narration, input } = startNarration(source);
     expect(source.subscribeMessages).not.toHaveBeenCalled();
     visibility("visible");
     await Promise.resolve();
     expect(source.subscribeMessages).toHaveBeenCalledOnce();
     visibility("hidden");
-    narration.sync({
-      enabled: false,
-      connected: true,
-      connectionIdentity: {},
-      source,
-      rows: [runningRow(runKey)],
-      openSessionKey: "",
-      agentId: "main",
-    });
+    narration.sync({ ...input, enabled: false, connectionIdentity: {} });
     visibility("visible");
     expect(source.subscribeMessages).toHaveBeenCalledOnce();
     expect(source.unsubscribeMessages).toHaveBeenCalledOnce();
@@ -305,25 +290,15 @@ describe("createSidebarNarration", () => {
   });
 
   it("subscribes only to sessions with a projected active run", async () => {
-    const subscribeMessages = vi.fn((key: string) => Promise.resolve({ key, agentId: null }));
-    const unsubscribeMessages = vi.fn(() => Promise.resolve());
-    const source = { subscribeMessages, unsubscribeMessages };
-    const narration = createSidebarNarration();
+    const source = messageSource();
+    const { subscribeMessages } = source;
     const rows: SidebarRecentSession[] = [
       { ...runningRow("agent:main:stale"), hasActiveRun: false, status: "running" },
       { ...runningRow("agent:main:failed"), hasActiveRun: false, status: "failed" },
       runningRow("agent:main:active"),
     ];
 
-    narration.sync({
-      enabled: true,
-      connected: true,
-      connectionIdentity: {},
-      source,
-      openSessionKey: "",
-      rows,
-      agentId: "main",
-    });
+    const { narration } = startNarration(source, { rows });
     await Promise.resolve();
 
     expect(subscribeMessages).toHaveBeenCalledTimes(1);
