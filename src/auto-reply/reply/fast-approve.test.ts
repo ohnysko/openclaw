@@ -51,15 +51,21 @@ describe("tryFastApproveFromMessage", () => {
     });
   });
 
-  it("delegates an external text /approve before session admission", async () => {
-    const ctx = approvalContext({ BodyForCommands: "/approve exec-1 allow-once" });
-
+  it.each([true, false])("uses canonical approval text (external=%s)", async (external) => {
+    const ctx = approvalContext(
+      external
+        ? { BodyForCommands: command }
+        : { Body: "[Replying to an approval prompt]\nquoted approval text" },
+    );
     await expect(
-      approve(ctx, { agentId: "main", sessionKey: "agent:main:imessage:direct:peer" }),
+      approve(
+        ctx,
+        external ? { agentId: "main", sessionKey: "agent:main:imessage:direct:peer" } : {},
+      ),
     ).resolves.toEqual({ handled: true, reply: { text: "Approval submitted." } });
     expectDelegated({
-      commandBodyNormalized: "/approve exec-1 allow-once",
-      isAuthorizedSender: true,
+      commandBodyNormalized: command,
+      ...(external ? { isAuthorizedSender: true } : {}),
     });
   });
 
@@ -82,16 +88,6 @@ describe("tryFastApproveFromMessage", () => {
 
     await expect(approve(ctx, { cfg })).resolves.toEqual({ handled: false });
     expect(handleApproveCommandFromContextMock).not.toHaveBeenCalled();
-  });
-
-  it("uses the canonical command text instead of iMessage reply context", async () => {
-    const ctx = approvalContext({ Body: "[Replying to an approval prompt]\nquoted approval text" });
-
-    await expect(approve(ctx)).resolves.toEqual({
-      handled: true,
-      reply: { text: "Approval submitted." },
-    });
-    expectDelegated({ commandBodyNormalized: "/approve exec-1 allow-once" });
   });
 
   it("does not promote a quoted approval command from an arbitrary message line", async () => {

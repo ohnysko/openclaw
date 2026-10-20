@@ -39,11 +39,8 @@ export function registerPreparedSettlementTests() {
         dispatcher,
         replyOptions: { onBlockReplyQueued },
         replyResolver: async (_ctx, opts) => {
-          const plan = expectDefined(
-            createStructuredOutboundPayloadPlan([payload])[0],
-            "prepared block",
-          );
-          await opts?.onPreparedBlockReply?.(plan);
+          const [plan] = createStructuredOutboundPayloadPlan([payload]);
+          await opts?.onPreparedBlockReply?.(expectDefined(plan, "prepared block"));
           return payload;
         },
       });
@@ -81,18 +78,15 @@ export function registerPreparedSettlementTests() {
       ctx,
       cfg: emptyConfig,
       dispatcher,
-      replyResolver: vi.fn(async (_ctx, opts) => {
+      replyResolver: async (_ctx, opts) => {
         await opts?.onBlockReply?.({ text: "private block" });
         return { text: "private reply" };
-      }),
+      },
     });
     dispatcher.markComplete();
     await dispatcher.waitForIdle();
 
-    expect(result).toMatchObject({
-      queuedFinal: false,
-      counts: { tool: 0, block: 0, final: 0 },
-    });
+    expect(result).toMatchObject({ queuedFinal: false, counts: { tool: 0, block: 0, final: 0 } });
     expect(result).not.toHaveProperty("noVisibleReplyFallbackEligible");
     expect(result).not.toHaveProperty("noVisibleReplyFallbackDelivered");
     expect(transformReplyPayload).toHaveBeenCalledTimes(2);

@@ -1,10 +1,9 @@
-import { vi } from "vitest";
 import { prepareAgentRunTerminalReply } from "../../agents/agent-run-terminal-reply.js";
 import type { ReplyPayload } from "../types.js";
 import type { SettledAgentTurn } from "./agent-runner-execution.types.js";
 import type { resolveFollowupDeliveryDecision } from "./followup-delivery.js";
 import type { AdmittedFollowupTurn } from "./reply-agent-turn-preparation.js";
-import { createMockReplyOperation } from "./test-helpers.js";
+import { createMockReplyOperation, createMockTypingController } from "./test-helpers.js";
 
 export function createTurn(overrides: Partial<AdmittedFollowupTurn> = {}): AdmittedFollowupTurn {
   return {
@@ -31,12 +30,7 @@ export function createTurn(overrides: Partial<AdmittedFollowupTurn> = {}): Admit
     },
     operation: createMockReplyOperation().replyOperation,
     config: {},
-    session: {
-      kind: "session",
-      key: "main",
-      current: () => undefined,
-      publish: () => undefined,
-    },
+    session: { kind: "session", key: "main", current: () => undefined, publish: () => undefined },
     sendPolicy: "allow",
     preflightCompactionApplied: false,
     ...overrides,
@@ -92,15 +86,6 @@ export function createAccounting(
 export const createDefaults = (onBlockReply: (payload: ReplyPayload) => Promise<void>) => ({
   defaultModel: "claude",
   typingMode: "never" as const,
-  typing: {
-    onReplyStart: vi.fn(async () => {}),
-    startTypingLoop: vi.fn(async () => {}),
-    startTypingOnText: vi.fn(async () => {}),
-    refreshTypingTtl: vi.fn(),
-    isActive: vi.fn(() => false),
-    markRunComplete: vi.fn(),
-    markDispatchIdle: vi.fn(),
-    cleanup: vi.fn(),
-  },
+  typing: createMockTypingController(),
   opts: { onBlockReply },
 });

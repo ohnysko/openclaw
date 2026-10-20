@@ -17,8 +17,8 @@ function resolve(
 const answer = "The answer remains unchanged.";
 const sideReply = (question: string, text: string) => `BTW\nQuestion: ${question}\n\n${text}`;
 
-function slackTarget(text: string, threadId = "111.000") {
-  return { tool: "slack", provider: "slack", to: "channel:C1", threadId, text };
+function slackTarget(text: string) {
+  return { tool: "slack", provider: "slack", to: "channel:C1", threadId: "111.000", text };
 }
 
 describe("resolveFollowupDeliveryPayloads", () => {
@@ -75,30 +75,12 @@ describe("resolveFollowupDeliveryPayloads", () => {
   });
 
   it.each([
-    {
-      label: "new question with an already-sent answer",
-      text: answer,
-      question: "What about the new case?",
-      sentText: answer,
-      duplicate: false,
-    },
-    {
-      label: "already-rendered short answer",
-      text: "323",
-      question: "What is 17 * 19?",
-      sentText: sideReply("What is 17 * 19?", "323"),
-      duplicate: true,
-    },
-    {
-      label: "different questions sharing the same long answer",
-      text: answer,
-      question: "What about the second case?",
-      sentText: sideReply("What about the first case?", answer),
-      duplicate: false,
-    },
-  ])(
-    "dedupes the visible side-question reply: $label",
-    ({ text, question, sentText, duplicate }) => {
+    [answer, "What about the new case?", answer, false],
+    ["323", "What is 17 * 19?", sideReply("What is 17 * 19?", "323"), true],
+    [answer, "What about the second case?", sideReply("What about the first case?", answer), false],
+  ] as const)(
+    "dedupes side-question %s for %s against %s (duplicate=%s)",
+    (text, question, sentText, duplicate) => {
       const payload = { text, btw: { question } };
       const delivered = vi.fn();
       expect(
