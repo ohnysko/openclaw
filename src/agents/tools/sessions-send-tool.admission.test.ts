@@ -80,6 +80,72 @@ const config = {
   tools: { sessions: { visibility: "all" }, agentToAgent: { enabled: true } },
 } satisfies OpenClawConfig;
 
+type GatewayRequest = Parameters<AgentToolGatewayRequestCaller>[0];
+function createTool(options: Parameters<typeof createSessionsSendTool>[0] = {}) {
+  return createSessionsSendTool({
+    agentSessionKey: requesterSessionKey,
+    config,
+    idempotencyKey: runId,
+    ...options,
+  });
+}
+function putSession(sessionKey: string, entry: Parameters<typeof replaceSessionEntry>[1]) {
+  return replaceSessionEntry({ agentId: "main", sessionKey }, entry);
+}
+function interceptGateway(callGateway: AgentToolGatewayRequestCaller) {
+  const gateway = vi
+    .spyOn(inProcessGateway, "callAgentToolGatewayRequest")
+    .mockImplementation(callGateway);
+  const mutation = vi
+    .spyOn(sessionsSendDelivery, "callSessionsSendGateway")
+    .mockImplementation(callGateway);
+  return () => {
+    gateway.mockRestore();
+    mutation.mockRestore();
+  };
+}
+function inOperatorScope<T>(
+  context: ReturnType<typeof createContext>,
+  owner: ReturnType<typeof createOperatorClient>,
+  source: ReturnType<typeof captureGatewayDeviceRevocation>,
+  work: () => Promise<T>,
+) {
+  return withPluginRuntimeGatewayRequestScope(
+    {
+      client: owner,
+      context,
+      isWebchatConnect: () => false,
+      hasCurrentClientAuthority: source.isCurrent,
+    },
+    () =>
+      withOperatorToolGatewayAuthority(
+        {
+          authenticatedUserProfile: owner.authenticatedUserProfile,
+          scopes: owner.connect.scopes ?? [],
+        },
+        work,
+      ),
+  );
+}
+async function completeRun(request: GatewayRequest, sessionKey: string, sessionId: string) {
+  if (!isRecord(request.params) || typeof request.params.runId !== "string") {
+    throw new Error("Expected agent wait run ID");
+  }
+  await appendTranscriptMessage(
+    { agentId: "main", sessionKey, sessionId },
+    {
+      message: {
+        role: "assistant",
+        __openclaw: { runId: request.params.runId },
+        phase: "final_answer",
+        stopReason: "stop",
+        content: [{ type: "text", text: "Task complete" }],
+      },
+    },
+  );
+  return { status: "ok", terminalReply: { disposition: "visible", text: "Task complete" } };
+}
+
 async function trackActualReplyFlow() {
   const { runSessionsSendA2AFlow: runActualFlow } = await vi.importActual<
     typeof import("./sessions-send-tool.a2a.js")
@@ -110,10 +176,7 @@ describe("sessions_send dispatch admission", () => {
       [requesterSessionKey, "requester-session"],
       [targetSessionKey, "target-session"],
     ] as const) {
-      await replaceSessionEntry(
-        { agentId: "main", sessionKey },
-        { sessionId, updatedAt: Date.now() },
-      );
+      await putSession(sessionKey, { sessionId, updatedAt: Date.now() });
     }
   });
 
@@ -127,12 +190,7 @@ describe("sessions_send dispatch admission", () => {
   it("applies peer preferences to new notifications without revoking accepted events", async () => {
     const callGateway = vi.fn();
     callGateway.mockResolvedValue({ key: targetSessionKey, agentId: "main" });
-    const tool = createSessionsSendTool({
-      agentSessionKey: requesterSessionKey,
-      config,
-      callGateway,
-      idempotencyKey: runId,
-    });
+    const tool = createTool({ callGateway });
     const first = await tool.execute("notify-peer", {
       sessionKey: targetSessionKey,
       message: "accepted notice",
@@ -143,10 +201,11 @@ describe("sessions_send dispatch admission", () => {
       durability: "process",
       runStarted: false,
     });
-    await replaceSessionEntry(
-      { agentId: "main", sessionKey: targetSessionKey },
-      { sessionId: "target-session", updatedAt: 2, communication: { receive: "never" } },
-    );
+    await putSession(targetSessionKey, {
+      sessionId: "target-session",
+      updatedAt: 2,
+      communication: { receive: "never" },
+    });
     expect(peekSystemEvents(targetSessionKey)).toHaveLength(1);
     const second = await tool.execute("notify-denied", {
       sessionKey: targetSessionKey,
@@ -171,33 +230,29 @@ describe("sessions_send dispatch admission", () => {
       setRuntimeConfigSnapshot(currentConfig);
       let admitted = false;
       const callGateway = vi.fn();
-      callGateway.mockImplementation(
-        async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-          if (request.method === "sessions.resolve") {
-            return { key: targetSessionKey, agentId: "main" };
-          }
-          if (request.method === "agent") {
-            currentConfig.session!.communication![direction] = "never";
-            setRuntimeConfigSnapshot(currentConfig);
-            request.assertDispatchCurrent?.();
-            request.sessionMutationCommitGuard?.();
-            admitted = true;
-            return { runId, status: "accepted" };
-          }
-          throw new Error(`Unexpected Gateway method: ${request.method}`);
+      callGateway.mockImplementation(async (request: GatewayRequest) => {
+        if (request.method === "sessions.resolve") {
+          return { key: targetSessionKey, agentId: "main" };
+        }
+        if (request.method === "agent") {
+          currentConfig.session!.communication![direction] = "never";
+          setRuntimeConfigSnapshot(currentConfig);
+          request.assertDispatchCurrent?.();
+          request.sessionMutationCommitGuard?.();
+          admitted = true;
+          return { runId, status: "accepted" };
+        }
+        throw new Error(`Unexpected Gateway method: ${request.method}`);
+      });
+      const result = await createTool({ config: currentConfig, callGateway }).execute(
+        "revoked-default",
+        {
+          sessionKey: targetSessionKey,
+          message: "Must not enter the target after policy revocation",
+          mode: "followup",
+          timeoutSeconds: 0,
         },
       );
-      const result = await createSessionsSendTool({
-        agentSessionKey: requesterSessionKey,
-        config: currentConfig,
-        callGateway,
-        idempotencyKey: runId,
-      }).execute("revoked-default", {
-        sessionKey: targetSessionKey,
-        message: "Must not enter the target after policy revocation",
-        mode: "followup",
-        timeoutSeconds: 0,
-      });
       expect(admitted).toBe(false);
       expect(result.details).toMatchObject({
         status: "error",
@@ -346,43 +401,25 @@ describe("sessions_send dispatch admission", () => {
       .mockImplementation(gateway);
     const pending = (async () => {
       await awaitGateBeforeSettlement(nativeReady.promise, native, "Native owner was not prepared");
-      return await withPluginRuntimeGatewayRequestScope(
-        {
-          client: owner,
-          context,
-          isWebchatConnect: () => false,
-          hasCurrentClientAuthority: source.isCurrent,
-        },
-        () =>
-          withOperatorToolGatewayAuthority(
-            {
-              authenticatedUserProfile: owner.authenticatedUserProfile,
-              scopes: owner.connect.scopes ?? [],
-            },
-            () =>
-              withGatewayToolCallerIdentity(
-                {
-                  agentId: "main",
-                  sessionKey: requesterSessionKey,
-                  requesterOrigin,
-                  operatorAuthority:
-                    getPluginRuntimeGatewayRequestScope()?.client?.internal?.operatorRunAuthority,
-                  gatewayContextResolver: () => context,
-                  receiptAuthority: () => true,
-                },
-                () =>
-                  createSessionsSendTool({
-                    agentSessionKey: requesterSessionKey,
-                    config,
-                    idempotencyKey: runId,
-                  }).execute("steer-physical-owner", {
-                    sessionKey: targetSessionKey,
-                    message: "Continue with this guidance",
-                    mode: "steer",
-                    timeoutSeconds: 0,
-                  }),
-              ),
-          ),
+      return await inOperatorScope(context, owner, source, () =>
+        withGatewayToolCallerIdentity(
+          {
+            agentId: "main",
+            sessionKey: requesterSessionKey,
+            requesterOrigin,
+            operatorAuthority:
+              getPluginRuntimeGatewayRequestScope()?.client?.internal?.operatorRunAuthority,
+            gatewayContextResolver: () => context,
+            receiptAuthority: () => true,
+          },
+          () =>
+            createTool({}).execute("steer-physical-owner", {
+              sessionKey: targetSessionKey,
+              message: "Continue with this guidance",
+              mode: "steer",
+              timeoutSeconds: 0,
+            }),
+        ),
       );
     })();
     try {
@@ -439,28 +476,26 @@ describe("sessions_send dispatch admission", () => {
       config,
     );
     const callGateway = vi.fn();
-    callGateway.mockImplementation(
-      async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-        if (request.method === "sessions.resolve") {
-          return { key: targetSessionKey, agentId: "main" };
-        }
-        if (request.method !== "agent") {
-          throw new Error(`Unexpected Gateway method: ${request.method}`);
-        }
-        expect(
-          readSessionSendDeliveryAdmission({
-            agentId: "main",
-            sessionKey: targetSessionKey,
-            sessionId: "target-session",
-            runId,
-          })?.delivery,
-        ).toMatchObject({
-          source: { sessionKey: requesterSessionKey, sessionId: "requester-session" },
-          target: { sessionKey: targetSessionKey, sessionId: "target-session" },
-        });
-        return { runId, status: "accepted" };
-      },
-    );
+    callGateway.mockImplementation(async (request: GatewayRequest) => {
+      if (request.method === "sessions.resolve") {
+        return { key: targetSessionKey, agentId: "main" };
+      }
+      if (request.method !== "agent") {
+        throw new Error(`Unexpected Gateway method: ${request.method}`);
+      }
+      expect(
+        readSessionSendDeliveryAdmission({
+          agentId: "main",
+          sessionKey: targetSessionKey,
+          sessionId: "target-session",
+          runId,
+        })?.delivery,
+      ).toMatchObject({
+        source: { sessionKey: requesterSessionKey, sessionId: "requester-session" },
+        target: { sessionKey: targetSessionKey, sessionId: "target-session" },
+      });
+      return { runId, status: "accepted" };
+    });
     try {
       const result = await withGatewayToolCallerIdentity(
         {
@@ -469,12 +504,7 @@ describe("sessions_send dispatch admission", () => {
           receiptAuthority: () => true,
         },
         () =>
-          createSessionsSendTool({
-            agentSessionKey: requesterSessionKey,
-            config,
-            callGateway,
-            idempotencyKey: runId,
-          }).execute("durable-steer-fallback", {
+          createTool({ callGateway }).execute("durable-steer-fallback", {
             sessionKey: targetSessionKey,
             message: "Save this guidance before acknowledging it",
             mode: "steer",
@@ -494,14 +524,12 @@ describe("sessions_send dispatch admission", () => {
   const callerKeys = [requesterSessionKey, "agent:main:telegram:direct:peer-1"];
   it.each(callerKeys)("retains accepted reply source (%s)", async (sourceKey) => {
     if (sourceKey !== requesterSessionKey) {
-      await replaceSessionEntry(
-        { agentId: "main", sessionKey: sourceKey },
-        { sessionId: "key-only-requester", updatedAt: 1 },
-      );
-      await replaceSessionEntry(
-        { agentId: "main", sessionKey: targetSessionKey },
-        { sessionId: "target-session", updatedAt: 1, spawnedBy: sourceKey },
-      );
+      await putSession(sourceKey, { sessionId: "key-only-requester", updatedAt: 1 });
+      await putSession(targetSessionKey, {
+        sessionId: "target-session",
+        updatedAt: 1,
+        spawnedBy: sourceKey,
+      });
     }
     const context = createContext();
     // The admitted Gateway owns one current snapshot, not the factory's fresh {} per read.
@@ -531,82 +559,63 @@ describe("sessions_send dispatch admission", () => {
       });
     vi.mocked(runSessionsSendA2AFlow).mockImplementationOnce(() => finish.promise);
     const callGateway = vi.fn();
-    callGateway.mockImplementation(
-      async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-        if (request.method === "sessions.resolve") {
-          return { key: targetSessionKey, agentId: "main" };
+    callGateway.mockImplementation(async (request: GatewayRequest) => {
+      if (request.method === "sessions.resolve") {
+        return { key: targetSessionKey, agentId: "main" };
+      }
+      if (request.method === "sessions.list") {
+        return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
+      }
+      if (request.method === "agent") {
+        const followup = readFollowupRequest(runId, targetSessionKey);
+        if (followup) {
+          completion = SessionFollowupCompletion.bind(followup);
+          followup.completion = completion;
+          completion.markAccepted(runId);
+          await completion.settle(runId, {
+            status: "ok",
+            replyText: "Task complete",
+            terminalReply: { disposition: "visible", text: "Task complete" },
+          });
+          completion.finishExecution(runId);
         }
-        if (request.method === "sessions.list") {
-          return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
-        }
-        if (request.method === "agent") {
-          const followup = readFollowupRequest(runId, targetSessionKey);
-          if (followup) {
-            completion = SessionFollowupCompletion.bind(followup);
-            followup.completion = completion;
-            completion.markAccepted(runId);
-            await completion.settle(runId, {
-              status: "ok",
-              replyText: "Task complete",
-              terminalReply: { disposition: "visible", text: "Task complete" },
-            });
-            completion.finishExecution(runId);
-          }
-          return { runId, status: "accepted" };
-        }
-        throw new Error(`Unexpected Gateway method: ${request.method}`);
-      },
-    );
+        return { runId, status: "accepted" };
+      }
+      throw new Error(`Unexpected Gateway method: ${request.method}`);
+    });
     try {
-      const pending = withPluginRuntimeGatewayRequestScope(
-        {
-          client: owner,
-          context,
-          isWebchatConnect: () => false,
-          hasCurrentClientAuthority: source.isCurrent,
-        },
-        () =>
-          withOperatorToolGatewayAuthority(
+      const pending = inOperatorScope(context, owner, source, async () => {
+        const participants = createReplyTurnParticipants({
+          operatorAuthority:
+            getPluginRuntimeGatewayRequestScope()?.client?.internal?.operatorRunAuthority,
+        });
+        try {
+          return await withGatewayToolCallerIdentity(
             {
-              authenticatedUserProfile: owner.authenticatedUserProfile,
-              scopes: owner.connect.scopes ?? [],
+              agentId: "main",
+              sessionKey: sourceKey,
+              personalToolParticipants: participants,
+              gatewayContextResolver: () => context,
+              receiptAuthority: () => true,
             },
-            async () => {
-              const participants = createReplyTurnParticipants({
-                operatorAuthority:
-                  getPluginRuntimeGatewayRequestScope()?.client?.internal?.operatorRunAuthority,
-              });
-              try {
-                return await withGatewayToolCallerIdentity(
-                  {
-                    agentId: "main",
-                    sessionKey: sourceKey,
-                    personalToolParticipants: participants,
-                    gatewayContextResolver: () => context,
-                    receiptAuthority: () => true,
-                  },
-                  () => {
-                    invocationStarted = true;
-                    return createSessionsSendTool({
-                      agentSessionKey: sourceKey,
-                      config,
-                      callGateway,
-                      idempotencyKey: runId,
-                    }).execute("send-followup", {
-                      sessionKey: targetSessionKey,
-                      message: "Continue the task",
-                      mode: "followup",
-                      timeoutSeconds: 0,
-                    });
-                  },
-                );
-              } finally {
-                returned = true;
-                participants.close();
-              }
+            () => {
+              invocationStarted = true;
+              return createTool({ agentSessionKey: sourceKey, callGateway }).execute(
+                "send-followup",
+                {
+                  sessionKey: targetSessionKey,
+                  message: "Continue the task",
+                  mode: "followup",
+                  timeoutSeconds: 0,
+                },
+              );
             },
-          ),
-      );
+          );
+        } finally {
+          returned = true;
+          participants.close();
+        }
+      });
       await awaitGateBeforeSettlement(
         capturing.promise,
         pending.then((result) => {
@@ -667,74 +676,51 @@ describe("sessions_send dispatch admission", () => {
     async ({ name, accountId, sourceKey, threadId }) => {
       let completion: Record<string, unknown> | undefined;
       const settled = await trackActualReplyFlow();
-      await replaceSessionEntry(
-        { agentId: "main", sessionKey: sourceKey },
-        { sessionId: "requester-session", updatedAt: 1, lifecycleRevision: "original-generation" },
-      );
-      await replaceSessionEntry(
-        { agentId: "main", sessionKey: targetSessionKey },
-        { sessionId: "target-session", updatedAt: 1, spawnedBy: sourceKey },
-      );
+      await putSession(sourceKey, {
+        sessionId: "requester-session",
+        updatedAt: 1,
+        lifecycleRevision: "original-generation",
+      });
+      await putSession(targetSessionKey, {
+        sessionId: "target-session",
+        updatedAt: 1,
+        spawnedBy: sourceKey,
+      });
       const callGateway = vi.fn();
-      callGateway.mockImplementation(
-        async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-          if (request.method === "sessions.resolve") {
-            return { key: targetSessionKey, agentId: "main" };
+      callGateway.mockImplementation(async (request: GatewayRequest) => {
+        if (request.method === "sessions.resolve") {
+          return { key: targetSessionKey, agentId: "main" };
+        }
+        if (request.method === "sessions.list") {
+          return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
+        }
+        if (request.method === "agent.wait") {
+          return completeRun(request, targetSessionKey, "target-session");
+        }
+        if (request.method === "agent") {
+          if (!isRecord(request.params)) {
+            throw new Error("Expected agent request parameters");
           }
-          if (request.method === "sessions.list") {
-            return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
-          }
-          if (request.method === "agent.wait") {
-            if (!isRecord(request.params) || typeof request.params.runId !== "string") {
-              throw new Error("Expected agent wait run ID");
-            }
-            await appendTranscriptMessage(
-              { agentId: "main", sessionKey: targetSessionKey, sessionId: "target-session" },
+          if (request.params.sessionKey === targetSessionKey) {
+            await replaceSessionEntry(
+              { agentId: "main", sessionKey: sourceKey },
               {
-                message: {
-                  role: "assistant",
-                  __openclaw: { runId: request.params.runId },
-                  phase: "final_answer",
-                  stopReason: "stop",
-                  content: [{ type: "text", text: "Task complete" }],
-                },
+                sessionId: "requester-session",
+                updatedAt: 2,
+                lifecycleRevision: "original-generation",
+                delivery: normalizeSessionDeliveryState({
+                  context: { channel: "telegram", accountId: "other", to: "later-recipient" },
+                }),
               },
             );
-            return {
-              status: "ok",
-              terminalReply: { disposition: "visible", text: "Task complete" },
-            };
+            return { runId };
           }
-          if (request.method === "agent") {
-            if (!isRecord(request.params)) {
-              throw new Error("Expected agent request parameters");
-            }
-            if (request.params.sessionKey === targetSessionKey) {
-              await replaceSessionEntry(
-                { agentId: "main", sessionKey: sourceKey },
-                {
-                  sessionId: "requester-session",
-                  updatedAt: 2,
-                  lifecycleRevision: "original-generation",
-                  delivery: normalizeSessionDeliveryState({
-                    context: { channel: "telegram", accountId: "other", to: "later-recipient" },
-                  }),
-                },
-              );
-              return { runId };
-            }
-            completion = request.params;
-            return { runId: "completion-run" };
-          }
-          throw new Error(`Unexpected Gateway method: ${request.method}`);
-        },
-      );
-      const gateway = vi
-        .spyOn(inProcessGateway, "callAgentToolGatewayRequest")
-        .mockImplementation(callGateway);
-      const mutation = vi
-        .spyOn(sessionsSendDelivery, "callSessionsSendGateway")
-        .mockImplementation(callGateway);
+          completion = request.params;
+          return { runId: "completion-run" };
+        }
+        throw new Error(`Unexpected Gateway method: ${request.method}`);
+      });
+      const restoreGateway = interceptGateway(callGateway);
       // This routing fixture supplies a run-scoped Gateway, not a native task
       // receipt. Keep its real A2A/route assertions at that explicit boundary;
       // retained core authority and custody have separate owner/integration proof.
@@ -788,8 +774,7 @@ describe("sessions_send dispatch admission", () => {
         });
       } finally {
         prepareFollowup.mockRestore();
-        gateway.mockRestore();
-        mutation.mockRestore();
+        restoreGateway();
       }
     },
   );
@@ -804,63 +789,35 @@ describe("sessions_send dispatch admission", () => {
       updatedAt: 1,
       lifecycleRevision: "original-generation",
     };
-    await replaceSessionEntry(
-      { agentId: "main", sessionKey },
-      { ...entry, delivery: normalizeSessionDeliveryState({ context: originalRoute }) },
-    );
+    await putSession(sessionKey, {
+      ...entry,
+      delivery: normalizeSessionDeliveryState({ context: originalRoute }),
+    });
     const callGateway = vi.fn();
-    callGateway.mockImplementation(
-      async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-        switch (request.method) {
-          case "sessions.resolve":
-            return { key: sessionKey, agentId: "main" };
-          case "sessions.list":
-            return {
-              sessions: [{ key: sessionKey, agentId: "main", deliveryContext: laterRoute }],
-            };
-          case "agent":
-            await replaceSessionEntry(
-              { agentId: "main", sessionKey },
-              {
-                ...entry,
-                updatedAt: 2,
-                delivery: normalizeSessionDeliveryState({ context: laterRoute }),
-              },
-            );
-            return { runId };
-          case "agent.wait":
-            if (!isRecord(request.params) || typeof request.params.runId !== "string") {
-              throw new Error("Expected agent wait run ID");
-            }
-            await appendTranscriptMessage(
-              { agentId: "main", sessionKey, sessionId: entry.sessionId },
-              {
-                message: {
-                  role: "assistant",
-                  __openclaw: { runId: request.params.runId },
-                  phase: "final_answer",
-                  stopReason: "stop",
-                  content: [{ type: "text", text: "Task complete" }],
-                },
-              },
-            );
-            return {
-              status: "ok",
-              terminalReply: { disposition: "visible", text: "Task complete" },
-            };
-          case "send":
-            return { messageId: "final-reply" };
-          default:
-            throw new Error(`Unexpected Gateway method: ${request.method}`);
-        }
-      },
-    );
-    const gateway = vi
-      .spyOn(inProcessGateway, "callAgentToolGatewayRequest")
-      .mockImplementation(callGateway);
-    const mutation = vi
-      .spyOn(sessionsSendDelivery, "callSessionsSendGateway")
-      .mockImplementation(callGateway);
+    callGateway.mockImplementation(async (request: GatewayRequest) => {
+      switch (request.method) {
+        case "sessions.resolve":
+          return { key: sessionKey, agentId: "main" };
+        case "sessions.list":
+          return {
+            sessions: [{ key: sessionKey, agentId: "main", deliveryContext: laterRoute }],
+          };
+        case "agent":
+          await putSession(sessionKey, {
+            ...entry,
+            updatedAt: 2,
+            delivery: normalizeSessionDeliveryState({ context: laterRoute }),
+          });
+          return { runId };
+        case "agent.wait":
+          return completeRun(request, sessionKey, entry.sessionId);
+        case "send":
+          return { messageId: "final-reply" };
+        default:
+          throw new Error(`Unexpected Gateway method: ${request.method}`);
+      }
+    });
+    const restoreGateway = interceptGateway(callGateway);
     try {
       const tool = createOpenClawTools({
         agentSessionKey: sessionKey,
@@ -912,8 +869,7 @@ describe("sessions_send dispatch admission", () => {
       expect(sendParams).toHaveProperty("idempotencyKey", `sessions-send:${runId}`);
       expect(sendParams).not.toHaveProperty("sessionGeneration");
     } finally {
-      gateway.mockRestore();
-      mutation.mockRestore();
+      restoreGateway();
     }
   });
 
@@ -923,35 +879,28 @@ describe("sessions_send dispatch admission", () => {
   ] as const)(
     "does not install a watch or start A2A when admission is $admission (wait $timeoutSeconds)",
     async ({ admission, timeoutSeconds }) => {
-      const requests: Parameters<AgentToolGatewayRequestCaller>[0][] = [];
+      const requests: GatewayRequest[] = [];
       const callGateway = vi.fn();
-      callGateway.mockImplementation(
-        async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-          requests.push(request);
-          if (request.method === "sessions.resolve") {
-            return { key: targetSessionKey, agentId: "main" };
+      callGateway.mockImplementation(async (request: GatewayRequest) => {
+        requests.push(request);
+        if (request.method === "sessions.resolve") {
+          return { key: targetSessionKey, agentId: "main" };
+        }
+        if (request.method === "sessions.list") {
+          return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
+        }
+        if (request.method === "agent") {
+          if (admission === "rejected") {
+            throw new Error("Task admission failed before dispatch");
           }
-          if (request.method === "sessions.list") {
-            return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
-          }
-          if (request.method === "agent") {
-            if (admission === "rejected") {
-              throw new Error("Task admission failed before dispatch");
-            }
-            return { runId, status: "in_flight", admissionPending: true };
-          }
-          if (request.method === "agent.wait") {
-            return { status: "timeout" };
-          }
-          throw new Error(`Unexpected Gateway method: ${request.method}`);
-        },
-      );
-      const tool = createSessionsSendTool({
-        agentSessionKey: requesterSessionKey,
-        config,
-        callGateway,
-        idempotencyKey: runId,
+          return { runId, status: "in_flight", admissionPending: true };
+        }
+        if (request.method === "agent.wait") {
+          return { status: "timeout" };
+        }
+        throw new Error(`Unexpected Gateway method: ${request.method}`);
       });
+      const tool = createTool({ callGateway });
 
       const result = await tool.execute("send-followup", {
         sessionKey: targetSessionKey,

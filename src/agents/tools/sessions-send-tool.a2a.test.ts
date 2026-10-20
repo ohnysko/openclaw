@@ -55,6 +55,27 @@ function firstMockArg(
   return call[0] as Record<string, unknown>;
 }
 
+type FlowOptions = Parameters<typeof runSessionsSendA2AFlow>[0];
+function runFlow(options: Partial<FlowOptions> = {}) {
+  const targetSessionKey = options.targetSessionKey ?? requesterDeliveryGeneration.sessionKey;
+  return runSessionsSendA2AFlow({
+    targetAgentId: "main",
+    runId: "run-test",
+    replyTimeoutMs: 10_000,
+    targetSessionKey,
+    displayKey: targetSessionKey,
+    requesterSessionKey: targetSessionKey,
+    ...options,
+  });
+}
+function visibleReply(text: string) {
+  return {
+    status: "ok" as const,
+    replyText: text,
+    terminalReply: { disposition: "visible" as const, text },
+  };
+}
+
 describe("runSessionsSendA2AFlow reply delivery", () => {
   let gatewayCalls: CallGatewayOptions[];
   let sessionListRows: GatewaySessionListRow[];
@@ -104,30 +125,21 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
   });
 
   it("passes threadId through to gateway send for Telegram forum topics", async () => {
-    await runSessionsSendA2AFlow({
+    await runFlow({
       callGateway: callGatewayMock,
-      runId: "run-test",
-      targetAgentId: "main",
       targetSessionKey: "agent:main:telegram:group:-100123:topic:554",
-      displayKey: "agent:main:telegram:group:-100123:topic:554",
-      requesterSessionKey: "agent:main:telegram:group:-100123:topic:554",
       requesterDeliveryGeneration: {
         ...requesterDeliveryGeneration,
         sessionKey: "agent:main:telegram:group:-100123:topic:554",
       },
-      replyTimeoutMs: 10_000,
-      reply: {
-        status: "ok",
-        replyText: "Worker completed successfully",
-        terminalReply: { disposition: "visible", text: "Worker completed successfully" },
-      },
+      reply: visibleReply("Worker completed successfully"),
     });
 
-    const sendCall = requireGatewayCall("send");
-    const sendParams = sendCall.params as Record<string, unknown>;
-    expect(sendParams.to).toBe("-100123");
-    expect(sendParams.channel).toBe("telegram");
-    expect(sendParams.threadId).toBe("554");
+    expect(requireGatewayCall("send").params).toMatchObject({
+      to: "-100123",
+      channel: "telegram",
+      threadId: "554",
+    });
   });
 
   it.each([
@@ -150,25 +162,17 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
   ])(
     "projects $name into the same-session source delivery contract",
     async ({ reply, expected }) => {
-      await runSessionsSendA2AFlow({
+      await runFlow({
         callGateway: callGatewayMock,
-        runId: "run-test",
         targetAgentId: "orion",
         targetSessionKey: "agent:orion:discord:channel:target-room",
-        displayKey: "agent:orion:discord:channel:target-room",
-        replyTimeoutMs: 10_000,
-        requesterSessionKey: "agent:orion:discord:channel:target-room",
         requesterDeliveryGeneration: {
           ...requesterDeliveryGeneration,
           agentId: "orion",
           sessionKey: "agent:orion:discord:channel:target-room",
         },
         requesterChannel: "discord",
-        reply: {
-          status: "ok",
-          replyText: reply,
-          terminalReply: { disposition: "visible", text: reply },
-        },
+        reply: visibleReply(reply),
       });
 
       const sendParams = requireGatewayCall("send").params as Record<string, unknown>;
@@ -193,14 +197,9 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
       terminalReply: { disposition: "visible", text: "Delayed channel reply" },
     });
 
-    await runSessionsSendA2AFlow({
+    await runFlow({
       callGateway: callGatewayMock,
       requesterDeliveryGeneration,
-      targetAgentId: "main",
-      targetSessionKey: "agent:main:discord:channel:target-room",
-      displayKey: "agent:main:discord:channel:target-room",
-      replyTimeoutMs: 10_000,
-      requesterSessionKey: "agent:main:discord:channel:target-room",
       requesterChannel: "discord",
       runId: "run-delayed-channel",
     });
@@ -209,12 +208,13 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
       runId: "run-delayed-channel",
     });
     expect(runAgentStep).not.toHaveBeenCalled();
-    const sendCall = requireGatewayCall("send");
-    const sendParams = sendCall.params as Record<string, unknown>;
-    expect(sendParams.channel).toBe("discord");
-    expect(sendParams.to).toBe("channel:target-room");
-    expect(sendParams.message).toBe("Delayed channel reply");
-    expect(sendParams.agentId).toBe("main");
+    const sendParams = requireGatewayCall("send").params;
+    expect(sendParams).toMatchObject({
+      channel: "discord",
+      to: "channel:target-room",
+      message: "Delayed channel reply",
+      agentId: "main",
+    });
     expect(sendParams).not.toHaveProperty("sessionKey");
   });
 
@@ -225,12 +225,7 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
       replyText: "HEARTBEAT_OK",
     },
   ])("does not deliver silent completion or the exact heartbeat acknowledgement", async (reply) => {
-    await runSessionsSendA2AFlow({
-      targetAgentId: "main",
-      targetSessionKey: "agent:main:discord:channel:target-room",
-      displayKey: "agent:main:discord:channel:target-room",
-      replyTimeoutMs: 10_000,
-      requesterSessionKey: "agent:main:discord:channel:target-room",
+    await runFlow({
       requesterChannel: "discord",
       runId: "run-silent",
       reply: { status: "ok", ...reply },
@@ -241,38 +236,19 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
   });
 
   it("does not turn a missing original session generation into an unbound direct send", async () => {
-    await runSessionsSendA2AFlow({
-      runId: "run-test",
-      targetAgentId: "main",
+    await runFlow({
       targetSessionKey: requesterDeliveryGeneration.sessionKey,
-      displayKey: requesterDeliveryGeneration.sessionKey,
-      requesterSessionKey: requesterDeliveryGeneration.sessionKey,
       requesterChannel: "discord",
-      replyTimeoutMs: 10_000,
-      reply: {
-        status: "ok",
-        replyText: "Task complete",
-        terminalReply: { disposition: "visible", text: "Task complete" },
-      },
+      reply: visibleReply("Task complete"),
     });
     expect(gatewayCalls.find((call) => call.method === "send")).toBeUndefined();
     expect(runAgentStep).not.toHaveBeenCalled();
   });
 
   it("does not start a turn or send for same-session replies from a different channel", async () => {
-    await runSessionsSendA2AFlow({
-      runId: "run-test",
-      targetAgentId: "main",
-      targetSessionKey: "agent:main:discord:channel:target-room",
-      displayKey: "agent:main:discord:channel:target-room",
-      replyTimeoutMs: 10_000,
-      requesterSessionKey: "agent:main:discord:channel:target-room",
+    await runFlow({
       requesterChannel: "webchat",
-      reply: {
-        status: "ok",
-        replyText: "Substantive channel reply",
-        terminalReply: { disposition: "visible", text: "Substantive channel reply" },
-      },
+      reply: visibleReply("Substantive channel reply"),
     });
 
     expect(runAgentStep).not.toHaveBeenCalled();
@@ -286,13 +262,8 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
       terminalReceipt: deliveredReceipt("run-delivered-source"),
     });
 
-    await runSessionsSendA2AFlow({
+    await runFlow({
       runId: "run-delivered-source",
-      targetAgentId: "main",
-      targetSessionKey: "agent:main:discord:channel:target-room",
-      displayKey: "agent:main:discord:channel:target-room",
-      replyTimeoutMs: 10_000,
-      requesterSessionKey: "agent:main:discord:channel:target-room",
       requesterChannel: "webchat",
     });
 
@@ -307,12 +278,9 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
       terminalReceipt: deliveredReceipt("run-delivered-cross-session-source"),
     });
 
-    await runSessionsSendA2AFlow({
+    await runFlow({
       runId: "run-delivered-cross-session-source",
-      targetAgentId: "main",
       targetSessionKey: "agent:main:webchat:direct:target",
-      displayKey: "agent:main:webchat:direct:target",
-      replyTimeoutMs: 10_000,
       requesterSessionKey: "agent:main:webchat:direct:requester",
       requesterChannel: "webchat",
     });
@@ -337,29 +305,17 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
       sessionListRows = [
         { key: sessionKey, agentId: "main", kind: "direct", classification: "channel" },
       ];
-      await runSessionsSendA2AFlow({
-        runId: "run-test",
+      await runFlow({
         callGateway: callGatewayMock,
         requesterDeliveryGeneration: generation
           ? { ...requesterDeliveryGeneration, sessionKey }
           : undefined,
-        targetAgentId: "main",
         targetSessionKey: sessionKey,
-        displayKey: sessionKey,
-        replyTimeoutMs: 10_000,
-        requesterSessionKey: sessionKey,
         requesterChannel: "qa-channel",
         requesterOrigin: captured
           ? { channel: "qa-channel", to: "dm:alice", accountId: "default" }
           : undefined,
-        reply: {
-          status: "ok",
-          replyText: "Delayed result for a session with no saved route",
-          terminalReply: {
-            disposition: "visible",
-            text: "Delayed result for a session with no saved route",
-          },
-        },
+        reply: visibleReply("Delayed result for a session with no saved route"),
       });
 
       expect(runAgentStep).not.toHaveBeenCalled();
@@ -392,28 +348,19 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
     } satisfies GatewaySessionListRow;
     sessionListRows = [session];
 
-    await runSessionsSendA2AFlow({
+    await runFlow({
       callGateway: callGatewayMock,
-      runId: "run-test",
-      targetAgentId: "main",
       targetSessionKey: session.key,
-      displayKey: session.key,
-      requesterSessionKey: session.key,
       requesterDeliveryGeneration,
-      replyTimeoutMs: 10_000,
-      reply: {
-        status: "ok",
-        replyText: "Worker completed successfully",
-        terminalReply: { disposition: "visible", text: "Worker completed successfully" },
-      },
+      reply: visibleReply("Worker completed successfully"),
     });
 
     requireGatewayCall("sessions.describe");
-    const sendCall = requireGatewayCall("send");
-    const sendParams = sendCall.params as Record<string, unknown>;
-    expect(sendParams.channel).toBe("discord");
-    expect(sendParams.to).toBe("channel:target-room");
-    expect(sendParams.accountId).toBe(accountId);
+    expect(requireGatewayCall("send").params).toMatchObject({
+      channel: "discord",
+      to: "channel:target-room",
+      accountId,
+    });
   });
 
   it("notifies the requester when accepted delivery ends with timeout", async () => {
@@ -424,11 +371,9 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
     };
     agentWaitMock.mockResolvedValueOnce(wait);
 
-    await runSessionsSendA2AFlow({
+    await runFlow({
       targetAgentId: "worker",
       targetSessionKey: "agent:worker:discord:group:dev",
-      displayKey: "agent:worker:discord:group:dev",
-      replyTimeoutMs: 10_000,
       requesterSessionKey: "agent:main:discord:group:req",
       requesterChannel: "discord",
       notifyRequesterOnWaitFailure: true,
@@ -454,12 +399,7 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
       terminalReceipt: deliveredReceipt("run-failed-after-source-reply"),
     });
 
-    await runSessionsSendA2AFlow({
-      targetAgentId: "main",
-      targetSessionKey: "agent:main:discord:channel:target-room",
-      displayKey: "agent:main:discord:channel:target-room",
-      replyTimeoutMs: 10_000,
-      requesterSessionKey: "agent:main:discord:channel:target-room",
+    await runFlow({
       requesterChannel: "webchat",
       notifyRequesterOnWaitFailure: true,
       runId: "run-failed-after-source-reply",
@@ -480,11 +420,9 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
       timeoutPhase: "gateway_draining",
     });
 
-    await runSessionsSendA2AFlow({
+    await runFlow({
       targetAgentId: "worker",
       targetSessionKey: "agent:worker:discord:group:dev",
-      displayKey: "agent:worker:discord:group:dev",
-      replyTimeoutMs: 10_000,
       requesterSessionKey: "agent:main:discord:group:req",
       requesterChannel: "discord",
       notifyRequesterOnWaitFailure: true,
@@ -498,11 +436,9 @@ describe("runSessionsSendA2AFlow reply delivery", () => {
   it("keeps recoverable delayed wait errors silent", async () => {
     agentWaitMock.mockRejectedValueOnce(new Error("gateway closed (1006)"));
 
-    await runSessionsSendA2AFlow({
+    await runFlow({
       targetAgentId: "worker",
       targetSessionKey: "agent:worker:discord:group:dev",
-      displayKey: "agent:worker:discord:group:dev",
-      replyTimeoutMs: 10_000,
       requesterSessionKey: "agent:main:discord:group:req",
       requesterChannel: "discord",
       notifyRequesterOnWaitFailure: true,

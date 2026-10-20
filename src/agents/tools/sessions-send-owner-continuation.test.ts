@@ -107,6 +107,44 @@ vi.mock("../../sessions/session-participant-recording.js", () => ({
 const SESSION = "agent:main:requester";
 const CHILD = "agent:main:subagent:worker";
 const SESSION_ID = `${SESSION}-id`;
+function prepareFollowup(extra: Partial<Parameters<typeof prepareSessionsSendFollowup>[0]> = {}) {
+  return prepareSessionsSendFollowup({
+    runId: "child-followup",
+    requesterTurnRunId: "original",
+    requesterAgentId: "main",
+    requesterSessionKey: SESSION,
+    targetAgentId: "main",
+    targetSessionKey: CHILD,
+    ...extra,
+  });
+}
+function startReply(
+  extra: Pick<
+    Parameters<typeof startSessionsSendReplyFlow>[0],
+    "completion" | "callGateway" | "runId"
+  > &
+    Partial<Parameters<typeof startSessionsSendReplyFlow>[0]>,
+) {
+  return startSessionsSendReplyFlow({
+    skip: false,
+    notifyRequesterOnWaitFailure: true,
+    targetSessionKey: CHILD,
+    targetAgentId: "main",
+    displayKey: CHILD,
+    requesterSessionKey: SESSION,
+    requesterAgentId: "main",
+    replyTimeoutMs: 1000,
+    replyMode: "one-way",
+    ...extra,
+  });
+}
+function visibleReply(text: string) {
+  return {
+    status: "ok" as const,
+    replyText: text,
+    terminalReply: { disposition: "visible" as const, text },
+  };
+}
 async function inRun<T>(runId: string, work: () => Promise<T>) {
   const { operationalRunInstance } = createTestAdmittedRunContext(runId);
   const approvalAuthority = claimAgentRunDelegatedAuthority(operationalRunInstance);
@@ -142,16 +180,7 @@ afterEach(() => {
 describe("child followup requester continuation", () => {
   it("retains one timed-out inline result through busy parent admission and execution", async () => {
     vi.useFakeTimers();
-    const request = await inRun("original", () =>
-      prepareSessionsSendFollowup({
-        runId: "child-followup",
-        requesterTurnRunId: "original",
-        requesterAgentId: "main",
-        requesterSessionKey: SESSION,
-        targetAgentId: "main",
-        targetSessionKey: CHILD,
-      }),
-    );
+    const request = await inRun("original", () => prepareFollowup());
     expect(request).toBeDefined();
     const completion = SessionFollowupCompletion.bind(request!);
     completion.markAccepted(request!.runId);
@@ -187,26 +216,13 @@ describe("child followup requester continuation", () => {
       }),
     );
     try {
-      await startSessionsSendReplyFlow({
+      await startReply({
         completion,
         callGateway: callAgentToolGatewayRequest,
         runId: request!.runId,
-        skip: false,
-        notifyRequesterOnWaitFailure: true,
-        targetSessionKey: CHILD,
-        targetAgentId: "main",
-        displayKey: CHILD,
-        requesterSessionKey: SESSION,
-        requesterAgentId: "main",
         requesterSession: { sessionId: SESSION_ID, lifecycleRevision: "one" },
-        replyTimeoutMs: 1_000,
-        replyMode: "one-way",
       });
-      await completion.settle(request!.runId, {
-        status: "ok",
-        replyText: "Child result",
-        terminalReply: { disposition: "visible", text: "Child result" },
-      });
+      await completion.settle(request!.runId, visibleReply("Child result"));
       completion.finishExecution(request!.runId);
       await entered.promise;
       await vi.advanceTimersByTimeAsync(180_000);
@@ -264,15 +280,7 @@ describe("child followup requester continuation", () => {
     const request: FollowupRequest | undefined = await inRun("original", () =>
       runWithCronCreatorAuthorityCapability(capability, async () => {
         const withRequesterAuthority = bindRequesterYieldCronAuthority("original");
-        return await prepareSessionsSendFollowup({
-          runId: "child-followup",
-          requesterTurnRunId: "original",
-          withRequesterAuthority,
-          requesterAgentId: "main",
-          requesterSessionKey: SESSION,
-          targetAgentId: "main",
-          targetSessionKey: CHILD,
-        });
+        return await prepareFollowup({ withRequesterAuthority });
       }),
     );
     expect(request).toBeDefined();
@@ -296,11 +304,7 @@ describe("child followup requester continuation", () => {
     fixture.wait.mockResolvedValue(
       outcome === "requester failed while pending"
         ? { status: "error", error: "requester processing failed" }
-        : {
-            status: "ok",
-            replyText: "continued",
-            terminalReply: { disposition: "visible", text: "continued" },
-          },
+        : visibleReply("continued"),
     );
     callGateway.mockImplementation(async (rpc) => {
       if (rpc.method !== "agent") {
@@ -356,27 +360,14 @@ describe("child followup requester continuation", () => {
         assertDispatchCurrent: options?.sessionMutationCommitGuard,
       }),
     );
-    await startSessionsSendReplyFlow({
+    await startReply({
       completion,
       callGateway,
       runId: request!.runId,
-      skip: false,
       reply:
         outcome === "child error"
           ? { status: "error", error: "plugin failed" }
-          : {
-              status: "ok",
-              replyText: "ready",
-              terminalReply: { disposition: "visible", text: "ready" },
-            },
-      notifyRequesterOnWaitFailure: true,
-      targetSessionKey: CHILD,
-      targetAgentId: "main",
-      displayKey: CHILD,
-      requesterSessionKey: SESSION,
-      requesterAgentId: "main",
-      replyTimeoutMs: 1000,
-      replyMode: "one-way",
+          : visibleReply("ready"),
     });
     await released.promise;
     if (

@@ -20,6 +20,16 @@ export function registerSessionsSpawnInputTests({
     inProcessCreationMock: Mock;
   };
 }) {
+  const timeoutError = "runTimeoutSeconds must be a non-negative integer";
+  const worktreeError = "Hidden native subagents require worktree=true";
+  const correctedInput = {
+    task: "Review the API change",
+    group: "Reviews",
+    projectGitUrl: "https://github.com/example/project.git",
+    worktreeName: "api-review",
+    worktreeBaseRef: "origin/main",
+  };
+
   it.each([false, true])(
     "keeps collector inputs within the declared spawn contract (placement=%s)",
     (workerPlacement) => {
@@ -38,16 +48,8 @@ export function registerSessionsSpawnInputTests({
     ["invalid completion target", { completionTarget: "channel" }, /completionTarget/],
     ["schema without collect", { outputSchema: { type: "object" } }, "requires collect=true"],
     ["group without collect", { groupId: "swarm:custom" }, "requires collect=true"],
-    [
-      "negative timeout",
-      { runTimeoutSeconds: -1 },
-      "runTimeoutSeconds must be a non-negative integer",
-    ],
-    [
-      "nonnumeric timeout",
-      { runTimeoutSeconds: "not-a-number" },
-      "runTimeoutSeconds must be a non-negative integer",
-    ],
+    ["negative timeout", { runTimeoutSeconds: -1 }, timeoutError],
+    ["nonnumeric timeout", { runTimeoutSeconds: "not-a-number" }, timeoutError],
     [
       "retired timeout alias",
       { timeout_seconds: 2 },
@@ -68,21 +70,9 @@ export function registerSessionsSpawnInputTests({
       { runtime: "acp", projectId: "example", worktree: true },
       'Managed worktree parameters are unavailable with runtime="acp"',
     ],
-    [
-      "hidden project without worktree",
-      { projectId: "example" },
-      "Hidden native subagents require worktree=true",
-    ],
-    [
-      "hidden worktree name without worktree",
-      { worktreeName: "review" },
-      "Hidden native subagents require worktree=true",
-    ],
-    [
-      "hidden worktree base without worktree",
-      { worktreeBaseRef: "origin/main" },
-      "Hidden native subagents require worktree=true",
-    ],
+    ["hidden project without worktree", { projectId: "example" }, worktreeError],
+    ["hidden worktree name without worktree", { worktreeName: "review" }, worktreeError],
+    ["hidden worktree base without worktree", { worktreeBaseRef: "origin/main" }, worktreeError],
     [
       "hidden cloud placement",
       { placement: { kind: "profile", profileId: "build" } },
@@ -113,11 +103,7 @@ export function registerSessionsSpawnInputTests({
     finalizeAgentToolAvailability([tool, createAgentsWaitTool({})]);
     const error = await tool
       .execute("hidden-visible-options", {
-        task: "Review the API change",
-        group: "Reviews",
-        projectGitUrl: "https://github.com/example/project.git",
-        worktreeName: "api-review",
-        worktreeBaseRef: "origin/main",
+        ...correctedInput,
         completionTarget: "parent",
         cleanup: "delete",
         mode: "run",
@@ -147,11 +133,7 @@ export function registerSessionsSpawnInputTests({
     }
     const corrected: unknown = JSON.parse(match[1]);
     expect(corrected).toEqual({
-      task: "Review the API change",
-      group: "Reviews",
-      projectGitUrl: "https://github.com/example/project.git",
-      worktreeName: "api-review",
-      worktreeBaseRef: "origin/main",
+      ...correctedInput,
       worktree: true,
       runtime: "subagent",
       visible: true,

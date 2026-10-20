@@ -24,62 +24,51 @@ export function registerSessionsSpawnCompletionTests({
     label: string,
   ) => Record<string, unknown>;
 }) {
-  it.each([{ name: "quiet", input: { expectsCompletionMessage: false }, expected: false }])(
-    "declares completion policy and forwards $name to hidden, ACP, and visible spawns",
-    async ({ input, expected }) => {
-      registerAcpBackendForTest();
-      await withTestDir({ prefix: "openclaw-spawn-completion-" }, async (dir) => {
-        const callGateway = vi.fn(async () => ({
-          key: "agent:main:dashboard:child",
-          sessionId: "visible-child",
-          runStarted: true,
-          runId: "run-visible",
-        }));
-        const registerRun = vi.fn();
-        const tool = createSessionsSpawnTool({
-          agentSessionKey: "agent:main:main",
-          config: { session: { store: path.join(dir, "sessions.json") } },
-          callGateway: callGateway as never,
-          registerRun,
-          countActiveRuns: () => 0,
-        });
-        expect(tool.parameters).toMatchObject({
-          properties: { expectsCompletionMessage: { type: "boolean" } },
-        });
+  function expectCompletion(mock: Mock, label: string) {
+    const params = mockCallArg(mock, 0, 0, label);
+    expect(params.expectsCompletionMessage).toBe(false);
+    expect(params.completionTarget).toBeUndefined();
+  }
 
-        await tool.execute("hidden", { task: "hidden child", ...input });
-        expect(
-          mockCallArg(hoisted.spawnSubagentDirectMock, 0, 0, "spawnSubagentDirect")
-            .expectsCompletionMessage,
-        ).toBe(expected);
-        expect(
-          mockCallArg(hoisted.spawnSubagentDirectMock, 0, 0, "spawnSubagentDirect")
-            .completionTarget,
-        ).toBeUndefined();
-
-        await tool.execute("acp", {
-          task: "ACP child",
-          runtime: "acp",
-          ...input,
-        });
-        expect(
-          mockCallArg(hoisted.spawnAcpDirectMock, 0, 0, "spawnAcpDirect").expectsCompletionMessage,
-        ).toBe(expected);
-        expect(
-          mockCallArg(hoisted.spawnAcpDirectMock, 0, 0, "spawnAcpDirect").completionTarget,
-        ).toBeUndefined();
-
-        const visible = await tool.execute("visible", {
-          task: "visible child",
-          visible: true,
-          ...input,
-        });
-        expect(visible.details).toMatchObject({ expectsCompletionMessage: expected });
-        expectRegisteredSubagentRun(registerRun, { expectsCompletionMessage: expected });
-        expect(mockCallArg(registerRun, 0, 0, "registerRun").completionTarget).toBeUndefined();
+  it("declares completion policy and forwards quiet to hidden, ACP, and visible spawns", async () => {
+    const input = { expectsCompletionMessage: false };
+    const expected = false;
+    registerAcpBackendForTest();
+    await withTestDir({ prefix: "openclaw-spawn-completion-" }, async (dir) => {
+      const callGateway = vi.fn(async () => ({
+        key: "agent:main:dashboard:child",
+        sessionId: "visible-child",
+        runStarted: true,
+        runId: "run-visible",
+      }));
+      const registerRun = vi.fn();
+      const tool = createSessionsSpawnTool({
+        agentSessionKey: "agent:main:main",
+        config: { session: { store: path.join(dir, "sessions.json") } },
+        callGateway: callGateway as never,
+        registerRun,
+        countActiveRuns: () => 0,
       });
-    },
-  );
+      expect(tool.parameters).toMatchObject({
+        properties: { expectsCompletionMessage: { type: "boolean" } },
+      });
+
+      await tool.execute("hidden", { task: "hidden child", ...input });
+      expectCompletion(hoisted.spawnSubagentDirectMock, "spawnSubagentDirect");
+
+      await tool.execute("acp", { task: "ACP child", runtime: "acp", ...input });
+      expectCompletion(hoisted.spawnAcpDirectMock, "spawnAcpDirect");
+
+      const visible = await tool.execute("visible", {
+        task: "visible child",
+        visible: true,
+        ...input,
+      });
+      expect(visible.details).toMatchObject({ expectsCompletionMessage: expected });
+      expectRegisteredSubagentRun(registerRun, { expectsCompletionMessage: expected });
+      expect(mockCallArg(registerRun, 0, 0, "registerRun").completionTarget).toBeUndefined();
+    });
+  });
 
   it("retains committed child acceptance when the caller loses its result", async () => {
     hoisted.spawnSubagentDirectMock.mockResolvedValueOnce({

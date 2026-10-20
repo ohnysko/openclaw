@@ -7,15 +7,42 @@ export function registerSessionsSpawnVisibleCleanupTests({
 }: {
   createTool: typeof SpawnToolFactory;
 }) {
+  const key = "agent:main:dashboard:child";
+  const receipt = {
+    key,
+    sessionId: "created-child",
+    entry: { lifecycleRevision: "birth-revision" },
+  };
+  async function executeVisible(
+    callGateway: NonNullable<Parameters<typeof createTool>[0]>["callGateway"],
+    options: NonNullable<Parameters<typeof createTool>[0]> = {},
+    id = "visible-failure",
+  ) {
+    return (
+      await createTool({
+        agentSessionKey: "agent:main:main",
+        config: { agents: { entries: { main: {} } } },
+        countActiveRuns: () => 0,
+        callGateway,
+        ...options,
+      }).execute(id, { task: "inspect", visible: true })
+    ).details;
+  }
+  function expectError(details: unknown, error: string) {
+    expect(details).toMatchObject({
+      status: "error",
+      error: expect.stringContaining(error),
+      childSessionKey: key,
+    });
+  }
+
   it.each(["not-started", "missing-run-id", "registration"] as const)(
     "cleans up the created visible session after %s failure",
     async (failure) => {
       const callGateway = vi
         .fn()
         .mockResolvedValueOnce({
-          key: "agent:main:dashboard:child",
-          sessionId: "created-child",
-          entry: { lifecycleRevision: "birth-revision" },
+          ...receipt,
           runStarted: failure !== "not-started",
           ...(failure === "registration" ? { runId: "child-run" } : {}),
           runError: "startup failed",
@@ -24,24 +51,12 @@ export function registerSessionsSpawnVisibleCleanupTests({
       const registerRun = vi.fn(() => {
         throw new Error("registry unavailable");
       });
-      const tool = createTool({
-        agentSessionKey: "agent:main:main",
-        config: { agents: { entries: { main: {} } } },
-        callGateway,
-        registerRun,
-        countActiveRuns: () => 0,
-      });
+      const details = await executeVisible(callGateway, { registerRun });
 
-      const result = await tool.execute("visible-failure", { task: "inspect", visible: true });
-
-      expect(result.details).toMatchObject({
-        status: "error",
-        error: expect.stringContaining("Session removed."),
-        childSessionKey: "agent:main:dashboard:child",
-      });
+      expectError(details, "Session removed.");
       expect(callGateway).toHaveBeenCalledTimes(2);
       expect(callGateway).toHaveBeenNthCalledWith(2, "sessions.delete", {
-        key: "agent:main:dashboard:child",
+        key,
         agentId: "main",
         expectedSessionId: "created-child",
         expectedLifecycleRevision: "birth-revision",
@@ -53,92 +68,69 @@ export function registerSessionsSpawnVisibleCleanupTests({
   );
 
   it.each([
-    {
-      failure: "initial child start",
-      runStarted: false,
-      runId: undefined,
-      runError: {
-        code: "UNAVAILABLE",
-        message: "child chat.send rejected before input admission",
-      },
-      registrationError: undefined,
-      expectedError: "child chat.send rejected before input admission",
-    },
-    {
-      failure: "run registration",
-      runStarted: true,
-      runId: "child-run",
-      runError: undefined,
-      registrationError: "registry unavailable",
-      expectedError: "Session cleanup unconfirmed.",
-    },
-  ] as const)("reports the retained child when $failure and cleanup fail", async (scenario) => {
-    const callGateway = vi
-      .fn()
-      .mockResolvedValueOnce({
-        key: "agent:main:dashboard:child",
-        sessionId: "created-child",
-        entry: { lifecycleRevision: "birth-revision" },
-        runStarted: scenario.runStarted,
-        ...(scenario.runId ? { runId: scenario.runId } : {}),
-        ...(scenario.runError ? { runError: scenario.runError } : {}),
-      })
-      .mockRejectedValueOnce(new Error("lifecycle drain unavailable"));
-    const tool = createTool({
-      agentSessionKey: "agent:main:main",
-      config: { agents: { entries: { main: {} } } },
-      callGateway,
-      ...(scenario.registrationError
-        ? {
-            registerRun: () => {
-              throw new Error(scenario.registrationError);
-            },
-          }
-        : {}),
-      countActiveRuns: () => 0,
-    });
+    [
+      "initial child start",
+      false,
+      undefined,
+      { code: "UNAVAILABLE", message: "child chat.send rejected before input admission" },
+      undefined,
+      "child chat.send rejected before input admission",
+    ],
+    [
+      "run registration",
+      true,
+      "child-run",
+      undefined,
+      "registry unavailable",
+      "Session cleanup unconfirmed.",
+    ],
+  ] as const)(
+    "reports the retained child when %s and cleanup fail",
+    async (_failure, runStarted, runId, runError, registrationError, expectedError) => {
+      const callGateway = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ...receipt,
+          runStarted,
+          ...(runId ? { runId } : {}),
+          ...(runError ? { runError } : {}),
+        })
+        .mockRejectedValueOnce(new Error("lifecycle drain unavailable"));
+      const details = await executeVisible(
+        callGateway,
+        registrationError
+          ? {
+              registerRun: () => {
+                throw new Error(registrationError);
+              },
+            }
+          : {},
+      );
 
-    const result = await tool.execute("visible-failure", { task: "inspect", visible: true });
-
-    expect(result.details).toMatchObject({
-      status: "error",
-      error: expect.stringContaining(scenario.expectedError),
-      childSessionKey: "agent:main:dashboard:child",
-      ...(scenario.runId ? { runId: scenario.runId } : {}),
-    });
-    expect(result.details).toMatchObject({
-      error: expect.stringContaining("Session cleanup unconfirmed."),
-    });
-    expect(callGateway).toHaveBeenCalledTimes(2);
-  });
+      expectError(details, expectedError);
+      if (runId) {
+        expect(details).toMatchObject({ runId });
+      }
+      expect(details).toMatchObject({
+        error: expect.stringContaining("Session cleanup unconfirmed."),
+      });
+      expect(callGateway).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it.each(["sessionId", "lifecycleRevision"] as const)(
     "keeps a failed visible child when its creation receipt omits %s",
     async (missing) => {
       const callGateway = vi.fn().mockResolvedValueOnce({
-        key: "agent:main:dashboard:child",
+        key,
         ...(missing === "sessionId" ? {} : { sessionId: "created-child" }),
         entry: missing === "lifecycleRevision" ? {} : { lifecycleRevision: "birth-revision" },
         runStarted: false,
         runError: "startup failed",
       });
-      const tool = createTool({
-        agentSessionKey: "agent:main:main",
-        config: { agents: { entries: { main: {} } } },
-        callGateway,
-        countActiveRuns: () => 0,
-      });
+      const details = await executeVisible(callGateway, {}, "visible-missing-identity");
 
-      const result = await tool.execute("visible-missing-identity", {
-        task: "inspect",
-        visible: true,
-      });
-
-      expect(result.details).toMatchObject({
-        status: "error",
-        error: expect.stringContaining("Session cleanup unconfirmed."),
-        childSessionKey: "agent:main:dashboard:child",
-      });
+      expectError(details, "Session cleanup unconfirmed.");
       expect(callGateway).toHaveBeenCalledTimes(1);
     },
   );
@@ -147,33 +139,22 @@ export function registerSessionsSpawnVisibleCleanupTests({
     "refuses a started visible run with missing or blank session identity %j",
     async (sessionId) => {
       const callGateway = vi.fn().mockResolvedValueOnce({
-        key: "agent:main:dashboard:child",
+        key,
         sessionId,
         entry: { lifecycleRevision: "birth-revision" },
         runStarted: true,
         runId: "child-run",
       });
       const registerRun = vi.fn();
-      const tool = createTool({
-        agentSessionKey: "agent:main:main",
-        config: { agents: { entries: { main: {} } } },
+      const details = await executeVisible(
         callGateway,
-        registerRun,
-        countActiveRuns: () => 0,
-      });
+        { registerRun },
+        "visible-missing-identity",
+      );
 
-      const result = await tool.execute("visible-missing-identity", {
-        task: "inspect",
-        visible: true,
-      });
-
-      expect(result.details).toMatchObject({
-        status: "error",
-        childSessionKey: "agent:main:dashboard:child",
-        runId: "child-run",
-        error: expect.stringContaining("sessions.create did not return its sessionId"),
-      });
-      expect(result.details).toMatchObject({
+      expectError(details, "sessions.create did not return its sessionId");
+      expect(details).toMatchObject({ runId: "child-run" });
+      expect(details).toMatchObject({
         error: expect.stringContaining("inspect this child session and run before retrying"),
       });
       expect(registerRun).not.toHaveBeenCalled();

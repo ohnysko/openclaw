@@ -88,6 +88,26 @@ function configFor(
 
 const callGateway = vi.fn();
 
+function assistantReply(text: string, id = runId) {
+  return {
+    role: "assistant" as const,
+    __openclaw: { runId: id },
+    content: [{ type: "text" as const, text }],
+  };
+}
+function mockReplyHistory(preview: string, messages: ReturnType<typeof assistantReply>[]) {
+  const transport = callGateway.getMockImplementation()!;
+  callGateway.mockImplementation(async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
+    if (request.method === "agent.wait") {
+      return { runId, status: "ok", terminalReply: { disposition: "visible", text: preview } };
+    }
+    if (request.method === "chat.history") {
+      return { messages };
+    }
+    return await transport(request);
+  });
+}
+
 function gatewayMethods() {
   return callGateway.mock.calls.map(([request]) => request.method);
 }
@@ -134,11 +154,9 @@ describe("sessions_send directed policy at the tool boundary", () => {
         { agentId, sessionKey: key, sessionId },
         {
           message: {
-            role: "assistant",
-            __openclaw: { runId },
+            ...assistantReply(replyText),
             phase: "final_answer",
             stopReason: "stop",
-            content: [{ type: "text", text: replyText }],
           },
         },
       );
@@ -321,35 +339,10 @@ describe("sessions_send directed policy at the tool boundary", () => {
   ])(
     "returns the accepted run's full $name with explicit tool-budget truncation",
     async ({ full, preview }) => {
-      const transport = callGateway.getMockImplementation()!;
-      callGateway.mockImplementation(
-        async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-          if (request.method === "agent.wait") {
-            return {
-              runId,
-              status: "ok",
-              terminalReply: { disposition: "visible", text: preview },
-            };
-          }
-          if (request.method === "chat.history") {
-            return {
-              messages: [
-                {
-                  role: "assistant",
-                  __openclaw: { runId },
-                  content: [{ type: "text", text: full }],
-                },
-                {
-                  role: "assistant",
-                  __openclaw: { runId: "later-run" },
-                  content: [{ type: "text", text: "Unrelated answer" }],
-                },
-              ],
-            };
-          }
-          return await transport(request);
-        },
-      );
+      mockReplyHistory(preview, [
+        assistantReply(full),
+        assistantReply("Unrelated answer", "later-run"),
+      ]);
 
       const result = await send(configFor({ send: ["worker"] }), { agentId: "worker" });
       expect(result.details).toMatchObject({ status: "ok", reply: full });
@@ -380,26 +373,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
 
   it("reports a truncated preview when the accepted run's full reply is unavailable", async () => {
     const preview = `${"a".repeat(4_095)}…`;
-    const transport = callGateway.getMockImplementation()!;
-    callGateway.mockImplementation(
-      async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-        if (request.method === "agent.wait") {
-          return { runId, status: "ok", terminalReply: { disposition: "visible", text: preview } };
-        }
-        if (request.method === "chat.history") {
-          return {
-            messages: [
-              {
-                role: "assistant",
-                __openclaw: { runId: "other-run" },
-                content: [{ type: "text", text: "Unrelated answer" }],
-              },
-            ],
-          };
-        }
-        return await transport(request);
-      },
-    );
+    mockReplyHistory(preview, [assistantReply("Unrelated answer", "other-run")]);
     const result = await send(configFor({ send: ["worker"] }), { agentId: "worker" });
     expect(result.details).toMatchObject({
       status: "ok",
