@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
 import { installMockGateway } from "../test-helpers/control-ui-e2e.ts";
+import { captureUiProof } from "./chat-flow.test-support.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
-import { pollCount, pollAttribute } from "./new-session-page.test-support.ts";
 
 const suite = createControlUiE2eSuite({ name: "command palette composition" });
 
@@ -12,8 +12,15 @@ suite.define(() => {
     it.each(keys)(`respects ${composition} composition ownership for palette %s`, async (key) => {
       await suite.withPage({}, async ({ page }) => {
         const gateway = await installMockGateway(page, {
-          sessions: [],
           methodResponses: {
+            "sessions.list": {
+              cases: [
+                {
+                  match: { search: "東京" },
+                  response: { ts: 1, path: "", count: 0, defaults: {}, sessions: [] },
+                },
+              ],
+            },
             "agents.list": {
               defaultId: "main",
               mainKey: "main",
@@ -32,10 +39,11 @@ suite.define(() => {
         const input = page.locator(".cmd-palette__input");
         await input.fill("東京");
         const results = page.locator(".cmd-palette__results");
-        await pollAttribute(results, "aria-busy").toBe("false");
+        await expect.poll(() => results.getAttribute("aria-busy")).toBe("false");
         await expect
           .poll(() => results.getByRole("option").allTextContents())
           .toEqual([expect.stringContaining("東京 Alpha"), expect.stringContaining("東京 Beta")]);
+        await input.focus();
         const activeId = await input.getAttribute("aria-activedescendant");
         expect(activeId).toBeTruthy();
         expect(await results.locator('[aria-selected="true"]').textContent()).toContain(
@@ -50,7 +58,7 @@ suite.define(() => {
               .poll(() => new URL(page.url()).pathname)
               .toBe("/settings/agents/tokyo-alpha");
           }
-          await pollCount(input).toBe(0);
+          await expect.poll(() => input.count()).toBe(0);
           if (key === "Escape") {
             expect(page.url()).toBe(originalUrl);
           }
@@ -70,16 +78,25 @@ suite.define(() => {
               composed: true,
             });
             element.dispatchEvent(event);
-            return event.defaultPrevented;
+            return {
+              prevented: event.defaultPrevented,
+              isComposing: event.isComposing,
+              keyCode: event.keyCode,
+            };
           },
           { key, composition },
         );
-        expect(dispatched).toBe(false);
+        expect(dispatched.isComposing).toBe(composition === "active");
+        expect(dispatched.keyCode).toBe(composition === "keyCode229" ? 229 : 0);
+        expect(dispatched.prevented).toBe(false);
         expect(await input.isVisible()).toBe(true);
         expect(await input.inputValue()).toBe("東京");
         expect(await input.getAttribute("aria-activedescendant")).toBe(activeId);
         expect(page.url()).toBe(originalUrl);
         expect(await gateway.getRequests("chat.send")).toEqual([]);
+        if (composition === "active" && key === "Enter") {
+          await captureUiProof(suite, page, "palette-composition", "composing-enter.png");
+        }
       });
     });
   }

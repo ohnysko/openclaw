@@ -2,37 +2,13 @@ import type { Locator, Page } from "playwright";
 import { expect } from "vitest";
 import type { ControlUiMockGatewayScenario } from "../test-helpers/control-ui-e2e.ts";
 import { createControlUiSessionRow } from "../test-helpers/control-ui-session-fixtures.ts";
-import { controlUiSessionUrl, installMockGateway } from "./new-session-page.test-support.ts";
+import { controlUiSessionUrl } from "./new-session-page.test-support.ts";
 
 export const foregroundKey = "agent:main:dashboard:palette-foreground";
 export const appearanceKey = "agent:main:dashboard:palette-appearance";
 export const foregroundDraft = "Keep this unsent foreground draft exactly as it is.";
 const caret = 10;
 const workspace = "/workspace/palette-fixture";
-const session = (key: string, label: string, age = 60_000) =>
-  createControlUiSessionRow(key, label, Date.now() - age);
-
-export const button = (scope: Page | Locator, name: string | RegExp) =>
-  scope.getByRole("button", { name, exact: true });
-export const option = (scope: Page | Locator, name: string | RegExp) =>
-  scope.getByRole("option", { name, exact: true });
-export const isFocused = (locator: Locator) =>
-  locator.evaluate((element) => document.activeElement === element);
-
-export function paletteAnchors(palette: Locator) {
-  return palette.evaluate((element) => {
-    const nodes = element.querySelectorAll(
-      '.cmd-palette, .cmd-palette__input, .cmd-palette__create, button[aria-label="New session settings"]',
-    );
-    if (nodes.length !== 4) {
-      throw new Error(`Expected four palette anchors, found ${nodes.length}`);
-    }
-    return Array.from(nodes, (node) => {
-      const { x, y } = node.getBoundingClientRect();
-      return { x, y };
-    });
-  });
-}
 
 export function scenario(
   methodResponses: Record<string, unknown> = {},
@@ -51,8 +27,11 @@ export function scenario(
       "sessions.search",
     ],
     sessions: [
-      session(foregroundKey, "Foreground planning"),
-      session(appearanceKey, "Appearance audit", 120_000),
+      createControlUiSessionRow(foregroundKey, "Foreground planning", Date.now() - 60_000),
+      createControlUiSessionRow(appearanceKey, "Appearance audit", Date.now() - 120_000),
+    ],
+    historyMessages: [
+      { role: "assistant", content: [{ type: "text", text: "The foreground task stays here." }] },
     ],
     methodResponses: {
       "sessions.list": {
@@ -64,7 +43,9 @@ export function scenario(
               path: "",
               defaults: {},
               count: 1,
-              sessions: [session(appearanceKey, "Appearance audit")],
+              sessions: [
+                createControlUiSessionRow(appearanceKey, "Appearance audit", Date.now() - 60_000),
+              ],
             },
           },
         ],
@@ -73,13 +54,22 @@ export function scenario(
         defaultId: "main",
         mainKey: "main",
         scope: "per-sender",
-        agents: ["main", "reviewer"].map((id) => ({
-          id,
-          name: id === "main" ? "Main" : "Reviewer",
-          workspace,
-          workspaceGit: true,
-          model: { primary: "openai/gpt-5.5" },
-        })),
+        agents: [
+          {
+            id: "main",
+            name: "Main",
+            workspace,
+            workspaceGit: true,
+            model: { primary: "openai/gpt-5.5" },
+          },
+          {
+            id: "reviewer",
+            name: "Reviewer",
+            workspace,
+            workspaceGit: true,
+            model: { primary: "openai/gpt-5.5" },
+          },
+        ],
       },
       "agent.identity.get": {
         cases: [
@@ -123,13 +113,10 @@ export async function openFromForeground(page: Page, baseUrl: string) {
   const palette = page.locator("openclaw-command-palette");
   const input = palette.locator(".cmd-palette__input");
   await input.waitFor({ state: "visible" });
-  await expect.poll(() => isFocused(input)).toBe(true);
+  await expect
+    .poll(() => input.evaluate((element) => document.activeElement === element))
+    .toBe(true);
   return { composer, url, palette, input };
-}
-
-export async function openMockPalette(page: Page, baseUrl: string, fixture = scenario()) {
-  const gateway = await installMockGateway(page, fixture);
-  return { gateway, ...(await openFromForeground(page, baseUrl)) };
 }
 
 export async function expectForegroundUnchanged(page: Page, composer: Locator, url: string) {

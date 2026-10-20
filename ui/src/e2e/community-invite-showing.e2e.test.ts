@@ -1,5 +1,8 @@
+import { writeFile } from "node:fs/promises";
+import nodePath from "node:path";
 import { expect, it } from "vitest";
 import { CONTROL_UI_BOOTSTRAP_CONFIG_PATH } from "../../../src/gateway/control-ui-bootstrap-contract.js";
+import { takeControlUiScreenshotFrame } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import {
   controlUiSessionUrl,
   createControlUiMockBootstrapConfig,
@@ -70,6 +73,17 @@ suite.define(() => {
       await page.reload();
       const entry = page.getByRole("button", { name: "Community", exact: true });
       await entry.waitFor({ state: "visible" });
+      if (process.env.OPENCLAW_CAPTURE_UI_PROOF === "1") {
+        const sidebar = page.locator(".sidebar");
+        const frame = await takeControlUiScreenshotFrame(page, sidebar, [entry], {
+          elements: [sidebar],
+          animations: "disabled",
+        });
+        await writeFile(
+          nodePath.join(suite.artifactDir, "community-sidebar.png"),
+          frame.elements[0]!.png,
+        );
+      }
       expect(await entry.evaluate((node) => Boolean(node.closest(".sidebar-rail")))).toBe(true);
       expect((await page.locator(".sidebar-shell__body").boundingBox())!.height).toBe(listHeight);
       const selectedUrl = page.url();

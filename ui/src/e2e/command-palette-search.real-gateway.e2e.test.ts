@@ -23,9 +23,9 @@ import {
 import { runQaGatewayFixture } from "../../../test/helpers/qa-gateway-cleanup.ts";
 import { createRequireRecord } from "../../../test/helpers/record.js";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
+import { takeControlUiViewportScreenshot } from "../test-helpers/control-ui-e2e-screenshot.ts";
 import { enterControlUiSession } from "../test-helpers/control-ui-session-entry.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
-import { pollCount, pollAttribute } from "./new-session-page.test-support.ts";
 import { selectAllSidebarSessions } from "./sidebar-navigation.test-support.ts";
 
 const requireRecord = createRequireRecord("record", "expected-object-value");
@@ -47,6 +47,7 @@ const scope = {
   excludeSystem: true,
   excludeDock: true,
 };
+const captureEnabled = process.env.OPENCLAW_CAPTURE_UI_PROOF === "1";
 let instance: OpenClawTestInstance | undefined;
 
 type RpcObservation = {
@@ -55,6 +56,7 @@ type RpcObservation = {
   startedMs: number;
   elapsedMs?: number;
   ok?: boolean;
+  responseBytes?: number;
   resultCount?: number;
   resultKeys?: unknown[];
   sessionKeys?: unknown[];
@@ -64,6 +66,16 @@ type RpcObservation = {
   truncated?: boolean;
   indexing?: boolean;
   archivedTranscriptsExcluded?: number;
+};
+
+type QueryObservation = {
+  query: string;
+  elapsedMs: number;
+  visibleResults: number;
+  searchRequests: number;
+  metadataRequests: number;
+  backgroundListRequests: number;
+  notices: string[];
 };
 
 async function seedSessions(owner: OpenClawTestInstance, config: OpenClawConfig) {
@@ -247,6 +259,15 @@ const suite = createControlUiE2eSuite({
       return await runQaGatewayFixture(
         async (): Promise<never> => {
           await writeFile(diagnostics, sanitized);
+          // Keep all safe probe receipts, not only the last near-deadline attempt.
+          await writeFile(
+            path.join(suite.artifactDir, "gateway-readiness.json"),
+            JSON.stringify(
+              owner.readiness.map(({ logs: _logs, ...receipt }) => receipt),
+              null,
+              2,
+            ),
+          );
           throw failure;
         },
         () => owner.cleanup(),
@@ -257,8 +278,34 @@ const suite = createControlUiE2eSuite({
 });
 
 function observeSearchTraffic(page: Page, rpc: RpcObservation[]) {
+  const connection = {
+    sockets: 0,
+    challenges: 0,
+    connectRequests: 0,
+    connectReplies: 0,
+    accepted: 0,
+    rejected: 0,
+    unauthorized: 0,
+    invalidRequest: 0,
+    unavailable: 0,
+    unavailableReasons: {
+      startup: 0,
+      restarting: 0,
+      suspending: 0,
+      buildMismatch: 0,
+      profile: 0,
+      other: 0,
+    },
+    pairingRequired: 0,
+    socketErrors: 0,
+    closes: 0,
+    pageErrors: 0,
+  };
+  page.on("pageerror", () => connection.pageErrors++);
   page.on("websocket", (socket) => {
+    connection.sockets++;
     const pending = new Map<string, RpcObservation>();
+    let connectId: string | undefined;
     socket.on("framesent", ({ payload }) => {
       const frame = requireRecord(JSON.parse(payload.toString()));
       if (
@@ -266,6 +313,11 @@ function observeSearchTraffic(page: Page, rpc: RpcObservation[]) {
         typeof frame.id !== "string" ||
         typeof frame.method !== "string"
       ) {
+        return;
+      }
+      if (frame.method === "connect") {
+        connection.connectRequests++;
+        connectId = frame.id;
         return;
       }
       // Never retain connect/auth frames or unrelated RPC payloads.
@@ -291,6 +343,43 @@ function observeSearchTraffic(page: Page, rpc: RpcObservation[]) {
     });
     socket.on("framereceived", ({ payload }) => {
       const frame = requireRecord(JSON.parse(payload.toString()));
+      if (frame.type === "event" && frame.event === "connect.challenge") {
+        connection.challenges++;
+      }
+      if (frame.type === "res" && frame.id === connectId) {
+        connection.connectReplies++;
+        if (frame.ok === true) {
+          connection.accepted++;
+        } else {
+          connection.rejected++;
+          const error = isRecord(frame.error) ? frame.error : {};
+          connection.unauthorized += Number(error.code === "UNAUTHORIZED");
+          connection.invalidRequest += Number(error.code === "INVALID_REQUEST");
+          connection.unavailable += Number(error.code === "UNAVAILABLE");
+          connection.pairingRequired += Number(error.code === "PAIRING_REQUIRED");
+          if (error.code === "UNAVAILABLE") {
+            const details = isRecord(error.details) ? error.details : {};
+            // Retain only known categories, never arbitrary error text or auth frames.
+            if (details.reason === "startup-sidecars") {
+              connection.unavailableReasons.startup++;
+            } else if (details.reason === "gateway-restarting") {
+              connection.unavailableReasons.restarting++;
+            } else if (details.reason === "gateway-suspending") {
+              connection.unavailableReasons.suspending++;
+            } else if (
+              details.code === "PROTOCOL_MISMATCH" ||
+              details.code === "CONTROL_UI_BUILD_MISMATCH"
+            ) {
+              connection.unavailableReasons.buildMismatch++;
+            } else if (details.code === "AUTHENTICATED_PROFILE_UNAVAILABLE") {
+              connection.unavailableReasons.profile++;
+            } else {
+              connection.unavailableReasons.other++;
+            }
+          }
+        }
+        return;
+      }
       const metric =
         frame.type === "res" && typeof frame.id === "string" ? pending.get(frame.id) : undefined;
       if (!metric) {
@@ -298,6 +387,7 @@ function observeSearchTraffic(page: Page, rpc: RpcObservation[]) {
       }
       metric.elapsedMs = performance.now() - metric.startedMs;
       metric.ok = frame.ok === true;
+      metric.responseBytes = Buffer.byteLength(payload);
       const body = isRecord(frame.payload) ? frame.payload : {};
       if (Array.isArray(body.results)) {
         metric.resultCount = body.results.length;
@@ -317,16 +407,13 @@ function observeSearchTraffic(page: Page, rpc: RpcObservation[]) {
         pending.delete(frame.id);
       }
     });
-    socket.on("close", () => pending.clear());
+    socket.on("socketerror", () => connection.socketErrors++);
+    socket.on("close", () => {
+      connection.closes++;
+      pending.clear();
+    });
   });
-}
-
-async function expectSessionKey(pane: Locator, key: string) {
-  await expect
-    .poll(() =>
-      pane.evaluate((element) => (element as HTMLElement & { sessionKey: string }).sessionKey),
-    )
-    .toBe(key);
+  return connection;
 }
 
 suite.define(() => {
@@ -336,7 +423,10 @@ suite.define(() => {
     }
     const owner = instance;
     const rpc: RpcObservation[] = [];
-    const queries: string[] = [];
+    const queries: QueryObservation[] = [];
+    const assets: Array<{ path: string; servedSha256: string; builtSha256: string }> = [];
+    const screenshots: string[] = [];
+    let connection: ReturnType<typeof observeSearchTraffic> | undefined;
     let passed = false;
     const artifactDir = suite.artifactDir;
     try {
@@ -347,6 +437,15 @@ suite.define(() => {
         timeoutMs: 60_000,
         onPending: () => console.log("[search-proof] waiting for the preparing UI document"),
       });
+      if (!uiDocument.ready) {
+        console.log(
+          "[search-proof] document readiness failed",
+          JSON.stringify({
+            document: uiDocument,
+            gateway: owner.readiness.map(({ logs: _logs, ...receipt }) => receipt),
+          }),
+        );
+      }
       expect(uiDocument.ready, uiDocument.ready ? "ready" : uiDocument.reason).toBe(true);
       const handoff = await owner.cli(["dashboard", "--json"]);
       const result = requireRecord(JSON.parse(handoff.stdout));
@@ -365,9 +464,12 @@ suite.define(() => {
           serviceWorkers: "block",
           locale: "en-US",
           viewport: { width: 1280, height: 900 },
+          ...(captureEnabled
+            ? { recordVideo: { dir: artifactDir, size: { width: 1280, height: 900 } } }
+            : {}),
         },
         async ({ page }) => {
-          observeSearchTraffic(page, rpc);
+          connection = observeSearchTraffic(page, rpc);
           expect((await page.goto(url.href))?.status()).toBe(404);
           await enterControlUiSession(page);
           await waitForControlUiGatewayReady(page);
@@ -408,8 +510,18 @@ suite.define(() => {
               .update(await served.body())
               .digest("hex");
             const builtSha256 = createHash("sha256").update(built).digest("hex");
+            assets.push({ path: script, servedSha256, builtSha256 });
             expect(servedSha256).toBe(builtSha256);
           }
+          const capture = async (filename: string, surface: Locator, content: Locator[]) => {
+            if (captureEnabled) {
+              await writeFile(
+                path.join(artifactDir, filename),
+                await takeControlUiViewportScreenshot(page, surface, content),
+              );
+              screenshots.push(filename);
+            }
+          };
           await page.keyboard.press("ControlOrMeta+K");
           const palette = page.locator(".cmd-palette");
           const input = palette.getByRole("textbox", {
@@ -417,18 +529,18 @@ suite.define(() => {
             exact: true,
           });
           const results = palette.locator(".cmd-palette__results");
-          const options = results.getByRole("option");
-          const targetOption = options.filter({ hasText: targetLabel });
           const emptyState = palette.locator(".cmd-palette__no-results");
           await input.waitFor();
           const metadataReceipts = new Map<string, { revision: string; keys: string[] }>();
           const search = async (
             query: string,
             expectedHits: number,
+            filename: string,
             metadataKeys: string[] = [],
           ) => {
             const noMatches = expectedHits === 0 && metadataKeys.length === 0;
             const start = rpc.length;
+            const started = performance.now();
             await input.fill(query);
             await expect
               .poll(
@@ -438,7 +550,7 @@ suite.define(() => {
             await expect
               .poll(() => rpc.slice(start).every((entry) => entry.elapsedMs !== undefined))
               .toBe(true);
-            await pollAttribute(results, "aria-busy").toBe("false");
+            await expect.poll(() => results.getAttribute("aria-busy")).toBe("false");
             const notices = await palette
               .locator(".cmd-palette__search")
               .getByRole("status")
@@ -449,20 +561,26 @@ suite.define(() => {
             // by its metadata-search intent, not by arrival time alone.
             const listRequests = traffic.filter((entry) => entry.method === "sessions.list");
             const metadata = listRequests.filter((entry) => entry.params.search === query);
-            queries.push(query);
-
+            const visibleResults = await results.getByRole("option").count();
+            queries.push({
+              query,
+              elapsedMs: performance.now() - started,
+              visibleResults,
+              searchRequests: searches.length,
+              metadataRequests: metadata.length,
+              backgroundListRequests: listRequests.length - metadata.length,
+              notices,
+            });
+            // Capture the settled state before assertions too, retaining useful
+            // before-fix evidence when run against the original regression.
+            await capture(filename, palette, [input, visibleResults === 0 ? emptyState : results]);
             expect(searches).toHaveLength(1);
             const response = searches[0]!;
             expect(response.params).toEqual({ query, limit: 25, scope });
-            expect(response).toMatchObject({
-              ok: true,
-              resultCount: expectedHits,
-              indexing: false,
-              archivedTranscriptsExcluded: 0,
-            });
-            if (expectedHits === 1) {
-              expect(response.resultKeys).toEqual([targetKey]);
-            }
+            expect(response.ok).toBe(true);
+            expect(response.resultCount).toBe(expectedHits);
+            expect(response.indexing).toBe(false);
+            expect(response.archivedTranscriptsExcluded).toBe(0);
             expect(response.sessionKeys?.length).toBeLessThanOrEqual(25);
             expect(new Set(response.sessionKeys)).toEqual(new Set(response.resultKeys));
             // The query owns one bounded metadata lookup. The scoped transcript
@@ -520,62 +638,93 @@ suite.define(() => {
             return response;
           };
 
-          await search("per session communi", 0, [targetKey]);
-          await targetOption.waitFor();
-          expect(await options.count()).toBe(1);
+          await search("per session communi", 0, "00-title-punctuation-prefix.png", [targetKey]);
+          await results.getByRole("option").filter({ hasText: targetLabel }).waitFor();
+          expect(await results.getByRole("option").count()).toBe(1);
 
-          await search("cross agent message rout", 1);
-          await targetOption.waitFor();
+          const partial = await search(
+            "cross agent message rout",
+            1,
+            "00-message-punctuation-prefix.png",
+          );
+          expect(partial.resultKeys).toEqual([targetKey]);
+          await results.getByRole("option").filter({ hasText: targetLabel }).waitFor();
           expect(await results.textContent()).toContain(targetMessage);
 
-          const common = await search(commonQuery, 25);
+          const common = await search(commonQuery, 25, "01-common-limited-search.png");
           expect(common.truncated).toBe(true);
-          await pollCount(options).toBe(10);
+          await expect.poll(() => results.getByRole("option").count()).toBe(10);
           expect(
             common.resultKeys?.every(
               (key) => typeof key === "string" && key.includes(":search-roster-"),
             ),
           ).toBe(true);
 
-          await search(targetLabel, 0, [targetKey]);
-          await targetOption.click();
+          await search(targetLabel, 0, "02-grouped-metadata-match.png", [targetKey]);
+          await results.getByRole("option").filter({ hasText: targetLabel }).click();
           await input.waitFor({ state: "hidden" });
           const activePane = () =>
             page.locator("openclaw-chat-pane.chat-pane-cache__pane--active:not([inert])");
-          await expectSessionKey(activePane(), targetKey);
+          await expect
+            .poll(() =>
+              activePane().evaluate(
+                (element) => (element as HTMLElement & { sessionKey: string }).sessionKey,
+              ),
+            )
+            .toBe(targetKey);
           await activePane()
             .locator(".chat-thread")
             .getByText(targetMessage, { exact: true })
             .waitFor();
           await page.goBack();
-          await expectSessionKey(activePane(), "agent:main:main");
+          await expect
+            .poll(() =>
+              activePane().evaluate(
+                (element) => (element as HTMLElement & { sessionKey: string }).sessionKey,
+              ),
+            )
+            .toBe("agent:main:main");
           await page.keyboard.press("ControlOrMeta+K");
           await input.waitFor();
 
-          const unique = await search(uniqueQuery, 1);
+          const unique = await search(uniqueQuery, 1, "02-older-fifth-agent-match.png");
+          expect(unique.resultKeys).toEqual([targetKey]);
           expect(unique.truncated).toBe(false);
-          await targetOption.waitFor();
-          expect(await options.count()).toBe(1);
+          await results.getByRole("option").filter({ hasText: targetLabel }).waitFor();
+          expect(await results.getByRole("option").count()).toBe(1);
           expect(await results.textContent()).toContain("Synthetic fifth assistant");
           expect(await results.textContent()).toContain(targetMessage);
 
-          // Case folding and ANDed words both retain the same unique transcript hit.
-          for (const query of [uniqueQuery.toUpperCase(), "copperfinch violet lantern"]) {
-            await search(query, 1);
-          }
-          const absent = await search("copperfinch absentconstellation", 0);
+          const upper = await search(uniqueQuery.toUpperCase(), 1, "03-case-insensitive-match.png");
+          expect(upper.resultKeys).toEqual([targetKey]);
+          // The public FTS contract ANDs whitespace-separated words; this proves
+          // multiword narrowing without inventing quoted exact-phrase semantics.
+          const phrase = await search("copperfinch violet lantern", 1, "04-multiword-match.png");
+          expect(phrase.resultKeys).toEqual([targetKey]);
+          const absent = await search("copperfinch absentconstellation", 0, "05-no-match.png");
           expect(absent.truncated).toBe(false);
-          expect(await options.count()).toBe(0);
+          expect(await results.getByRole("option").count()).toBe(0);
           await emptyState
             .getByRole("heading", { name: "No results found", exact: true })
             .waitFor();
 
-          await search("copperfinch observatory", 1);
-          await targetOption.click();
+          await search("copperfinch observatory", 1, "06-selected-search-result.png");
+          await results.getByRole("option").filter({ hasText: targetLabel }).click();
           await input.waitFor({ state: "hidden" });
-          const pane = activePane();
-          await expectSessionKey(pane, targetKey);
+          const pane = page.locator(
+            "openclaw-chat-pane.chat-pane-cache__pane--active:not([inert])",
+          );
+          await expect
+            .poll(() =>
+              pane.evaluate(
+                (element) => (element as HTMLElement & { sessionKey: string }).sessionKey,
+              ),
+            )
+            .toBe(targetKey);
           await pane.locator(".chat-thread").getByText(targetMessage, { exact: true }).waitFor();
+          await capture("07-opened-fifth-agent-transcript.png", pane, [
+            pane.locator(".chat-thread"),
+          ]);
 
           // Category membership spans accessible owners, beyond the default Mine scope.
           await selectAllSidebarSessions(page);
@@ -585,7 +734,13 @@ suite.define(() => {
               `.sidebar-recent-session[data-session-key="${otherKey}"] .sidebar-recent-session__link`,
             )
             .click();
-          await expectSessionKey(activePane(), otherKey);
+          await expect
+            .poll(() =>
+              activePane().evaluate(
+                (element) => (element as HTMLElement & { sessionKey: string }).sessionKey,
+              ),
+            )
+            .toBe(otherKey);
           const call = async (method: string, params: Record<string, unknown>) => {
             const rpcResult = await owner.cli([
               "gateway",
@@ -603,7 +758,7 @@ suite.define(() => {
             const groupRows = page.locator(
               `[data-session-section^="category:"] [data-session-key="${targetKey}"]`,
             );
-            await pollCount(groupRows).toBe(category ? 1 : 0);
+            await expect.poll(() => groupRows.count()).toBe(category ? 1 : 0);
             if (category) {
               await page
                 .locator(
@@ -623,14 +778,86 @@ suite.define(() => {
             expect(inventory.owners).toHaveLength(category ? 1 : 0);
             await page.keyboard.press("ControlOrMeta+K");
             await input.waitFor();
-            await search(targetLabel, 0, category ? [targetKey] : []);
-            await search(uniqueQuery, category ? 1 : 0);
+            const stage = category?.replaceAll(" ", "-") ?? "ungrouped";
+            await search(
+              targetLabel,
+              0,
+              `category-${stage}-metadata.png`,
+              category ? [targetKey] : [],
+            );
+            await search(uniqueQuery, category ? 1 : 0, `category-${stage}-transcript.png`);
             await page.keyboard.press("Escape");
             await input.waitFor({ state: "hidden" });
           }
           expect(rpc.filter((metric) => metric.method === "sessions.search")).toHaveLength(
             queries.length,
           );
+          expect(
+            rpc.filter((metric) => metric.method === "chat.send" || metric.method === "agent"),
+          ).toEqual([]);
+          // Cover the agreed direct shortcuts against the same isolated real Gateway.
+          // The existing capture gate exports these sanitized views on manual proof runs.
+          const currentPane = activePane();
+          await capture("direct-01-before.png", currentPane, [currentPane.locator(".chat-thread")]);
+          await page.keyboard.press("ControlOrMeta+/");
+          const helper = page.locator("openclaw-keyboard-shortcuts-dialog");
+          const newHint = helper.locator(".shortcut-row").filter({ hasText: "Open New Session" });
+          const archiveHint = helper
+            .locator(".shortcut-row")
+            .filter({ hasText: "Archive current session" });
+          await newHint.waitFor({ state: "visible" });
+          await archiveHint.waitFor({ state: "visible" });
+          expect((await newHint.locator("kbd").allTextContents()).at(-1)).toBe("O");
+          expect((await archiveHint.locator("kbd").allTextContents()).at(-1)).toBe("A");
+          // The host is display: contents; the native dialog owns the opening animation.
+          await capture("direct-02-keyboard-helper.png", helper.locator("dialog"), [
+            newHint,
+            archiveHint,
+          ]);
+          await page.keyboard.press("Escape");
+          await newHint.waitFor({ state: "hidden" });
+          await page.keyboard.press("ControlOrMeta+Shift+O");
+          const draft = page.locator("openclaw-new-session-page .new-session-page__message");
+          await draft.waitFor({ state: "visible" });
+          await expect
+            .poll(() => draft.evaluate((element) => element === document.activeElement))
+            .toBe(true);
+          expect(await draft.inputValue()).toBe("");
+          await capture("direct-03-new-session.png", page.locator("openclaw-new-session-page"), [
+            draft,
+          ]);
+          await page.goBack();
+          await expect
+            .poll(() =>
+              currentPane.evaluate(
+                (element) => (element as HTMLElement & { sessionKey: string }).sessionKey,
+              ),
+            )
+            .toBe(otherKey);
+          const composer = currentPane.locator(".agent-chat__composer-combobox > textarea");
+          await composer.fill("Keep this unsent shortcut draft");
+          await capture("direct-04-archive-before.png", currentPane, [composer]);
+          await page.keyboard.press("ControlOrMeta+Shift+A");
+          const archiveRequests = (archived: boolean) =>
+            rpc.filter(
+              (metric) =>
+                metric.method === "sessions.patch" &&
+                metric.params.key === otherKey &&
+                metric.params.archived === archived,
+            );
+          await expect
+            .poll(() => archiveRequests(true).filter((metric) => metric.ok === true).length)
+            .toBe(1);
+          const undo = page.getByRole("button", { name: "Undo", exact: true });
+          await undo.waitFor({ state: "visible" });
+          await capture("direct-05-archive-after.png", currentPane, [
+            currentPane.locator(".chat-thread"),
+          ]);
+          await undo.click();
+          await expect
+            .poll(() => archiveRequests(false).filter((metric) => metric.ok === true).length)
+            .toBe(1);
+          await expect.poll(() => composer.inputValue()).toBe("Keep this unsent shortcut draft");
           expect(
             rpc.filter((metric) =>
               ["sessions.create", "chat.send", "agent"].includes(metric.method),
@@ -641,6 +868,8 @@ suite.define(() => {
       passed = true;
     } finally {
       if (!passed) {
+        // CI retains console output; keep only counts and allowlisted error categories.
+        console.error("[search-proof] connection", JSON.stringify(connection));
         await writeFile(
           path.join(artifactDir, "gateway-failure.log"),
           owner
@@ -651,7 +880,24 @@ suite.define(() => {
       }
       await writeFile(
         path.join(artifactDir, "search-proof.json"),
-        JSON.stringify({ passed, queries, rpc }, null, 2),
+        JSON.stringify(
+          {
+            passed,
+            fixture: {
+              sessions: recentSessionCount + 1,
+              configuredAgents: agentIds.length,
+              newerSessions: recentSessionCount,
+              commonMatches: commonMatchCount,
+              targetKey,
+            },
+            assets,
+            queries,
+            rpc,
+            screenshots,
+          },
+          null,
+          2,
+        ),
       );
     }
   });

@@ -1,9 +1,8 @@
 import type { Locator } from "playwright";
 import { expect, it } from "vitest";
 import {
-  paletteAnchors,
   expectForegroundUnchanged,
-  openMockPalette,
+  openFromForeground,
   scenario,
 } from "./command-palette.test-support.ts";
 import { controlUiE2eBuiltModuleRequest } from "./control-ui-built-module.test-support.ts";
@@ -15,9 +14,20 @@ import {
 import { installMockGateway } from "./new-session-page.test-support.ts";
 
 const suite = createControlUiE2eSuite({ name: "command palette people mentions" });
-const people = Array.from({ length: 10 }, (_, index) => ({
+const people = [
+  "Alex Chen",
+  "Jordan Rivera",
+  "Sam Taylor",
+  "Morgan Lee",
+  "Casey Williams",
+  "Riley Patel",
+  "Avery Thompson",
+  "Quinn Davis",
+  "Jamie Wilson",
+  "Charlie Garcia",
+].map((displayName, index) => ({
   profileId: "person-" + index,
-  displayName: index === 0 ? "Alex Chen" : `Fixture person ${index}`,
+  displayName,
   online: index % 2 === 0,
 }));
 function mentionScenario() {
@@ -26,24 +36,47 @@ function mentionScenario() {
     "sessions.create": {
       key: "agent:main:dashboard:palette-mentioned",
       runStarted: true,
+      runId: "mentioned-run",
     },
   });
   return {
     ...base,
     featureMethods: [...base.featureMethods!, "users.mentionable"],
-    presenceUsers: [{ self: true, id: "sender", name: "Sender" }],
+    presenceUsers: [
+      {
+        self: true,
+        id: "sender",
+        identity: { type: "profile" as const, id: "sender" },
+        name: "Sender",
+      },
+    ],
   };
+}
+async function anchors(palette: Locator) {
+  return palette.evaluate((element) =>
+    [
+      ".cmd-palette",
+      ".cmd-palette__input",
+      ".cmd-palette__create",
+      'button[aria-label="New session settings"]',
+    ].map((selector) => {
+      const rect = element.querySelector(selector)!.getBoundingClientRect();
+      return { x: rect.x, y: rect.y };
+    }),
+  );
 }
 async function selectPerson(input: Locator, palette: Locator, index: number) {
   await input.press("@");
   const menu = palette.getByRole("listbox", { name: "Mention a person" });
   await menu.getByRole("option").nth(9).waitFor({ state: "visible" });
+  expect(await menu.getByRole("option").count()).toBe(10);
   await input.press("Home");
   for (let step = 0; step < index; step++) {
     await input.press("ArrowDown");
   }
   await input.press(index % 2 ? "Tab" : "Enter");
   await menu.waitFor({ state: "detached" });
+  expect(await menu.count()).toBe(0);
 }
 
 suite.define(() => {
@@ -86,23 +119,27 @@ suite.define(() => {
       await suite.withPage(
         { ...createControlUiE2eContextOptions(), viewport: { width, height: 900 } },
         async ({ page }) => {
-          const { gateway, palette, input, composer, url } = await openMockPalette(
+          const gateway = await installMockGateway(page, mentionScenario());
+          const { palette, input, composer, url } = await openFromForeground(
             page,
             suite.server.baseUrl,
-            mentionScenario(),
           );
           await page.evaluate(() => document.fonts.ready);
-          const before = await paletteAnchors(palette);
-          const selectedPeople = palette.locator(".composer-context-strip__person");
+          const before = await anchors(palette);
           const mentions = [];
           for (let index = 0; index < people.length; index++) {
             const start = (await input.inputValue()).length;
             await selectPerson(input, palette, index);
-            const { profileId, displayName } = people[index]!;
-            mentions.push({ profileId, start, end: start + displayName.length + 1 });
+            mentions.push({
+              profileId: people[index]!.profileId,
+              start,
+              end: start + people[index]!.displayName.length + 1,
+            });
             if ([1, 2, 10].includes(index + 1)) {
-              expect(await paletteAnchors(palette)).toEqual(before);
-              expect(await selectedPeople.count()).toBe(index + 1);
+              expect(await anchors(palette)).toEqual(before);
+              expect(await palette.locator(".composer-context-strip__person").count()).toBe(
+                index + 1,
+              );
               expect(await input.getAttribute("aria-activedescendant")).toBeNull();
             }
           }
