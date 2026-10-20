@@ -95,17 +95,16 @@ vi.mock("./shared.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./shared.js")>()),
   createDaemonInstallActionContext: (jsonFlag: unknown) => {
     const json = Boolean(jsonFlag);
+    // Plan decisions only; the integration suite exercises actual CLI output.
+    const emit = (payload: DaemonActionResponse) => {
+      actionState.emitted.push(payload);
+    };
     return {
       json,
       stdout: process.stdout,
       warnings: actionState.warnings,
-      emit: (payload: DaemonActionResponse) => {
-        actionState.emitted.push(payload);
-      },
-      // This fixture records plan decisions; output behavior uses the real-owner integration suite.
-      emitMessage: (payload: DaemonActionResponse) => {
-        actionState.emitted.push(payload);
-      },
+      emit,
+      emitMessage: emit,
       warn: (message: string) => {
         if (json) {
           actionState.warnings.push(message);

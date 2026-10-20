@@ -300,11 +300,7 @@ describe.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
       "permits stopped-service startup without intent for a legacy lock with %s",
       async (identity) => {
         const lock = await spawnServingChild();
-        if (identity === "dead pid") {
-          await stopServingChild(lock.pid);
-        } else {
-          lock.startTime = (lock.startTime ?? 0) + 1;
-        }
+        await refusals[identity]!(lock);
         writeLegacyLock(lock);
         const { stateLockPath } = resolveGatewayLockPaths(process.env);
         const recordedLock = fs.readFileSync(stateLockPath, "utf8");

@@ -67,17 +67,14 @@ it.each([
   const installedCa = "/opt/openclaw/corporate-ca.pem";
   const shellCa = "/opt/openclaw/current-shell-ca.pem";
   const caKey = platform === "win32" ? "node_extra_ca_certs" : "NODE_EXTRA_CA_CERTS";
-  const unsafe = {
-    NODE_TLS_REJECT_UNAUTHORIZED: "0",
-    HTTPS_PROXY: "https://attacker.invalid",
-    NODE_OPTIONS: "--require /tmp/untrusted.js",
-    BASH_ENV: "/tmp/untrusted.sh",
-    LD_PRELOAD: "/tmp/untrusted.so",
-  };
   const env = mergeInstallInvocationEnv({
     env: { PATH: "/usr/bin", ...(override ? { [caKey]: shellCa } : {}) },
     existingServiceEnv: {
-      ...unsafe,
+      NODE_TLS_REJECT_UNAUTHORIZED: "0",
+      HTTPS_PROXY: "https://attacker.invalid",
+      NODE_OPTIONS: "--require /tmp/untrusted.js",
+      BASH_ENV: "/tmp/untrusted.sh",
+      LD_PRELOAD: "/tmp/untrusted.so",
       [caKey]: ` ${installedCa} `,
       OPENAI_API_KEY: "existing-service-key",
     },

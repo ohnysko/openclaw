@@ -47,11 +47,10 @@ function expectFailure(...messages: string[]) {
 }
 
 function loadedService(command: Partial<GatewayServiceCommandConfig> = {}) {
+  const installed = { programArguments: ["openclaw", "gateway", "run"], ...command };
   service.isLoaded.mockResolvedValue(true);
-  service.readCommand.mockResolvedValue({
-    programArguments: ["openclaw", "gateway", "run"],
-    ...command,
-  });
+  service.readCommand.mockResolvedValue(installed);
+  return installed;
 }
 
 async function expectReinstall(options: DaemonInstallOptions = {}) {
@@ -195,8 +194,8 @@ describe("runDaemonInstall", () => {
         expect(plan).toMatchObject({
           serviceCli: { executable: cli.executable, entrypoint: cli.entrypoint },
           runtimePath: cli.executable,
+          pinnedRuntimePath: runtime === "bun" ? cli.executable : undefined,
         });
-        expect(plan.pinnedRuntimePath).toBe(runtime === "bun" ? cli.executable : undefined);
         expectPartialCall(service.install, {
           runtimePinUpdate: {
             expected,
@@ -289,10 +288,20 @@ describe("runDaemonInstall", () => {
     expect(installDaemonServiceAndEmitMock).not.toHaveBeenCalled();
   });
 
-  it.each<[string, string, string | undefined]>([
-    ["lan", "0.0.0.0", "test-token"],
-    ["tailnet", "127.0.0.1", undefined],
-  ])("blocks no-auth %s installation", async (bind, host, token) => {
+  it.each([
+    [
+      "lan",
+      "0.0.0.0",
+      "test-token",
+      [
+        "Gateway install blocked",
+        "gateway.bind=lan",
+        "gateway.auth.mode=none",
+        "openclaw config set gateway.auth.mode token",
+      ],
+    ],
+    ["tailnet", "127.0.0.1", undefined, ["can later resolve to a Tailnet interface"]],
+  ] as const)("blocks no-auth %s installation", async (bind, host, token, messages) => {
     setConfig({ gateway: { mode: "local", bind, auth: { mode: "none", token } } });
     resolveGatewayAuthMock.mockReturnValue({
       mode: "none",
@@ -302,16 +311,7 @@ describe("runDaemonInstall", () => {
     });
     resolveGatewayBindHostMock.mockResolvedValue(host);
     await runDaemonInstall({ json: true });
-    expectFailure(
-      ...(bind === "lan"
-        ? [
-            "Gateway install blocked",
-            "gateway.bind=lan",
-            "gateway.auth.mode=none",
-            "openclaw config set gateway.auth.mode token",
-          ]
-        : ["can later resolve to a Tailnet interface"]),
-    );
+    expectFailure(...messages);
     expectNoCalls(buildGatewayInstallPlanMock, installDaemonServiceAndEmitMock);
   });
 
@@ -380,25 +380,22 @@ describe("runDaemonInstall", () => {
   );
 
   it("reinstalls when the loaded service still embeds OPENCLAW_GATEWAY_TOKEN", async () => {
-    const programArguments = [
-      "/usr/bin/node",
-      "--max-old-space-size=24576",
-      "--require=/tmp/service-preload.js",
-      "/usr/local/bin/openclaw",
-      "gateway",
-    ];
     const managedDefinition = {
-      programArguments,
+      programArguments: [
+        "/usr/bin/node",
+        "--max-old-space-size=24576",
+        "--require=/tmp/service-preload.js",
+        "/usr/local/bin/openclaw",
+        "gateway",
+      ],
       environment: { OPENCLAW_GATEWAY_TOKEN: "stale-service-token" },
     };
-    const existingCommand = {
+    const existingCommand = loadedService({
       ...managedDefinition,
       environment: { NODE_OPTIONS: "--max-old-space-size=512" },
       managedDefinition,
       managedOverrides: { environment: { keys: ["NODE_OPTIONS"] } },
-    };
-    loadedService(existingCommand);
-
+    });
     await expectReinstall();
     for (const [options] of buildGatewayInstallPlanMock.mock.calls) {
       expect(options).toEqual(expect.objectContaining({ existingCommand }));
@@ -409,15 +406,9 @@ describe("runDaemonInstall", () => {
   });
 
   it("returns already-installed when the embedded gateway token matches the install plan", async () => {
-    const command = {
-      programArguments: ["openclaw", "gateway", "run"],
-      environment: { OPENCLAW_GATEWAY_TOKEN: "durable-token" },
-    };
-    loadedService(command);
+    const command = loadedService({ environment: { OPENCLAW_GATEWAY_TOKEN: "durable-token" } });
     buildGatewayInstallPlanMock.mockResolvedValueOnce({ ...command, workingDirectory: "/tmp" });
-
     await runDaemonInstall({ json: true });
-
     expect(buildGatewayInstallPlanMock).toHaveBeenCalledTimes(1);
     expectNoCalls(replaceConfigFileMock, installDaemonServiceAndEmitMock);
     expect(actionState.emitted.at(-1)).toMatchObject({ result: "already-installed" });

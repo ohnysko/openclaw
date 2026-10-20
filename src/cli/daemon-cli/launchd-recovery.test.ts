@@ -14,16 +14,14 @@ vi.mock("../../daemon/launchd.js", () => ({
       `launchctl bootstrap failed: ${params.detail}`,
       `LaunchAgent ${params.actionHint} requires a logged-in macOS GUI session for this user (${params.domain}).`,
     ].join("\n"),
-  launchAgentPlistExists: (env: Record<string, string | undefined>) => launchAgentPlistExists(env),
-  repairLaunchAgentBootstrap: (args: { env?: Record<string, string | undefined> }) =>
-    repairLaunchAgentBootstrap(args),
+  launchAgentPlistExists,
+  repairLaunchAgentBootstrap,
   resolveLaunchAgentLabel: (env: Record<string, string | undefined>) =>
     env.OPENCLAW_LAUNCHD_LABEL ?? "ai.openclaw.gateway",
 }));
 
 vi.mock("../../daemon/launchd-system.js", () => ({
-  assertNoSystemLaunchDaemonOwnership: (label: string) =>
-    assertNoSystemLaunchDaemonOwnership(label),
+  assertNoSystemLaunchDaemonOwnership,
 }));
 
 const { recoverInstalledLaunchAgent } = await import("./launchd-recovery.js");

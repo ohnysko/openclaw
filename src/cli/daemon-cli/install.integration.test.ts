@@ -20,8 +20,9 @@ import { writeConfigMachineState } from "../../state/config-machine-state-write.
 import { readConfigMachineState } from "../../state/config-machine-state.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { makeTempWorkspace } from "../../test-helpers/workspace.js";
-import { captureEnv, withEnvAsync } from "../../test-utils/env.js";
+import { captureFullEnv, withEnvAsync } from "../../test-utils/env.js";
 import { stubNodeRuntime } from "../update-cli/update-command-runtime-recovery.test-support.js";
+import { nativeResult } from "../update-cli/update-command-service-fixtures.test-support.js";
 import { expectNoCalls, expectPartialCall } from "./lifecycle-assertions.test-support.js";
 import type { DaemonInstallOptions } from "./types.js";
 
@@ -91,16 +92,23 @@ const { readSystemdDefinitionMutationCapability } =
 const { readSystemdServiceExecStart, resolveSystemdServiceName, resolveSystemdUnitPath } =
   await import("../../daemon/systemd-service-files.js");
 
+const userSystemdTarget = (env: NodeJS.ProcessEnv) => ({
+  scope: "user" as const,
+  unitName: `${resolveSystemdServiceName(env)}.service`,
+  unitPath: resolveSystemdUnitPath(env),
+});
+
 // These fixtures author a user unit; do not discover real system units on the test host.
 const readUserSystemdServiceExecStart: typeof readSystemdServiceExecStart = (env, options) =>
   readSystemdServiceExecStart(env, {
     ...options,
-    systemdReadTarget: {
-      scope: "user",
-      unitName: `${resolveSystemdServiceName(env)}.service`,
-      unitPath: resolveSystemdUnitPath(env),
-    },
+    systemdReadTarget: userSystemdTarget(env),
   });
+
+async function writePrivateFile(file: string, contents: string) {
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await fs.writeFile(file, contents, { mode: 0o600 });
+}
 
 async function readJson(filePath: string): Promise<Record<string, unknown>> {
   return JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
@@ -127,7 +135,7 @@ async function createInstalledServiceCommand() {
 }
 
 describe("runDaemonInstall integration", () => {
-  let envSnapshot: ReturnType<typeof captureEnv>;
+  let envSnapshot: ReturnType<typeof captureFullEnv>;
   let accountHome: string;
   let tempHome: string;
   let configPath: string;
@@ -173,14 +181,7 @@ describe("runDaemonInstall integration", () => {
 
   beforeEach(async () => {
     originalArgv = process.argv;
-    envSnapshot = captureEnv([
-      "HOME",
-      "DBUS_SESSION_BUS_ADDRESS",
-      "OPENCLAW_STATE_DIR",
-      "OPENCLAW_CONFIG_PATH",
-      "OPENCLAW_GATEWAY_TOKEN",
-      "OPENCLAW_GATEWAY_PASSWORD",
-    ]);
+    envSnapshot = captureFullEnv();
     accountHome = await makeTempWorkspace("openclaw-daemon-install-int-");
     tempHome = path.join(accountHome, ".openclaw");
     await fs.mkdir(tempHome, { mode: 0o700 });
@@ -334,27 +335,18 @@ describe("runDaemonInstall integration", () => {
     await fs.mkdir(ancestor);
     await fs.chmod(ancestor, 0o777);
     await writeConfig(config);
-    busctl.mockResolvedValue({
-      code: 1,
-      termination: "exit",
-      stdout: "",
-      stderr: "Call failed: Unit openclaw-gateway.service not found.",
-    });
+    busctl.mockResolvedValue(
+      nativeResult("", 1, "Call failed: Unit openclaw-gateway.service not found."),
+    );
     const env = { ...process.env, HOME: fixture, OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway" };
     serviceMock.readCommand.mockImplementation((_env, options) =>
       readUserSystemdServiceExecStart(env, options),
     );
     serviceMock.readDefinitionMutationCapability.mockImplementation(() =>
       readSystemdDefinitionMutationCapability(env, {
-        systemdReadTarget: {
-          scope: "user",
-          unitName: "openclaw-gateway.service",
-          unitPath: resolveSystemdUnitPath(env),
-        },
+        systemdReadTarget: userSystemdTarget(env),
       }),
     );
-    // Admit local runtime intent without depending on an earlier install test.
-    await runtimePinState.withDaemonRuntimePinMigration(process.env, () => undefined);
     const before = await preparedSnapshotConfig();
     await expect(runDaemonInstall({ json: false, force: true })).rejects.toThrow("__exit__:1");
     expect(await snapshotConfig()).toEqual(before);
@@ -410,20 +402,15 @@ describe("runDaemonInstall integration", () => {
     const dropIn = `${unit}.d/override.conf`;
     const plannedFile = path.join(plannedState, "gateway.systemd.env");
     const effectiveFile = path.join(effectiveState, "gateway.systemd.env");
-    await fs.mkdir(path.dirname(dropIn), { recursive: true, mode: 0o700 });
-    await fs.mkdir(plannedState, { mode: 0o700 });
-    await fs.mkdir(effectiveState, { mode: 0o700 });
-    await fs.writeFile(plannedFile, "OPERATOR_VALUE=planned\n", { mode: 0o600 });
-    await fs.writeFile(effectiveFile, "OPERATOR_VALUE=effective\n", { mode: 0o600 });
-    await fs.writeFile(
+    await writePrivateFile(plannedFile, "OPERATOR_VALUE=planned\n");
+    await writePrivateFile(effectiveFile, "OPERATOR_VALUE=effective\n");
+    await writePrivateFile(
       unit,
       `[Service]\nExecStart=/usr/bin/node gateway\nEnvironment=OPENCLAW_STATE_DIR=${plannedState}\nEnvironmentFile=${plannedFile}\n`,
-      { mode: 0o600 },
     );
-    await fs.writeFile(
+    await writePrivateFile(
       dropIn,
       `[Service]\nEnvironment=OPENCLAW_STATE_DIR=${effectiveState}\nEnvironmentFile=\nEnvironmentFile=${effectiveFile}\n`,
-      { mode: 0o600 },
     );
     await fs.writeFile(configPath, JSON.stringify(tokenConfig("existing-token")));
     process.env.HOME = fixture;
@@ -438,20 +425,19 @@ describe("runDaemonInstall integration", () => {
       }
       return stat;
     });
-    busctl.mockImplementation(async (_env, args) => ({
-      code: 0,
-      termination: "exit",
-      stderr: "",
-      stdout: args.includes("LoadUnit")
-        ? JSON.stringify({ type: "o", data: ["/org/freedesktop/systemd1/unit/owned"] })
-        : args.includes("org.freedesktop.systemd1.Unit")
-          ? buildSystemdUnitPropertyOutput({ fragmentPath: unit, dropInPaths: [dropIn] })
-          : buildSystemdManagerPropertyOutput({
-              programArguments: ["/usr/bin/node", "gateway"],
-              environment: [`OPENCLAW_STATE_DIR=${effectiveState}`],
-              environmentFiles: [[effectiveFile, false]],
-            }),
-    }));
+    busctl.mockImplementation(async (_env, args) =>
+      nativeResult(
+        args.includes("LoadUnit")
+          ? JSON.stringify({ type: "o", data: ["/org/freedesktop/systemd1/unit/owned"] })
+          : args.includes("org.freedesktop.systemd1.Unit")
+            ? buildSystemdUnitPropertyOutput({ fragmentPath: unit, dropInPaths: [dropIn] })
+            : buildSystemdManagerPropertyOutput({
+                programArguments: ["/usr/bin/node", "gateway"],
+                environment: [`OPENCLAW_STATE_DIR=${effectiveState}`],
+                environmentFiles: [[effectiveFile, false]],
+              }),
+      ),
+    );
     serviceMock.readCommand.mockImplementation(readUserSystemdServiceExecStart);
     serviceMock.readDefinitionMutationCapability.mockImplementation((args) =>
       readSystemdDefinitionMutationCapability(args?.env ?? process.env, {

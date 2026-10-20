@@ -22,7 +22,7 @@ import { mockSystemAccountHome } from "../../daemon/service.test-helpers.js";
 import { resolveSystemdUnitPath } from "../../daemon/systemd-service-files.js";
 import {
   buildSystemdUnit,
-  parseSystemdEnvAssignments,
+  parseSystemdInlineEnvironment,
   parseSystemdExecStart,
 } from "../../daemon/systemd-unit.js";
 import { migrateDaemonRuntimePins } from "../../infra/state-migrations.daemon-runtime-pins.js";
@@ -32,6 +32,7 @@ import * as exec from "../../process/exec.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { firstWrittenJsonArg } from "../test-runtime-capture.js";
 import { stubNodeRuntime } from "../update-cli/update-command-runtime-recovery.test-support.js";
+import { nativeResult } from "../update-cli/update-command-service-fixtures.test-support.js";
 import { inspectManagedGatewayServiceBeforeUpdate } from "../update-cli/update-command-service-plan.js";
 import { runDaemonInstall } from "./install.js";
 
@@ -254,12 +255,9 @@ async function fixture(
     }
     return readFile(...args);
   });
-  native.systemctl.mockImplementation(async (_env, args: string[]) => ({
-    code: args[0] === "show" ? 1 : 0,
-    stdout: "",
-    stderr: "",
-    termination: "exit",
-  }));
+  native.systemctl.mockImplementation(async (_env, args: string[]) =>
+    nativeResult("", args[0] === "show" ? 1 : 0),
+  );
   native.serviceRuntime.mockResolvedValue(runtime("stopped"));
   const existing = {
     programArguments: [
@@ -302,17 +300,9 @@ async function fixture(
   }
   native.command.mockImplementation(async () => {
     const content = await fs.readFile(native.source, "utf8");
-    const environment = Object.fromEntries(
-      content
-        .split("\n")
-        .filter((line) => line.startsWith("Environment="))
-        .flatMap((line) =>
-          parseSystemdEnvAssignments(line.slice(12)).map(({ key, value }) => [key, value]),
-        ),
-    );
     return {
       programArguments: parseSystemdExecStart(/^ExecStart=(.*)$/mu.exec(content)?.[1] ?? ""),
-      environment,
+      environment: parseSystemdInlineEnvironment(content),
       sourcePath: native.source,
       definitionPaths: [native.source],
     };
@@ -393,6 +383,10 @@ function expectWarningStep(runId: string, detail: ReturnType<typeof expect.strin
   );
 }
 
+function expectPlistInteger(content: string, key: string, value: number) {
+  expect(content).toMatch(new RegExp(`<key>${key}</key>\\s*<integer>${value}</integer>`));
+}
+
 async function runStandaloneDoctor(
   mode: "direct" | "maintenance" = "direct",
   running = true,
@@ -457,7 +451,7 @@ describe.skipIf(process.platform === "win32")("service definition repair", () =>
     native.systemctl.mockImplementation(async (...args) => {
       if (args[1][0] === "restart") {
         await fs.appendFile(f.source, "# operator edit during failed activation\n");
-        return { code: 1, stdout: "", stderr: "fixture activation failed", termination: "exit" };
+        return nativeResult("", 1, "fixture activation failed");
       }
       return execute(...args);
     });
@@ -544,9 +538,14 @@ describe.skipIf(process.platform === "win32")("service definition repair", () =>
     expect(systemctlCalls("restart")).toHaveLength(0);
   });
 
-  it.each(["ExecStartPre", "foreign-unit", "foreign-root", "old-installation"] as const)(
+  it.each([
+    ["ExecStartPre", "Service.ExecStartPre"],
+    ["foreign-unit", "selected service is outside the managed user-unit path"],
+    ["foreign-root", "unknown or foreign installation"],
+    ["old-installation", "unknown or foreign installation"],
+  ] as const)(
     "preserves the entire definition when candidate repair finds %s",
-    async (edit) => {
+    async (edit, warning) => {
       const f = await fixture(edit);
       if (edit === "old-installation") {
         native.serviceRuntime.mockResolvedValue({
@@ -559,15 +558,7 @@ describe.skipIf(process.platform === "win32")("service definition repair", () =>
       expect(result.ok).toBe(false);
       expect(result.definitionBackup).toBeUndefined();
       expect(result.error).toContain("SERVICE_DEFINITION_UNKNOWN");
-      expect(result.warnings).toContainEqual(
-        expect.stringContaining(
-          edit === "ExecStartPre"
-            ? "Service.ExecStartPre"
-            : edit === "foreign-unit"
-              ? "selected service is outside the managed user-unit path"
-              : "unknown or foreign installation",
-        ),
-      );
+      expect(result.warnings).toContainEqual(expect.stringContaining(warning));
       await expectPreserved(f, before);
       expect(await read(resolveSystemdUnitPath(process.env))).toBe(f.original);
       if (edit === "old-installation") {
@@ -585,7 +576,7 @@ describe.skipIf(process.platform === "win32")("service definition repair", () =>
       if (args.includes("After,Wants,RestartUSec,KillMode,LoadState,TimeoutStopUSec")) {
         await fs.writeFile(f.source, edited);
       }
-      return { code: args[0] === "show" ? 1 : 0, stdout: "", stderr: "", termination: "exit" };
+      return nativeResult("", args[0] === "show" ? 1 : 0);
     });
     await rejectedInstall();
     expect(response().warnings).toContainEqual(
@@ -616,12 +607,11 @@ describe.skipIf(process.platform === "win32")("service definition repair", () =>
         }
         return decodeLaunchAgentPlistFixture(options.input, args[1]);
       });
-      native.launchctl.mockImplementation(async (args) => ({
-        code: 0,
-        stdout: args[0] === "print" ? `${args[1]} = {\n\tstate = running\n\tpid = 4242\n}\n` : "",
-        stderr: "",
-        termination: "exit",
-      }));
+      native.launchctl.mockImplementation(async (args) =>
+        nativeResult(
+          args[0] === "print" ? `${args[1]} = {\n\tstate = running\n\tpid = 4242\n}\n` : "",
+        ),
+      );
       const plan = await buildPlan();
       const source = resolveLaunchAgentPlistPath(process.env);
       const { stdoutPath } = resolveGatewaySupervisorLogPaths(process.env);
@@ -652,17 +642,9 @@ describe.skipIf(process.platform === "win32")("service definition repair", () =>
       if (portDrift) {
         expect(changed).toContain("<string>19138</string>");
       }
-      expect(changed).toMatch(
-        new RegExp(
-          `<key>ExitTimeOut</key>\\s*<integer>${seconds === 20 && throttle !== 45 ? 330 : seconds}</integer>`,
-        ),
-      );
+      expectPlistInteger(changed, "ExitTimeOut", seconds === 20 && throttle !== 45 ? 330 : seconds);
       if (migrated) {
-        expect(changed).toMatch(
-          new RegExp(
-            `<key>ThrottleInterval</key>\\s*<integer>${throttle === 45 ? 45 : 10}</integer>`,
-          ),
-        );
+        expectPlistInteger(changed, "ThrottleInterval", throttle === 45 ? 45 : 10);
         await expectDefinitionBackups({ source, original });
         expect(
           native.launchctl.mock.calls.filter(([args]) => args[0] === "bootstrap"),

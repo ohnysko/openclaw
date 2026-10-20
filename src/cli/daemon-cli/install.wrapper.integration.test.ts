@@ -70,6 +70,11 @@ let originalArgv: string[];
 let entrypoint: string;
 let exit: ExitError;
 const originalExit = defaultRuntime.exit.getMockImplementation()!;
+const sqliteCapabilities = {
+  sqliteVersion: "3.53.4",
+  nodeSharedSqlite: false,
+  sqliteProbe: { available: true, version: "3.53.4", text: true, blob: true, json: true },
+};
 
 function parseInstall(args: string[]) {
   const program = new Command().name("openclaw");
@@ -89,14 +94,11 @@ it("uses the running Bun on first install when Node is unavailable", async () =>
   Object.defineProperty(process.versions, "bun", { configurable: true, value: "1.4.3" });
   vi.spyOn(runtimePaths, "resolvePreferredNodePath").mockResolvedValue(undefined);
   vi.spyOn(runtimePaths, "resolveSystemNodeInfo").mockResolvedValue(null);
-  const supported = {
+  const probe = vi.spyOn(runtimePaths, "resolveBunRuntimeInfo").mockResolvedValue({
     status: "supported" as const,
     version: "1.4.3",
-    sqliteVersion: "3.53.4",
-    sqliteProbe: { available: true, version: "3.53.4", text: true, blob: true, json: true },
-    nodeSharedSqlite: false,
-  };
-  const probe = vi.spyOn(runtimePaths, "resolveBunRuntimeInfo").mockResolvedValue(supported);
+    ...sqliteCapabilities,
+  });
   try {
     await parseInstall(["--force", "--port", "29453", "--json"]);
     expect(runtimeErrors).toEqual([]);
@@ -284,9 +286,7 @@ it.each(["blank-wrapper", "missing-replacement-runtime"] as const)(
         runtime: "node",
         path: "/opt/prior/node",
         version: "20.0.0",
-        sqliteVersion: "3.53.4",
-        nodeSharedSqlite: false,
-        sqliteProbe: { available: true, version: "3.53.4", text: true, blob: true, json: true },
+        ...sqliteCapabilities,
       });
       vi.spyOn(runtimePaths, "resolvePreferredNodePath").mockResolvedValue(undefined);
     }
