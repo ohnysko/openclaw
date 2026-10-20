@@ -1,4 +1,5 @@
 import { expect, it } from "vitest";
+import { configureMerge, expectExit } from "./pr-merge-assertions.test-support.js";
 import { createMergeOutcomeFixtureHarness } from "./pr-merge-outcome.test-support.js";
 import { createPriorCiCandidateFactory } from "./pr-merge-prior-ci.test-support.js";
 import { landingSnapshotQuery } from "./pr-merge-snapshot.test-support.js";
@@ -9,7 +10,7 @@ type Candidate = ReturnType<typeof preExistingCandidate>;
 
 function unknownGraphqlCandidate() {
   const f = preExistingCandidate();
-  f.save({ ...f.state(), graphqlMergeProjection: { mergeStateStatus: "UNKNOWN" } });
+  configureMerge(f, { graphqlMergeProjection: { mergeStateStatus: "UNKNOWN" } });
   return f;
 }
 
@@ -130,8 +131,7 @@ describePosix("prior-CI whole REST observation fallback", () => {
       state.restObservation = { advanceMain: true };
     }
     f.save(state);
-    const result = f.adminPriorCi(f.path);
-    expect(result.status, result.output).toBe(0);
+    const result = expectExit(f.adminPriorCi(f.path));
     const final = f.state();
     expect(final).toMatchObject({
       mutations: 1,
@@ -195,8 +195,7 @@ describePosix("prior-CI whole REST observation fallback", () => {
   it("keeps the full authority deadline after UNKNOWN settles and main advances again", () => {
     const f = unknownGraphqlCandidate();
     const main = f.commit(f.tree("before\n", "advanced\n"), [f.base]);
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       mode: "unapplied",
       projectionSettlement: {
         seconds: 4,
@@ -212,9 +211,7 @@ describePosix("prior-CI whole REST observation fallback", () => {
       ],
     });
 
-    const result = f.adminPriorCi(f.path);
-
-    expect(result.status, result.output).toBe(1);
+    const result = expectExit(f.adminPriorCi(f.path), 1);
     expect(result.output).toContain("prior dispatch unresolved");
     expect(f.state().settlementSleeps).toEqual([2, 2]);
     expect(f.state().mainAdvances).toHaveLength(1);
@@ -232,8 +229,7 @@ describePosix("prior-CI whole REST observation fallback", () => {
     "refuses %s after a remote-only main advance",
     (fault) => {
       const f = unknownGraphqlCandidate();
-      f.save({
-        ...f.state(),
+      configureMerge(f, {
         restObservations: [
           {},
           {},
@@ -266,16 +262,14 @@ describePosix("prior-CI whole REST observation fallback", () => {
 
   it("refuses a missing merged receipt during active prior-CI admission", () => {
     const f = unknownGraphqlCandidate();
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       restMergeCommit: "missing",
       restObservation: {
         afterRestMainReads: 7,
         pr: { state: "MERGED", mergeCommit: { oid: f.base } },
       },
     });
-    const result = f.adminPriorCi(f.path);
-    expect(result.status, result.output).toBe(1);
+    const result = expectExit(f.adminPriorCi(f.path), 1);
     expect(result.output).toContain("merged PR commit requires GraphQL observation");
     expect(f.state().observationReads).toBe(1);
     expectNoDispatch(f);
@@ -283,14 +277,11 @@ describePosix("prior-CI whole REST observation fallback", () => {
 
   it("reads its single check inventory after historical preparation", () => {
     const f = unknownGraphqlCandidate();
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       restObservation: { afterHistoricalRead: true, restUnseenSuite: "new-gate" },
     });
 
-    const result = f.adminPriorCi(f.path);
-
-    expect(result.status, result.output).toBe(1);
+    const result = expectExit(f.adminPriorCi(f.path), 1);
     expect(result.output).toContain("currently effective CI gate");
     const state = f.state();
     expect(state.restObservationAppliedAt).toBeGreaterThan(0);
@@ -312,9 +303,8 @@ describePosix("prior-CI whole REST observation fallback", () => {
     "preserves prior-CI admission when GraphQL quota expires after %s known observations",
     (observations) => {
       const f = preExistingCandidate();
-      f.save({ ...f.state(), quotaAt: "observe", quotaAfterObservations: observations });
-      const result = f.adminPriorCi(f.path);
-      expect(result.status, result.output).toBe(0);
+      configureMerge(f, { quotaAt: "observe", quotaAfterObservations: observations });
+      expectExit(f.adminPriorCi(f.path));
       expect(f.state()).toMatchObject({
         observationReads: observations,
         mutations: 1,
@@ -365,8 +355,7 @@ describePosix("prior-CI whole REST observation fallback", () => {
       state.quotaAfterObservations = 4;
     }
     f.save(state);
-    const result = f.adminPriorCi(f.path);
-    expect(result.status, result.output).toBe(1);
+    const result = expectExit(f.adminPriorCi(f.path), 1);
     expect(result.output).toContain(diagnostic);
     const final = f.state();
     if (quota) {
@@ -571,8 +560,7 @@ describePosix("prior-CI whole REST observation fallback", () => {
   it("keeps an unknown prior-CI outcome fenced when main moves inside reconciliation", () => {
     const f = unknownGraphqlCandidate();
     const main = f.commit(f.tree("before\n", "advanced\n"), [f.base]);
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       mode: "unapplied",
       restMainAdvance: { boundary: "during-evidence", observed: false, main },
     });
@@ -644,8 +632,7 @@ describePosix("prior-CI whole REST observation fallback", () => {
       state.restObservation = observation;
     }
     f.save(state);
-    const result = f.adminPriorCi(f.path);
-    expect(result.status, result.output).toBe(1);
+    const result = expectExit(f.adminPriorCi(f.path), 1);
     expect(result.output).toContain(diagnostic);
     if (fault === "GraphQL conflict") {
       expect(f.state().restMainReads).toBe(0);
@@ -662,14 +649,8 @@ describePosix("prior-CI whole REST observation fallback", () => {
     "keeps ordinary REST admission strict for blocked projection with %s checks",
     (gates, diagnostic) => {
       const f = fixture();
-      f.save({
-        ...f.state(),
-        restPolicy: "rules",
-        gates,
-        pr: { ...f.state().pr, mergeStateStatus: "BLOCKED" },
-      });
-      const result = f.run();
-      expect(result.status, result.output).toBe(1);
+      configureMerge(f, { restPolicy: "rules", gates, pr: { mergeStateStatus: "BLOCKED" } });
+      const result = expectExit(f.run(), 1);
       expect(result.output).toContain(diagnostic);
       expect(f.state().mutations).toBe(0);
       expect(() => f.record()).toThrow();

@@ -1,10 +1,19 @@
 import { existsSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, it } from "vitest";
+import { applyFault, configureMerge, expectExit } from "./pr-merge-assertions.test-support.js";
 import { createMergeOutcomeFixtureHarness } from "./pr-merge-outcome.test-support.js";
 
 const { fixture, createLegacyRefusal, outcomeRef, describePosix } =
   createMergeOutcomeFixtureHarness();
+
+function legacyRun(
+  f: ReturnType<typeof fixture>,
+  legacy: ReturnType<typeof createLegacyRefusal>,
+  head: string,
+) {
+  return f.run(false, f.repo, "squash", legacy.oid, head, "", "", legacy.directory);
+}
 
 describePosix("native merge outcome with real Git and supervised lock recovery", () => {
   it.each([false, true])(
@@ -14,18 +23,9 @@ describePosix("native merge outcome with real Git and supervised lock recovery",
       const legacy = createLegacyRefusal(f);
       const approvedHead = f.replacePreparedHead();
       if (recover) {
-        f.save({ ...f.state(), mode: "unapplied" });
+        configureMerge(f, { mode: "unapplied" });
       }
-      const run = f.run(
-        false,
-        f.repo,
-        "squash",
-        legacy.oid,
-        approvedHead,
-        "",
-        "",
-        legacy.directory,
-      );
+      const run = legacyRun(f, legacy, approvedHead);
       expect(run.status, run.output).toBe(recover ? 1 : 0);
       expect(f.state().mutations).toBe(1);
       const previous = f.git(["rev-parse", outcomeRef]);
@@ -43,9 +43,8 @@ describePosix("native merge outcome with real Git and supervised lock recovery",
       expect(previousRecord).not.toHaveProperty("recovery");
       if (recover) {
         f.recover();
-        f.save({ ...f.state(), mode: "success" });
-        const recovered = f.run(false, f.repo, "squash", previous);
-        expect(recovered.status, recovered.output).toBe(0);
+        configureMerge(f, { mode: "success" });
+        expectExit(f.run(false, f.repo, "squash", previous));
         expect(f.record()).toMatchObject({
           phase: "complete",
           head: approvedHead,
@@ -53,18 +52,9 @@ describePosix("native merge outcome with real Git and supervised lock recovery",
         });
         f.git(["merge-base", "--is-ancestor", previous, outcomeRef]);
       }
-      expect(f.run().status).toBe(0);
+      expectExit(f.run());
       expect(f.state().mutations).toBe(recover ? 2 : 1);
-      const replay = f.run(
-        false,
-        f.repo,
-        "squash",
-        legacy.oid,
-        approvedHead,
-        "",
-        "",
-        legacy.directory,
-      );
+      const replay = legacyRun(f, legacy, approvedHead);
       expect(replay.status, replay.output).toBe(1);
       expect(f.state().mutations).toBe(recover ? 2 : 1);
       if (recover) {
@@ -110,18 +100,32 @@ describePosix("native merge outcome with real Git and supervised lock recovery",
     const approvedHead = f.replacePreparedHead();
     const next = f.state();
     const capture = join(f.worktree, ".local/merge-output.log");
-    if (fault === "timeout") {
-      const text = "502 after dispatch\n";
-      writeFileSync(capture, text);
-      writeFileSync(join(legacy.directory, "merge-output.log"), text);
-      legacy.oid = f.git(["hash-object", "--no-filters", capture]);
-    }
-    if (fault === "extra-capture") {
-      writeFileSync(join(f.worktree, ".local/merge-output.other.log"), "");
-    }
-    if (fault === "wrong-hash") {
-      legacy.oid = f.base;
-    }
+    applyFault(fault, {
+      timeout: () => {
+        const text = "502 after dispatch\n";
+        writeFileSync(capture, text);
+        writeFileSync(join(legacy.directory, "merge-output.log"), text);
+        legacy.oid = f.git(["hash-object", "--no-filters", capture]);
+      },
+      "extra-capture": () => writeFileSync(join(f.worktree, ".local/merge-output.other.log"), ""),
+      "wrong-hash": () => {
+        legacy.oid = f.base;
+      },
+      "missing-proof": () => rmSync(join(legacy.directory, "prep.md")),
+      symlink: () => {
+        rmSync(capture);
+        symlinkSync(join(legacy.directory, "merge-output.log"), capture);
+      },
+      queue: () => {
+        next.pr.isMergeQueueEnabled = true;
+      },
+      "ci-proof": () => {
+        next.ciExit = 15;
+      },
+      "changed-capture": () => {
+        next.duringChecks = { artifact: "merge-output.log" };
+      },
+    });
     if (fault === "wrong-pr" || fault === "wrong-base") {
       const path = join(legacy.directory, "prep.env");
       writeFileSync(
@@ -132,33 +136,8 @@ describePosix("native merge outcome with real Git and supervised lock recovery",
         ),
       );
     }
-    if (fault === "missing-proof") {
-      rmSync(join(legacy.directory, "prep.md"));
-    }
-    if (fault === "symlink") {
-      rmSync(capture);
-      symlinkSync(join(legacy.directory, "merge-output.log"), capture);
-    }
-    if (fault === "queue") {
-      next.pr.isMergeQueueEnabled = true;
-    }
-    if (fault === "ci-proof") {
-      next.ciExit = 15;
-    }
-    if (fault === "changed-capture") {
-      next.duringChecks = { artifact: "merge-output.log" };
-    }
     f.save(next);
-    const run = f.run(
-      false,
-      f.repo,
-      "squash",
-      legacy.oid,
-      fault === "no-head" ? "" : approvedHead,
-      "",
-      "",
-      legacy.directory,
-    );
+    const run = legacyRun(f, legacy, fault === "no-head" ? "" : approvedHead);
     expect(run.status, run.output).not.toBe(0);
     expect(f.state().mutations, run.output).toBe(0);
     expect(f.state().posts).toBe(0);

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, it } from "vitest";
+import { configureMerge, expectExit } from "./pr-merge-assertions.test-support.js";
 import { createMergeOutcomeFixtureHarness } from "./pr-merge-outcome.test-support.js";
 import { createPriorCiCandidateFactory } from "./pr-merge-prior-ci.test-support.js";
 
@@ -23,9 +24,8 @@ function mergeRequests(f: RecoveryFixture) {
 
 const rejectedAttempt = reuseCompletedSetup(function (response: string = refusal) {
   const f = preExistingCandidate();
-  f.save({ ...f.state(), restMergeRefusal: response });
-  const result = f.adminPriorCi(f.path);
-  expect(result.status, result.output).toBe(1);
+  configureMerge(f, { restMergeRefusal: response });
+  expectExit(f.adminPriorCi(f.path), 1);
   expect(mergeRequests(f)).toHaveLength(1);
   expect(f.state().pr).toMatchObject({ state: "OPEN", mergeCommit: null });
   expect(f.record()).toMatchObject({
@@ -39,7 +39,7 @@ const rejectedAttempt = reuseCompletedSetup(function (response: string = refusal
   const capture = `merge-output.${record.attempt}.log`;
   expect(readFileSync(join(f.worktree, ".local", capture), "utf8")).toBe(response);
   expect(f.recover()).toBe(false);
-  f.save({ ...f.state(), restMergeRefusal: "" });
+  configureMerge(f, { restMergeRefusal: "" });
   return { f, oid, record, capture };
 });
 
@@ -70,14 +70,12 @@ function rewriteRecord(f: RecoveryFixture, changes: Record<string, unknown>) {
 describePosix("explicit prior-CI provider rejection recovery", () => {
   it("recovers the exact rejected request and retains its intent and bytes through cleanup", () => {
     const { f, oid, record, capture } = rejectedAttempt();
-    const ordinary = f.run();
-    expect(ordinary.status, ordinary.output).toBe(1);
+    expectExit(f.run(), 1);
     expect(mergeRequests(f)).toHaveLength(1);
     expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
     f.recover();
 
-    const recovered = f.adminPriorCi(f.path, true, oid);
-    expect(recovered.status, recovered.output).toBe(0);
+    expectExit(f.adminPriorCi(f.path, true, oid));
     expect(mergeRequests(f)).toHaveLength(2);
     expect(f.state()).toMatchObject({ posts: 1, pr: { state: "MERGED" } });
     expect(f.record()).toMatchObject({
@@ -102,8 +100,7 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
     expectRetainedCapture(f, outcomeRef, capture);
     expect(existsSync(f.worktree)).toBe(false);
     const complete = f.git(["rev-parse", outcomeRef]);
-    const stale = f.adminPriorCi(f.path, true, oid);
-    expect(stale.status, stale.output).toBe(1);
+    expectExit(f.adminPriorCi(f.path, true, oid), 1);
     expect(mergeRequests(f)).toHaveLength(2);
     expect(f.git(["rev-parse", outcomeRef])).toBe(complete);
   });
@@ -111,9 +108,8 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
   it("requires a separate decision for each rejection and retains both captures after success", () => {
     const first = rejectedAttempt();
     const { f } = first;
-    f.save({ ...f.state(), restMergeRefusal: refusal });
-    const second = f.adminPriorCi(f.path, true, first.oid);
-    expect(second.status, second.output).toBe(1);
+    configureMerge(f, { restMergeRefusal: refusal });
+    expectExit(f.adminPriorCi(f.path, true, first.oid), 1);
     const secondOid = f.git(["rev-parse", outcomeRef]);
     const secondRecord = f.record();
     const secondCapture = `merge-output.${secondRecord.attempt}.log`;
@@ -124,14 +120,12 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
     expectRetainedCapture(f, secondOid, first.capture);
     expect(f.recover()).toBe(false);
 
-    const stale = f.adminPriorCi(f.path, true, first.oid);
-    expect(stale.status, stale.output).toBe(1);
+    expectExit(f.adminPriorCi(f.path, true, first.oid), 1);
     expect(mergeRequests(f)).toHaveLength(2);
     expect(f.git(["rev-parse", outcomeRef])).toBe(secondOid);
     f.recover();
-    f.save({ ...f.state(), restMergeRefusal: "" });
-    const final = f.adminPriorCi(f.path, true, secondOid);
-    expect(final.status, final.output).toBe(0);
+    configureMerge(f, { restMergeRefusal: "" });
+    expectExit(f.adminPriorCi(f.path, true, secondOid));
     expect(mergeRequests(f)).toHaveLength(3);
     expect(f.record()).toMatchObject({
       phase: "complete",
@@ -166,8 +160,7 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
     ["mixed success", refusal + '{"merged":true}\n'],
   ])("does not authorize a retry from %s capture bytes", (_name, response) => {
     const { f, oid, capture } = rejectedAttempt(response);
-    const result = f.adminPriorCi(f.path, true, oid);
-    expect(result.status, result.output).toBe(1);
+    const result = expectExit(f.adminPriorCi(f.path, true, oid), 1);
     expect(result.output).toContain("complete exact GitHub base-modified HTTP 405 rejection");
     expect(mergeRequests(f)).toHaveLength(1);
     expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
@@ -187,8 +180,7 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
       } else {
         writeFileSync(join(f.worktree, ".local/merge-output.unknown.log"), refusal);
       }
-      const result = f.adminPriorCi(f.path, true, oid);
-      expect(result.status, result.output).toBe(1);
+      expectExit(f.adminPriorCi(f.path, true, oid), 1);
       expect(mergeRequests(f)).toHaveLength(1);
       expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
       expect(readFileSync(target, "utf8")).toBe(refusal);
@@ -247,8 +239,7 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
         state.priorCi.mutateEvidence = true;
       }
       f.save(state);
-      const result = f.adminPriorCi(f.path, true, oid);
-      expect(result.status, result.output).toBe(1);
+      expectExit(f.adminPriorCi(f.path, true, oid), 1);
       expect(mergeRequests(f)).toHaveLength(1);
       expect(f.git(["rev-parse", outcomeRef])).toBe(oid);
       expect(f.state().pr.mergeCommit).toBeNull();
@@ -257,13 +248,11 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
 
   it("rechecks rejection bytes after the final awaited metadata read", () => {
     const { f, oid } = rejectedAttempt();
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       observationReads: 0,
       observations: [{}, {}, {}, {}, { tamperProviderCapture: true }],
     });
-    const result = f.adminPriorCi(f.path, true, oid);
-    expect(result.status, result.output).toBe(1);
+    const result = expectExit(f.adminPriorCi(f.path, true, oid), 1);
     expect(f.state().providerCaptureTampered).toBe(true);
     expect(result.output).toContain("provider rejection");
     expect(mergeRequests(f)).toHaveLength(1);
@@ -272,9 +261,8 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
 
   it("does not overwrite a competing outcome at the recovery intent CAS", () => {
     const { f, oid, capture } = rejectedAttempt();
-    f.save({ ...f.state(), crash: "successor" });
-    const result = f.adminPriorCi(f.path, true, oid);
-    expect(result.status, result.output).toBe(1);
+    configureMerge(f, { crash: "successor" });
+    expectExit(f.adminPriorCi(f.path, true, oid), 1);
     expect(f.git(["cat-file", "blob", outcomeRef])).toBe("successor");
     expect(mergeRequests(f)).toHaveLength(1);
     expect(readFileSync(join(f.worktree, ".local", capture), "utf8")).toBe(refusal);
@@ -285,16 +273,11 @@ describePosix("explicit prior-CI provider rejection recovery", () => {
     const { f, oid } = rejectedAttempt();
     const landed = f.commit(f.git(["merge-tree", "--write-tree", f.base, f.head]), [f.base]);
     f.git(["push", "-q", "origin", `${landed}:refs/heads/main`]);
-    f.save({
-      ...f.state(),
-      pr: { ...f.state().pr, state: "MERGED", mergeCommit: { oid: landed } },
-    });
-    const retry = f.adminPriorCi(f.path, true, oid);
-    expect(retry.status, retry.output).toBe(1);
+    configureMerge(f, { pr: { state: "MERGED", mergeCommit: { oid: landed } } });
+    expectExit(f.adminPriorCi(f.path, true, oid), 1);
     expect(mergeRequests(f)).toHaveLength(1);
     f.recover();
-    const reconciled = f.run();
-    expect(reconciled.status, reconciled.output).toBe(0);
+    expectExit(f.run());
     expect(f.record()).toMatchObject({ phase: "merged", landed });
     expect(mergeRequests(f)).toHaveLength(1);
     expect(f.state().posts).toBe(0);

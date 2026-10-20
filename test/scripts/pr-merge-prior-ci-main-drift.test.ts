@@ -1,36 +1,19 @@
-import { rmSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterAll, afterEach, expect, it } from "vitest";
-import { copyTreeCloseOnExec } from "../helpers/close-on-exec-copy.js";
-import { cleanupTempDirs, useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
+import { expect, it } from "vitest";
+import { configureMerge, expectExit } from "./pr-merge-assertions.test-support.js";
 import { createMergeOutcomeFixtureHarness } from "./pr-merge-outcome.test-support.js";
 import { createPriorCiCandidateFactory } from "./pr-merge-prior-ci.test-support.js";
 
-const { describePosix, fixture } = createMergeOutcomeFixtureHarness();
+const { describePosix, fixture, reuseCompletedSetup } = createMergeOutcomeFixtureHarness();
 const { preExistingCandidate: createCandidate } = createPriorCiCandidateFactory(fixture);
-const snapshots = useAutoCleanupTempDirTracker(afterAll);
-const restoredRoots = new Set<string>();
-afterEach(() => cleanupTempDirs(restoredRoots));
-let prepared: { candidate: ReturnType<typeof createCandidate>; snapshot: string } | undefined;
-
-function preExistingCandidate() {
-  if (!prepared) {
-    const candidate = createCandidate();
-    const snapshot = snapshots.make("pr-main-drift-setup-");
-    copyTreeCloseOnExec(candidate.root, snapshot);
-    prepared = { candidate, snapshot };
-  } else {
-    // Keep absolute worktree and evidence paths valid while resetting every case's refs and state.
-    rmSync(prepared.candidate.root, { recursive: true, force: true });
-    copyTreeCloseOnExec(prepared.snapshot, prepared.candidate.root);
-    restoredRoots.add(prepared.candidate.root);
-  }
-  return prepared.candidate;
-}
+const restoredCandidate = reuseCompletedSetup(() => ({ f: createCandidate() }));
+const preExistingCandidate = () => restoredCandidate().f;
+const unknown = { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
+const ready = { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" };
 
 function expectNoDispatch(f: ReturnType<typeof preExistingCandidate>) {
-  expect(f.state().mutations).toBe(0);
-  expect(f.state().posts).toBe(0);
+  expect(f.state()).toMatchObject({ mutations: 0, posts: 0 });
   expect(f.captures()).toEqual([]);
   expect(() => f.record()).toThrow();
 }
@@ -40,8 +23,6 @@ describePosix("prior-CI forward main admission", () => {
     "uses projection hints between full REST snapshots during %s settlement",
     (stage) => {
       const f = preExistingCandidate();
-      const unknown = { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
-      const ready = { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" };
       const state = f.state();
       state.graphqlMergeProjection = unknown;
       state.projectionSettlement = { seconds: stage === "initial" ? 22 : 24, pr: ready };
@@ -77,14 +58,12 @@ describePosix("prior-CI forward main admission", () => {
 
   it("does not admit a known hint when the complete snapshot is still UNKNOWN", () => {
     const f = preExistingCandidate();
-    const unknown = { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       graphqlMergeProjection: unknown,
       observations: [{ pr: unknown }],
       projectionSettlement: {
         seconds: 2,
-        pr: { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" },
+        pr: ready,
       },
       restObservations: [{ pr: unknown }],
     });
@@ -101,16 +80,13 @@ describePosix("prior-CI forward main admission", () => {
     "rechecks %s after a known projection hint before admitting the complete snapshot",
     (fault) => {
       const f = preExistingCandidate();
-      const unknown = { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
-      const ready = { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" };
       const changed =
         fault === "head"
           ? { pr: { ...ready, headRefOid: f.base } }
           : fault === "main"
             ? { pr: ready, main: f.commit(f.tree("conflicting\n", "stable\n"), [f.base]) }
             : { pr: ready, priorCi: { reviewCount: 2 } };
-      f.save({
-        ...f.state(),
+      configureMerge(f, {
         graphqlMergeProjection: unknown,
         projectionSettlement: { seconds: 4, pr: ready },
         restObservations: [{}, { advanceMain: true, pr: unknown }, changed],
@@ -132,9 +108,7 @@ describePosix("prior-CI forward main admission", () => {
 
   it("preserves the UNKNOWN budget while rematerializing a cold main before authority", () => {
     const f = preExistingCandidate();
-    const unknown = { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       mainProofDelaySeconds: 197,
       mainProofDelayAfterObservations: 5,
       observations: [
@@ -144,7 +118,7 @@ describePosix("prior-CI forward main admission", () => {
         {},
         { advanceMain: true, pr: unknown },
         { pr: unknown },
-        { pr: { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" } },
+        { pr: ready },
       ],
     });
 
@@ -173,9 +147,9 @@ describePosix("prior-CI forward main admission", () => {
       const main = f.commit(f.tree("before\n", "advanced\n"), [f.base]);
       const state = f.state();
       const observations = [
-        { main, pr: { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" } },
+        { main, pr: unknown },
         {
-          pr: { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" },
+          pr: ready,
           advanceSeconds: readSeconds,
         },
       ];
@@ -185,7 +159,7 @@ describePosix("prior-CI forward main admission", () => {
         state.graphqlMergeProjection = { mergeStateStatus: "UNKNOWN" };
         state.projectionSettlement = {
           seconds: 4,
-          pr: { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" },
+          pr: ready,
         };
         state.restObservations = [{}, {}, {}, ...observations];
       } else {
@@ -294,8 +268,7 @@ describePosix("prior-CI forward main admission", () => {
 
   it("lands after more than three main advances once a round stays stable", () => {
     const f = preExistingCandidate();
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       graphqlMergeProjection: { mergeStateStatus: "UNKNOWN" },
       restObservations: [
         {},
@@ -317,8 +290,7 @@ describePosix("prior-CI forward main admission", () => {
 
   it("stops at the authority deadline before intent when main keeps advancing", () => {
     const f = preExistingCandidate();
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       graphqlMergeProjection: { mergeStateStatus: "UNKNOWN" },
       restObservations: [{}, {}, {}, { advanceMain: true, advanceSeconds: 901 }],
     });
@@ -344,7 +316,6 @@ describePosix("prior-CI forward main admission", () => {
     const recalculating = stage.includes("recalculation");
     let main = remoteOnly ? f.base : f.commit(f.tree("before\n", "advanced\n"), [f.base]);
     const state = f.state();
-    const unknown = { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
     const settled = {
       mergeable: "MERGEABLE",
       mergeStateStatus: stage.includes("known status") ? "CLEAN" : "BLOCKED",
@@ -379,8 +350,7 @@ describePosix("prior-CI forward main admission", () => {
       }
     }
     f.save(state);
-    const result = f.adminPriorCi(f.path);
-    expect(result.status, result.output).toBe(0);
+    const result = expectExit(f.adminPriorCi(f.path));
     expect(f.state().mutations).toBe(1);
     expect(f.record()).toMatchObject({ phase: "complete", head: f.head });
     if (remoteOnly) {
@@ -431,20 +401,16 @@ describePosix("prior-CI forward main admission", () => {
   it("waits for late mergeability recalculation after a verified main advance", () => {
     const f = preExistingCandidate();
     const main = f.commit(f.tree("before\n", "advanced\n"), [f.base]);
-    const unknown = { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" };
-    f.save({
-      ...f.state(),
+    configureMerge(f, {
       observations: [
         {},
         { main, pr: unknown },
         ...Array.from({ length: 3 }, () => ({ pr: unknown })),
-        { pr: { mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" } },
+        { pr: ready },
       ],
     });
 
-    const result = f.adminPriorCi(f.path);
-
-    expect(result.status, result.output).toBe(0);
+    expectExit(f.adminPriorCi(f.path));
     expect(f.state().settlementSleeps).toEqual([2, 4, 8, 8]);
     expect(f.state().mutations).toBe(1);
     expect(f.record()).toMatchObject({ phase: "complete", head: f.head });
@@ -470,7 +436,7 @@ describePosix("prior-CI forward main admission", () => {
       ...Array.from({ length: fault.startsWith("final ") ? 4 : 1 }, () => ({})),
       {
         main: fault === "same main" ? f.base : main,
-        pr: { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" },
+        pr: unknown,
       },
       ...(fault === "persistent" || fault === "same main"
         ? []
@@ -673,7 +639,7 @@ describePosix("prior-CI forward main admission", () => {
     const scripts = replace(`${f.base}:scripts`, "lib", `040000 tree ${lib}\tlib`);
     const tree = replace(f.base, "scripts", `040000 tree ${scripts}\tscripts`);
     const main = f.commit(tree, [f.base]);
-    f.save({ ...f.state(), observations: [{}, { main }] });
+    configureMerge(f, { observations: [{}, { main }] });
 
     const result = f.adminPriorCi(f.path);
 
@@ -684,14 +650,14 @@ describePosix("prior-CI forward main admission", () => {
 
   it("keeps retained prior-CI outcomes fenced after main moves", () => {
     const f = preExistingCandidate();
-    f.save({ ...f.state(), mode: "unapplied" });
+    configureMerge(f, { mode: "unapplied" });
     f.adminPriorCi(f.path);
     expect(f.record()).toMatchObject({ phase: "intent", route: "admin" });
     expect(f.state().mutations).toBe(1);
     expect(f.recover()).toBe(false);
     const outcome = f.git(["rev-parse", "refs/openclaw/pr-merge-outcomes/123"]);
     const main = f.commit(f.tree("before\n", "advanced\n"), [f.base]);
-    f.save({ ...f.state(), observations: [{}, { main }] });
+    configureMerge(f, { observations: [{}, { main }] });
 
     const result = f.run();
 
