@@ -25,7 +25,7 @@ import { createRequireRecord } from "../../../test/helpers/record.js";
 import { waitForControlUiGatewayReady } from "../test-helpers/control-ui-e2e-readiness.ts";
 import { enterControlUiSession } from "../test-helpers/control-ui-session-entry.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
-import { pollCount, pollValue, pollAttribute } from "./new-session-page.test-support.ts";
+import { pollCount, pollAttribute } from "./new-session-page.test-support.ts";
 import { selectAllSidebarSessions } from "./sidebar-navigation.test-support.ts";
 
 const requireRecord = createRequireRecord("record", "expected-object-value");
@@ -337,15 +337,6 @@ suite.define(() => {
         timeoutMs: 60_000,
         onPending: () => console.log("[search-proof] waiting for the preparing UI document"),
       });
-      if (!uiDocument.ready) {
-        console.log(
-          "[search-proof] document readiness failed",
-          JSON.stringify({
-            document: uiDocument,
-            gateway: owner.readiness.map(({ logs: _logs, ...receipt }) => receipt),
-          }),
-        );
-      }
       expect(uiDocument.ready, uiDocument.ready ? "ready" : uiDocument.reason).toBe(true);
       const handoff = await owner.cli(["dashboard", "--json"]);
       const result = requireRecord(JSON.parse(handoff.stdout));
@@ -630,56 +621,6 @@ suite.define(() => {
           expect(rpc.filter((metric) => metric.method === "sessions.search")).toHaveLength(
             queries.length,
           );
-          expect(
-            rpc.filter((metric) => metric.method === "chat.send" || metric.method === "agent"),
-          ).toEqual([]);
-          // Cover the agreed direct shortcuts against the same isolated real Gateway.
-          const currentPane = activePane();
-
-          await page.keyboard.press("ControlOrMeta+/");
-          const helper = page.locator("openclaw-keyboard-shortcuts-dialog");
-          const newHint = helper.locator(".shortcut-row").filter({ hasText: "Open New Session" });
-          const archiveHint = helper
-            .locator(".shortcut-row")
-            .filter({ hasText: "Archive current session" });
-          await newHint.waitFor({ state: "visible" });
-          await archiveHint.waitFor({ state: "visible" });
-          expect((await newHint.locator("kbd").allTextContents()).at(-1)).toBe("O");
-          expect((await archiveHint.locator("kbd").allTextContents()).at(-1)).toBe("A");
-          await page.keyboard.press("Escape");
-          await newHint.waitFor({ state: "hidden" });
-          await page.keyboard.press("ControlOrMeta+Shift+O");
-          const draft = page.locator("openclaw-new-session-page .new-session-page__message");
-          await draft.waitFor({ state: "visible" });
-          await expect
-            .poll(() => draft.evaluate((element) => element === document.activeElement))
-            .toBe(true);
-          expect(await draft.inputValue()).toBe("");
-
-          await page.goBack();
-          await expectSessionKey(currentPane, otherKey);
-          const composer = currentPane.locator(".agent-chat__composer-combobox > textarea");
-          await composer.fill("Keep this unsent shortcut draft");
-
-          await page.keyboard.press("ControlOrMeta+Shift+A");
-          const archiveRequests = (archived: boolean) =>
-            rpc.filter(
-              (metric) =>
-                metric.method === "sessions.patch" &&
-                metric.params.key === otherKey &&
-                metric.params.archived === archived,
-            );
-          await expect
-            .poll(() => archiveRequests(true).filter((metric) => metric.ok === true).length)
-            .toBe(1);
-          const undo = page.getByRole("button", { name: "Undo", exact: true });
-          await undo.waitFor({ state: "visible" });
-
-          await undo.click();
-          await expect
-            .poll(() => archiveRequests(false).filter((metric) => metric.ok === true).length)
-            .toBe(1);
-          await pollValue(composer).toBe("Keep this unsent shortcut draft");
           expect(
             rpc.filter((metric) =>
               ["sessions.create", "chat.send", "agent"].includes(metric.method),

@@ -12,15 +12,8 @@ suite.define(() => {
     it.each(keys)(`respects ${composition} composition ownership for palette %s`, async (key) => {
       await suite.withPage({}, async ({ page }) => {
         const gateway = await installMockGateway(page, {
+          sessions: [],
           methodResponses: {
-            "sessions.list": {
-              cases: [
-                {
-                  match: { search: "東京" },
-                  response: { ts: 1, path: "", count: 0, defaults: {}, sessions: [] },
-                },
-              ],
-            },
             "agents.list": {
               defaultId: "main",
               mainKey: "main",
@@ -43,7 +36,6 @@ suite.define(() => {
         await expect
           .poll(() => results.getByRole("option").allTextContents())
           .toEqual([expect.stringContaining("東京 Alpha"), expect.stringContaining("東京 Beta")]);
-        await input.focus();
         const activeId = await input.getAttribute("aria-activedescendant");
         expect(activeId).toBeTruthy();
         expect(await results.locator('[aria-selected="true"]').textContent()).toContain(

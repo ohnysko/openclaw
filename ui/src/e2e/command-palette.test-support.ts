@@ -54,9 +54,6 @@ export function scenario(
       session(foregroundKey, "Foreground planning"),
       session(appearanceKey, "Appearance audit", 120_000),
     ],
-    historyMessages: [
-      { role: "assistant", content: [{ type: "text", text: "The foreground task stays here." }] },
-    ],
     methodResponses: {
       "sessions.list": {
         cases: [

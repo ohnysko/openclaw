@@ -77,28 +77,21 @@ suite.define(() => {
     },
   );
 
-  it("submits an image-only prompt once and retries the same images after creation fails", async () => {
+  it("submits once and preserves pasted images across a failed creation and retry", async () => {
     await suite.withPage(createControlUiE2eContextOptions(), async ({ page }) => {
+      const created = { key: "agent:main:dashboard:palette-image-created", runStarted: true };
       const { gateway, palette, input, composer, url } = await openMockPalette(
         page,
         suite.server.baseUrl,
-        scenario({
-          "sessions.create": {
-            key: "agent:main:dashboard:palette-image-created",
-            runStarted: true,
-          },
-        }),
+        scenario({ "sessions.create": created }),
       );
-      const attachments = await pasteImages(input, 2);
+      const expected = { message: "", attachments: await pasteImages(input, 2) };
       const images = palette.locator(".chat-attachment-thumb img");
       const start = button(palette, "Start new session in background");
       await pollEnabled(start).toBe(true);
       await gateway.deferNext("sessions.create");
       await input.press("ControlOrMeta+Enter");
-      expect((await gateway.waitForRequest("sessions.create")).params).toMatchObject({
-        message: "",
-        attachments,
-      });
+      expect((await gateway.waitForRequest("sessions.create")).params).toMatchObject(expected);
       expect(await input.isDisabled()).toBe(true);
       await page.keyboard.press("ControlOrMeta+Enter");
       expect(await gateway.getRequests("sessions.create")).toHaveLength(1);
@@ -115,10 +108,8 @@ suite.define(() => {
       expect(await images.count()).toBe(2);
       await pollEnabled(start).toBe(true);
       await input.press("ControlOrMeta+Enter");
-      expect((await gateway.waitForRequest("sessions.create", { after: 1 })).params).toMatchObject({
-        message: "",
-        attachments,
-      });
+      const retry = await gateway.waitForRequest("sessions.create", { after: 1 });
+      expect(retry.params).toMatchObject(expected);
       await input.waitFor({ state: "hidden" });
       await expectForegroundUnchanged(page, composer, url);
       expect(await gateway.getRequests("chat.send")).toEqual([]);

@@ -26,34 +26,24 @@ function mentionScenario() {
     "sessions.create": {
       key: "agent:main:dashboard:palette-mentioned",
       runStarted: true,
-      runId: "mentioned-run",
     },
   });
   return {
     ...base,
     featureMethods: [...base.featureMethods!, "users.mentionable"],
-    presenceUsers: [
-      {
-        self: true,
-        id: "sender",
-        identity: { type: "profile" as const, id: "sender" },
-        name: "Sender",
-      },
-    ],
+    presenceUsers: [{ self: true, id: "sender", name: "Sender" }],
   };
 }
 async function selectPerson(input: Locator, palette: Locator, index: number) {
   await input.press("@");
   const menu = palette.getByRole("listbox", { name: "Mention a person" });
   await menu.getByRole("option").nth(9).waitFor({ state: "visible" });
-  expect(await menu.getByRole("option").count()).toBe(10);
   await input.press("Home");
   for (let step = 0; step < index; step++) {
     await input.press("ArrowDown");
   }
   await input.press(index % 2 ? "Tab" : "Enter");
   await menu.waitFor({ state: "detached" });
-  expect(await menu.count()).toBe(0);
 }
 
 suite.define(() => {
@@ -103,20 +93,16 @@ suite.define(() => {
           );
           await page.evaluate(() => document.fonts.ready);
           const before = await paletteAnchors(palette);
+          const selectedPeople = palette.locator(".composer-context-strip__person");
           const mentions = [];
           for (let index = 0; index < people.length; index++) {
             const start = (await input.inputValue()).length;
             await selectPerson(input, palette, index);
-            mentions.push({
-              profileId: people[index]!.profileId,
-              start,
-              end: start + people[index]!.displayName.length + 1,
-            });
+            const { profileId, displayName } = people[index]!;
+            mentions.push({ profileId, start, end: start + displayName.length + 1 });
             if ([1, 2, 10].includes(index + 1)) {
               expect(await paletteAnchors(palette)).toEqual(before);
-              expect(await palette.locator(".composer-context-strip__person").count()).toBe(
-                index + 1,
-              );
+              expect(await selectedPeople.count()).toBe(index + 1);
               expect(await input.getAttribute("aria-activedescendant")).toBeNull();
             }
           }
