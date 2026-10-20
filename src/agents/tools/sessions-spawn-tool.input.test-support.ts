@@ -5,12 +5,7 @@ import { createAgentsWaitTool } from "./agents-wait-tool.js";
 import type { InProcessGatewayCaller } from "./in-process-gateway.js";
 import type { createSessionsSpawnTool as SpawnToolFactory } from "./sessions-spawn-tool.js";
 
-export function registerSessionsSpawnInputTests({
-  createTool,
-  registerAcpBackendForTest,
-  mockGateway,
-  mocks: hoisted,
-}: {
+export function registerSessionsSpawnInputTests(setup: {
   createTool: typeof SpawnToolFactory;
   registerAcpBackendForTest: () => void;
   mockGateway: (response: Record<string, unknown>) => InProcessGatewayCaller;
@@ -33,7 +28,7 @@ export function registerSessionsSpawnInputTests({
   it.each([false, true])(
     "keeps collector inputs within the declared spawn contract (placement=%s)",
     (workerPlacement) => {
-      const tool = createTool({ workerPlacement });
+      const tool = setup.createTool({ workerPlacement });
       finalizeAgentToolAvailability([tool, createAgentsWaitTool({})]);
       expect(Value.Check(tool.parameters, { task: "ordinary child" })).toBe(true);
       expect(Value.Check(tool.parameters, { task: "collector child", collect: true })).toBe(
@@ -43,58 +38,53 @@ export function registerSessionsSpawnInputTests({
   );
 
   it.each([
-    ["private ACP", { completionTarget: "parent", runtime: "acp" }, /completionTarget/],
-    ["private visible", { completionTarget: "parent", visible: true }, /completionTarget/],
-    ["invalid completion target", { completionTarget: "channel" }, /completionTarget/],
-    ["schema without collect", { outputSchema: { type: "object" } }, "requires collect=true"],
-    ["group without collect", { groupId: "swarm:custom" }, "requires collect=true"],
-    ["negative timeout", { runTimeoutSeconds: -1 }, timeoutError],
-    ["nonnumeric timeout", { runTimeoutSeconds: "not-a-number" }, timeoutError],
+    [{ completionTarget: "parent", runtime: "acp" }, /completionTarget/],
+    [{ completionTarget: "parent", visible: true }, /completionTarget/],
+    [{ completionTarget: "channel" }, /completionTarget/],
+    [{ outputSchema: { type: "object" } }, "requires collect=true"],
+    [{ groupId: "swarm:custom" }, "requires collect=true"],
+    [{ runTimeoutSeconds: -1 }, timeoutError],
+    [{ runTimeoutSeconds: "not-a-number" }, timeoutError],
     [
-      "retired timeout alias",
       { timeout_seconds: 2 },
       'sessions_spawn does not support "timeout_seconds". Use "runTimeoutSeconds" for a per-run timeout.',
     ],
     [
-      "channel delivery",
       { channel: "example" },
       'sessions_spawn does not support "channel"; remove channel-delivery parameters.',
     ],
     [
-      "ACP light context",
       { runtime: "acp", lightContext: true },
       "lightContext is only supported for runtime='subagent'.",
     ],
     [
-      "ACP managed worktree",
       { runtime: "acp", projectId: "example", worktree: true },
       'Managed worktree parameters are unavailable with runtime="acp"',
     ],
-    ["hidden project without worktree", { projectId: "example" }, worktreeError],
-    ["hidden worktree name without worktree", { worktreeName: "review" }, worktreeError],
-    ["hidden worktree base without worktree", { worktreeBaseRef: "origin/main" }, worktreeError],
+    [{ projectId: "example" }, worktreeError],
+    [{ worktreeName: "review" }, worktreeError],
+    [{ worktreeBaseRef: "origin/main" }, worktreeError],
     [
-      "hidden cloud placement",
       { placement: { kind: "profile", profileId: "build" } },
       "Cloud placement requires visible=true and worktree=true. Corrected call: sessions_spawn(",
     ],
-  ] as const)("%s is rejected before dispatch", async (_name, input, error) => {
-    registerAcpBackendForTest();
-    const tool = createTool({ config: { tools: { swarm: true } } });
+  ] as const)("rejects %j before dispatch", async (input, error) => {
+    setup.registerAcpBackendForTest();
+    const tool = setup.createTool({ config: { tools: { swarm: true } } });
     await expect(tool.execute("invalid", { task: "inspect", ...input })).rejects.toThrow(error);
-    expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
-    expect(hoisted.spawnAcpDirectMock).not.toHaveBeenCalled();
-    expect(hoisted.inProcessCreationMock).not.toHaveBeenCalled();
+    expect(setup.mocks.spawnSubagentDirectMock).not.toHaveBeenCalled();
+    expect(setup.mocks.spawnAcpDirectMock).not.toHaveBeenCalled();
+    expect(setup.mocks.inProcessCreationMock).not.toHaveBeenCalled();
   });
 
   it("gives an executable visible retry for visible-only parameters on a hidden spawn", async () => {
-    const callGateway = mockGateway({
+    const callGateway = setup.mockGateway({
       key: "agent:main:dashboard:child",
       sessionId: "visible-child",
       runStarted: true,
       runId: "run-visible",
     });
-    const tool = createTool({
+    const tool = setup.createTool({
       registerRun: vi.fn(),
       countActiveRuns: () => 0,
       config: { agents: { entries: { main: {} } }, tools: { swarm: true } },
@@ -120,18 +110,15 @@ export function registerSessionsSpawnInputTests({
         resumeSessionId: "prior-acp-session",
       })
       .catch((reason: unknown) => reason);
-    expect(error).toBeInstanceOf(Error);
     if (!(error instanceof Error)) {
       throw new Error("Expected visible-only parameter rejection");
     }
     expect(error.message).toContain("Parameters require visible=true: group, projectGitUrl");
     expect(callGateway).not.toHaveBeenCalled();
-    expect(hoisted.spawnSubagentDirectMock).not.toHaveBeenCalled();
-    const match = /Corrected visible call: sessions_spawn\((.*)\)$/.exec(error.message);
-    if (!match?.[1]) {
-      throw new Error("Expected an exact corrected sessions_spawn call");
-    }
-    const corrected: unknown = JSON.parse(match[1]);
+    expect(setup.mocks.spawnSubagentDirectMock).not.toHaveBeenCalled();
+    const corrected: unknown = JSON.parse(
+      /Corrected visible call: sessions_spawn\((.*)\)$/.exec(error.message)?.[1] ?? "",
+    );
     expect(corrected).toEqual({
       ...correctedInput,
       worktree: true,

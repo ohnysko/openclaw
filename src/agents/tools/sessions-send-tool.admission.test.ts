@@ -81,12 +81,43 @@ const config = {
 } satisfies OpenClawConfig;
 
 type GatewayRequest = Parameters<AgentToolGatewayRequestCaller>[0];
+function mockGateway(
+  handle: (request: GatewayRequest) => Promise<unknown> = async (request) => {
+    throw new Error(`Unexpected Gateway method: ${request.method}`);
+  },
+  list = false,
+) {
+  return vi.fn().mockImplementation((request: GatewayRequest) => {
+    if (request.method === "sessions.resolve") {
+      return Promise.resolve({ key: targetSessionKey, agentId: "main" });
+    }
+    if (list && request.method === "sessions.list") {
+      return Promise.resolve({
+        sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }],
+      });
+    }
+    return handle(request);
+  });
+}
 function createTool(options: Parameters<typeof createSessionsSendTool>[0] = {}) {
   return createSessionsSendTool({
     agentSessionKey: requesterSessionKey,
     config,
     idempotencyKey: runId,
     ...options,
+  });
+}
+function execute(
+  tool: ReturnType<typeof createTool>,
+  id: string,
+  input: Record<string, unknown> = {},
+) {
+  return tool.execute(id, {
+    sessionKey: targetSessionKey,
+    message: "Continue the task",
+    mode: "followup",
+    timeoutSeconds: 0,
+    ...input,
   });
 }
 function putSession(sessionKey: string, entry: Parameters<typeof replaceSessionEntry>[1]) {
@@ -229,11 +260,7 @@ describe("sessions_send dispatch admission", () => {
       };
       setRuntimeConfigSnapshot(currentConfig);
       let admitted = false;
-      const callGateway = vi.fn();
-      callGateway.mockImplementation(async (request: GatewayRequest) => {
-        if (request.method === "sessions.resolve") {
-          return { key: targetSessionKey, agentId: "main" };
-        }
+      const callGateway = mockGateway(async (request) => {
         if (request.method === "agent") {
           currentConfig.session!.communication![direction] = "never";
           setRuntimeConfigSnapshot(currentConfig);
@@ -244,14 +271,9 @@ describe("sessions_send dispatch admission", () => {
         }
         throw new Error(`Unexpected Gateway method: ${request.method}`);
       });
-      const result = await createTool({ config: currentConfig, callGateway }).execute(
+      const result = await execute(
+        createTool({ config: currentConfig, callGateway }),
         "revoked-default",
-        {
-          sessionKey: targetSessionKey,
-          message: "Must not enter the target after policy revocation",
-          mode: "followup",
-          timeoutSeconds: 0,
-        },
       );
       expect(admitted).toBe(false);
       expect(result.details).toMatchObject({
@@ -387,15 +409,7 @@ describe("sessions_send dispatch admission", () => {
     })();
     const gateway = vi
       .spyOn(inProcessGateway, "callAgentToolGatewayRequest")
-      .mockImplementation(async (request) => {
-        if (request.method === "sessions.resolve") {
-          return { key: targetSessionKey, agentId: "main" };
-        }
-        if (request.method === "sessions.list") {
-          return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
-        }
-        throw new Error(`Unexpected Gateway method: ${request.method}`);
-      });
+      .mockImplementation(mockGateway(undefined, true));
     const mutation = vi
       .spyOn(sessionsSendDelivery, "callSessionsSendGateway")
       .mockImplementation(gateway);
@@ -412,13 +426,7 @@ describe("sessions_send dispatch admission", () => {
             gatewayContextResolver: () => context,
             receiptAuthority: () => true,
           },
-          () =>
-            createTool({}).execute("steer-physical-owner", {
-              sessionKey: targetSessionKey,
-              message: "Continue with this guidance",
-              mode: "steer",
-              timeoutSeconds: 0,
-            }),
+          () => execute(createTool(), "steer-physical-owner", { mode: "steer" }),
         ),
       );
     })();
@@ -475,11 +483,7 @@ describe("sessions_send dispatch admission", () => {
       requesterSessionKey,
       config,
     );
-    const callGateway = vi.fn();
-    callGateway.mockImplementation(async (request: GatewayRequest) => {
-      if (request.method === "sessions.resolve") {
-        return { key: targetSessionKey, agentId: "main" };
-      }
+    const callGateway = mockGateway(async (request) => {
       if (request.method !== "agent") {
         throw new Error(`Unexpected Gateway method: ${request.method}`);
       }
@@ -503,13 +507,7 @@ describe("sessions_send dispatch admission", () => {
           gatewayContextResolver: () => context,
           receiptAuthority: () => true,
         },
-        () =>
-          createTool({ callGateway }).execute("durable-steer-fallback", {
-            sessionKey: targetSessionKey,
-            message: "Save this guidance before acknowledging it",
-            mode: "steer",
-            timeoutSeconds: 0,
-          }),
+        () => execute(createTool({ callGateway }), "durable-steer-fallback", { mode: "steer" }),
       );
       expect(result.details).toMatchObject({ status: "accepted", targetDisposition: "queued" });
       expect(queueMessage).not.toHaveBeenCalled();
@@ -558,14 +556,7 @@ describe("sessions_send dispatch admission", () => {
         return captured;
       });
     vi.mocked(runSessionsSendA2AFlow).mockImplementationOnce(() => finish.promise);
-    const callGateway = vi.fn();
-    callGateway.mockImplementation(async (request: GatewayRequest) => {
-      if (request.method === "sessions.resolve") {
-        return { key: targetSessionKey, agentId: "main" };
-      }
-      if (request.method === "sessions.list") {
-        return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
-      }
+    const callGateway = mockGateway(async (request) => {
       if (request.method === "agent") {
         const followup = readFollowupRequest(runId, targetSessionKey);
         if (followup) {
@@ -582,7 +573,7 @@ describe("sessions_send dispatch admission", () => {
         return { runId, status: "accepted" };
       }
       throw new Error(`Unexpected Gateway method: ${request.method}`);
-    });
+    }, true);
     try {
       const pending = inOperatorScope(context, owner, source, async () => {
         const participants = createReplyTurnParticipants({
@@ -600,14 +591,9 @@ describe("sessions_send dispatch admission", () => {
             },
             () => {
               invocationStarted = true;
-              return createTool({ agentSessionKey: sourceKey, callGateway }).execute(
+              return execute(
+                createTool({ agentSessionKey: sourceKey, callGateway }),
                 "send-followup",
-                {
-                  sessionKey: targetSessionKey,
-                  message: "Continue the task",
-                  mode: "followup",
-                  timeoutSeconds: 0,
-                },
               );
             },
           );
@@ -653,222 +639,150 @@ describe("sessions_send dispatch admission", () => {
   });
 
   it.each([
+    { name: "numeric thread", sourceKey: requesterSessionKey, threadId: 42 },
+    { name: "legacy DM", sourceKey: "agent:main:telegram:direct:peer-1", threadId: "42" },
     {
-      name: "default numeric-thread",
-      accountId: "default",
-      sourceKey: requesterSessionKey,
-      threadId: 42,
-    },
-    {
-      name: "exact legacy DM",
-      accountId: "default",
-      sourceKey: "agent:main:telegram:direct:peer-1",
-      threadId: "42",
-    },
-    {
-      name: "current source over agent delivery fallback",
-      accountId: "default",
+      name: "current source over fallback",
       sourceKey: requesterSessionKey,
       threadId: "42",
+      fallback: true,
     },
-  ])(
-    "preserves the original $name route when a later turn changes the shared session route",
-    async ({ name, accountId, sourceKey, threadId }) => {
-      let completion: Record<string, unknown> | undefined;
-      const settled = await trackActualReplyFlow();
-      await putSession(sourceKey, {
-        sessionId: "requester-session",
-        updatedAt: 1,
-        lifecycleRevision: "original-generation",
-      });
-      await putSession(targetSessionKey, {
-        sessionId: "target-session",
-        updatedAt: 1,
-        spawnedBy: sourceKey,
-      });
-      const callGateway = vi.fn();
-      callGateway.mockImplementation(async (request: GatewayRequest) => {
-        if (request.method === "sessions.resolve") {
-          return { key: targetSessionKey, agentId: "main" };
-        }
-        if (request.method === "sessions.list") {
-          return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
-        }
-        if (request.method === "agent.wait") {
-          return completeRun(request, targetSessionKey, "target-session");
-        }
-        if (request.method === "agent") {
+    { name: "opaque self-send", sourceKey: "agent:main:direct:identity-linked-person", self: true },
+  ])("preserves the admitted $name route after a later inbound turn", async (scenario) => {
+    const { sourceKey } = scenario;
+    const self = "self" in scenario;
+    const targetKey = self ? sourceKey : targetSessionKey;
+    const sourceId = self ? "self-session" : "requester-session";
+    const targetId = self ? sourceId : "target-session";
+    const originalRoute = { channel: "telegram", accountId: "default", to: "original-recipient" };
+    const laterRoute = { channel: "telegram", accountId: "other", to: "later-recipient" };
+    const entry = { sessionId: sourceId, updatedAt: 1, lifecycleRevision: "original-generation" };
+    const settled = await trackActualReplyFlow();
+    await putSession(sourceKey, {
+      ...entry,
+      ...(self ? { delivery: normalizeSessionDeliveryState({ context: originalRoute }) } : {}),
+    });
+    if (!self) {
+      await putSession(targetKey, { sessionId: targetId, updatedAt: 1, spawnedBy: sourceKey });
+    }
+    let completion: Record<string, unknown> | undefined;
+    const callGateway = vi.fn().mockImplementation(async (request: GatewayRequest) => {
+      switch (request.method) {
+        case "sessions.resolve":
+          return { key: targetKey, agentId: "main" };
+        case "sessions.list":
+          return {
+            sessions: [
+              {
+                key: targetKey,
+                agentId: "main",
+                ...(self ? { deliveryContext: laterRoute } : { kind: "direct" }),
+              },
+            ],
+          };
+        case "agent.wait":
+          return completeRun(request, targetKey, targetId);
+        case "agent":
           if (!isRecord(request.params)) {
             throw new Error("Expected agent request parameters");
           }
-          if (request.params.sessionKey === targetSessionKey) {
-            await replaceSessionEntry(
-              { agentId: "main", sessionKey: sourceKey },
-              {
-                sessionId: "requester-session",
-                updatedAt: 2,
-                lifecycleRevision: "original-generation",
-                delivery: normalizeSessionDeliveryState({
-                  context: { channel: "telegram", accountId: "other", to: "later-recipient" },
-                }),
-              },
-            );
+          if (request.params.sessionKey === targetKey) {
+            await putSession(sourceKey, {
+              ...entry,
+              updatedAt: 2,
+              delivery: normalizeSessionDeliveryState({ context: laterRoute }),
+            });
             return { runId };
           }
           completion = request.params;
           return { runId: "completion-run" };
-        }
-        throw new Error(`Unexpected Gateway method: ${request.method}`);
-      });
-      const restoreGateway = interceptGateway(callGateway);
-      // This routing fixture supplies a run-scoped Gateway, not a native task
-      // receipt. Keep its real A2A/route assertions at that explicit boundary;
-      // retained core authority and custody have separate owner/integration proof.
-      const prepareFollowup = vi
-        .spyOn(sessionsSendFollowup, "prepareSessionsSendFollowup")
-        .mockResolvedValue(undefined);
-      try {
-        const tool = createOpenClawTools({
-          agentSessionKey: sourceKey,
-          sessionId: "requester-session",
-          agentChannel: "telegram",
-          agentAccountId: accountId,
-          agentTo: "original-recipient",
-          agentThreadId: threadId,
-          ...(name === "current source over agent delivery fallback"
-            ? {
-                agentTo: "stale-recipient",
-                agentThreadId: 99,
-                currentMessagingTarget: "original-recipient",
-                currentChannelId: "native-channel-id",
-                currentThreadTs: "42",
-              }
-            : {}),
-          config,
-          disableMessageTool: true,
-          disablePluginTools: true,
-          wrapBeforeToolCallHook: false,
-        }).find((candidate) => candidate.name === "sessions_send");
-        expect(tool).toBeDefined();
-        const result = await tool!.execute("send-routed-task", {
-          sessionKey: targetSessionKey,
-          message: "Complete this task",
-          mode: "followup",
-          timeoutSeconds: 0,
-        });
-        expect(result.details).toMatchObject({
-          status: "accepted",
-          delivery: { status: "pending" },
-        });
-        await settled.promise;
-        expect(completion).toMatchObject({
-          sessionKey: sourceKey,
-          expectedExistingSessionId: "requester-session",
-          expectedExistingSessionLifecycleRevision: "original-generation",
-          channel: "telegram",
-          accountId,
-          to: "original-recipient",
-          threadId: "42",
-          deliver: false,
-          sourceReplyDeliveryMode: "message_tool_only",
-        });
-      } finally {
-        prepareFollowup.mockRestore();
-        restoreGateway();
-      }
-    },
-  );
-
-  it("keeps an opaque self-send on its admitted source route after a later inbound turn", async () => {
-    const sessionKey = "agent:main:direct:identity-linked-person";
-    const originalRoute = { channel: "telegram", accountId: "default", to: "original-recipient" };
-    const laterRoute = { channel: "telegram", accountId: "other", to: "later-recipient" };
-    const settled = await trackActualReplyFlow();
-    const entry = {
-      sessionId: "self-session",
-      updatedAt: 1,
-      lifecycleRevision: "original-generation",
-    };
-    await putSession(sessionKey, {
-      ...entry,
-      delivery: normalizeSessionDeliveryState({ context: originalRoute }),
-    });
-    const callGateway = vi.fn();
-    callGateway.mockImplementation(async (request: GatewayRequest) => {
-      switch (request.method) {
-        case "sessions.resolve":
-          return { key: sessionKey, agentId: "main" };
-        case "sessions.list":
-          return {
-            sessions: [{ key: sessionKey, agentId: "main", deliveryContext: laterRoute }],
-          };
-        case "agent":
-          await putSession(sessionKey, {
-            ...entry,
-            updatedAt: 2,
-            delivery: normalizeSessionDeliveryState({ context: laterRoute }),
-          });
-          return { runId };
-        case "agent.wait":
-          return completeRun(request, sessionKey, entry.sessionId);
         case "send":
-          return { messageId: "final-reply" };
-        default:
-          throw new Error(`Unexpected Gateway method: ${request.method}`);
+          if (self) {
+            return { messageId: "final-reply" };
+          }
       }
+      throw new Error(`Unexpected Gateway method: ${request.method}`);
     });
     const restoreGateway = interceptGateway(callGateway);
+    // Cross-session routing has a transport fixture, not a native custody receipt.
+    const prepareFollowup = self
+      ? undefined
+      : vi.spyOn(sessionsSendFollowup, "prepareSessionsSendFollowup").mockResolvedValue(undefined);
     try {
       const tool = createOpenClawTools({
-        agentSessionKey: sessionKey,
-        sessionId: entry.sessionId,
+        agentSessionKey: sourceKey,
+        sessionId: sourceId,
         agentChannel: originalRoute.channel,
         agentAccountId: originalRoute.accountId,
-        currentMessagingTarget: originalRoute.to,
+        ...(self
+          ? { currentMessagingTarget: originalRoute.to }
+          : {
+              agentTo: originalRoute.to,
+              agentThreadId: scenario.threadId,
+            }),
+        ...("fallback" in scenario
+          ? {
+              agentTo: "stale-recipient",
+              agentThreadId: 99,
+              currentMessagingTarget: originalRoute.to,
+              currentChannelId: "native-channel-id",
+              currentThreadTs: "42",
+            }
+          : {}),
         config,
         disableMessageTool: true,
         disablePluginTools: true,
         wrapBeforeToolCallHook: false,
       }).find((candidate) => candidate.name === "sessions_send");
       expect(tool).toBeDefined();
-      const result = await tool!.execute("self-followup", {
-        sessionKey,
-        message: "Complete this task",
-        mode: "followup",
-        timeoutSeconds: 0,
+      const result = await execute(tool!, self ? "self-followup" : "send-routed-task", {
+        sessionKey: targetKey,
       });
       expect(result.details).toMatchObject({ status: "accepted", delivery: { status: "pending" } });
       await settled.promise;
-      const requests = callGateway.mock.calls.map(([request]) => request);
-      expect.soft(requests.filter((request) => request.method === "agent")).toEqual([
-        expect.objectContaining({
-          params: expect.objectContaining({
-            ...originalRoute,
-            sessionKey,
-            deliver: false,
-            sourceReplyDeliveryMode: "message_tool_only",
-            inputProvenance: expect.objectContaining({
-              kind: "inter_session",
-              sourceSessionKey: sessionKey,
+      if (!self) {
+        expect(completion).toMatchObject({
+          sessionKey: sourceKey,
+          expectedExistingSessionId: sourceId,
+          expectedExistingSessionLifecycleRevision: entry.lifecycleRevision,
+          ...originalRoute,
+          threadId: "42",
+          deliver: false,
+          sourceReplyDeliveryMode: "message_tool_only",
+        });
+      } else {
+        const requests = callGateway.mock.calls.map(([request]) => request);
+        expect.soft(requests.filter((request) => request.method === "agent")).toEqual([
+          expect.objectContaining({
+            params: expect.objectContaining({
+              ...originalRoute,
+              sessionKey: sourceKey,
+              deliver: false,
+              sourceReplyDeliveryMode: "message_tool_only",
+              inputProvenance: expect.objectContaining({
+                kind: "inter_session",
+                sourceSessionKey: sourceKey,
+              }),
             }),
           }),
-        }),
-      ]);
-      expect.soft(requests.filter((request) => request.method === "send")).toEqual([
-        expect.objectContaining({
-          params: expect.objectContaining({ ...originalRoute, message: "Task complete" }),
-        }),
-      ]);
-      const sendParams = requests.find((request) => request.method === "send")?.params;
-      expect(readInProcessSessionDeliveryGeneration(sendParams)).toMatchObject({
-        agentId: "main",
-        sessionKey,
-        sessionId: entry.sessionId,
-        lifecycleRevision: entry.lifecycleRevision,
-      });
-      expect(sendParams).toHaveProperty("idempotencyKey", `sessions-send:${runId}`);
-      expect(sendParams).not.toHaveProperty("sessionGeneration");
+        ]);
+        expect.soft(requests.filter((request) => request.method === "send")).toEqual([
+          expect.objectContaining({
+            params: expect.objectContaining({ ...originalRoute, message: "Task complete" }),
+          }),
+        ]);
+        const sendParams = requests.find((request) => request.method === "send")?.params;
+        expect(readInProcessSessionDeliveryGeneration(sendParams)).toMatchObject({
+          agentId: "main",
+          sessionKey: sourceKey,
+          sessionId: sourceId,
+          lifecycleRevision: entry.lifecycleRevision,
+        });
+        expect(sendParams).toHaveProperty("idempotencyKey", `sessions-send:${runId}`);
+        expect(sendParams).not.toHaveProperty("sessionGeneration");
+      }
     } finally {
+      prepareFollowup?.mockRestore();
       restoreGateway();
     }
   });
@@ -879,16 +793,7 @@ describe("sessions_send dispatch admission", () => {
   ] as const)(
     "does not install a watch or start A2A when admission is $admission (wait $timeoutSeconds)",
     async ({ admission, timeoutSeconds }) => {
-      const requests: GatewayRequest[] = [];
-      const callGateway = vi.fn();
-      callGateway.mockImplementation(async (request: GatewayRequest) => {
-        requests.push(request);
-        if (request.method === "sessions.resolve") {
-          return { key: targetSessionKey, agentId: "main" };
-        }
-        if (request.method === "sessions.list") {
-          return { sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }] };
-        }
+      const callGateway = mockGateway(async (request) => {
         if (request.method === "agent") {
           if (admission === "rejected") {
             throw new Error("Task admission failed before dispatch");
@@ -899,17 +804,12 @@ describe("sessions_send dispatch admission", () => {
           return { status: "timeout" };
         }
         throw new Error(`Unexpected Gateway method: ${request.method}`);
-      });
+      }, true);
       const tool = createTool({ callGateway });
 
-      const result = await tool.execute("send-followup", {
-        sessionKey: targetSessionKey,
-        message: "Continue the requested task.",
-        mode: "followup",
-        watch: true,
-        timeoutSeconds,
-      });
+      const result = await execute(tool, "send-followup", { watch: true, timeoutSeconds });
 
+      const requests = callGateway.mock.calls.map(([request]) => request);
       expect.soft(result.details).toMatchObject({
         status: "error",
         runId,

@@ -1,7 +1,6 @@
 import { expect, it, vi } from "vitest";
 import type { createSessionsSpawnTool as SpawnToolFactory } from "./sessions-spawn-tool.js";
 
-/** Visible child rollback tests share the parent suite's spawn entry point and lifecycle. */
 export function registerSessionsSpawnVisibleCleanupTests({
   createTool,
 }: {
@@ -12,6 +11,11 @@ export function registerSessionsSpawnVisibleCleanupTests({
     key,
     sessionId: "created-child",
     entry: { lifecycleRevision: "birth-revision" },
+  };
+  const gateway = (overrides: Record<string, unknown>) =>
+    vi.fn().mockResolvedValueOnce({ ...receipt, ...overrides });
+  const registerRun = () => {
+    throw new Error("registry unavailable");
   };
   async function executeVisible(
     callGateway: NonNullable<Parameters<typeof createTool>[0]>["callGateway"],
@@ -39,19 +43,13 @@ export function registerSessionsSpawnVisibleCleanupTests({
   it.each(["not-started", "missing-run-id", "registration"] as const)(
     "cleans up the created visible session after %s failure",
     async (failure) => {
-      const callGateway = vi
-        .fn()
-        .mockResolvedValueOnce({
-          ...receipt,
-          runStarted: failure !== "not-started",
-          ...(failure === "registration" ? { runId: "child-run" } : {}),
-          runError: "startup failed",
-        })
-        .mockResolvedValueOnce({ deleted: true });
-      const registerRun = vi.fn(() => {
-        throw new Error("registry unavailable");
-      });
-      const details = await executeVisible(callGateway, { registerRun });
+      const callGateway = gateway({
+        runStarted: failure !== "not-started",
+        ...(failure === "registration" ? { runId: "child-run" } : {}),
+        runError: "startup failed",
+      }).mockResolvedValueOnce({ deleted: true });
+      const register = vi.fn(registerRun);
+      const details = await executeVisible(callGateway, { registerRun: register });
 
       expectError(details, "Session removed.");
       expect(callGateway).toHaveBeenCalledTimes(2);
@@ -63,51 +61,22 @@ export function registerSessionsSpawnVisibleCleanupTests({
         deleteTranscript: true,
         emitLifecycleHooks: false,
       });
-      expect(registerRun).toHaveBeenCalledTimes(failure === "registration" ? 1 : 0);
+      expect(register).toHaveBeenCalledTimes(failure === "registration" ? 1 : 0);
     },
   );
 
-  it.each([
-    [
-      "initial child start",
-      false,
-      undefined,
-      { code: "UNAVAILABLE", message: "child chat.send rejected before input admission" },
-      undefined,
-      "child chat.send rejected before input admission",
-    ],
-    [
-      "run registration",
-      true,
-      "child-run",
-      undefined,
-      "registry unavailable",
-      "Session cleanup unconfirmed.",
-    ],
-  ] as const)(
-    "reports the retained child when %s and cleanup fail",
-    async (_failure, runStarted, runId, runError, registrationError, expectedError) => {
-      const callGateway = vi
-        .fn()
-        .mockResolvedValueOnce({
-          ...receipt,
-          runStarted,
-          ...(runId ? { runId } : {}),
-          ...(runError ? { runError } : {}),
-        })
-        .mockRejectedValueOnce(new Error("lifecycle drain unavailable"));
-      const details = await executeVisible(
-        callGateway,
-        registrationError
-          ? {
-              registerRun: () => {
-                throw new Error(registrationError);
-              },
-            }
-          : {},
-      );
+  it.each([false, true])(
+    "reports the retained child when cleanup fails (runStarted=%s)",
+    async (runStarted) => {
+      const runId = runStarted ? "child-run" : undefined;
+      const startError = "child chat.send rejected before input admission";
+      const callGateway = gateway({
+        runStarted,
+        ...(runId ? { runId } : { runError: { code: "UNAVAILABLE", message: startError } }),
+      }).mockRejectedValueOnce(new Error("lifecycle drain unavailable"));
+      const details = await executeVisible(callGateway, runStarted ? { registerRun } : {});
 
-      expectError(details, expectedError);
+      expectError(details, runStarted ? "Session cleanup unconfirmed." : startError);
       if (runId) {
         expect(details).toMatchObject({ runId });
       }
@@ -138,26 +107,24 @@ export function registerSessionsSpawnVisibleCleanupTests({
   it.each([undefined, "", " \t\n "])(
     "refuses a started visible run with missing or blank session identity %j",
     async (sessionId) => {
-      const callGateway = vi.fn().mockResolvedValueOnce({
-        key,
+      const callGateway = gateway({
         sessionId,
-        entry: { lifecycleRevision: "birth-revision" },
         runStarted: true,
         runId: "child-run",
       });
-      const registerRun = vi.fn();
+      const register = vi.fn();
       const details = await executeVisible(
         callGateway,
-        { registerRun },
+        { registerRun: register },
         "visible-missing-identity",
       );
 
       expectError(details, "sessions.create did not return its sessionId");
-      expect(details).toMatchObject({ runId: "child-run" });
       expect(details).toMatchObject({
+        runId: "child-run",
         error: expect.stringContaining("inspect this child session and run before retrying"),
       });
-      expect(registerRun).not.toHaveBeenCalled();
+      expect(register).not.toHaveBeenCalled();
       expect(callGateway).toHaveBeenCalledTimes(1);
     },
   );

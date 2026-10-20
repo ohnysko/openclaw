@@ -38,26 +38,23 @@ const nativeChildKey = "agent:worker:subagent:owned-child";
 const acpChildKey = "agent:worker:acp:owned-child";
 const replyText = "Result from the dispatched run only";
 const runId = "send-policy-run";
+function ownedChild(key: string, name: string) {
+  return {
+    key,
+    agentId: "worker",
+    sessionId: `${name}-session`,
+    label: name,
+    spawnedBy: requesterKey,
+  };
+}
 const sessions = [
   { key: requesterKey, agentId: "main", sessionId: "requester-session" },
   { key: subagentRequesterKey, agentId: "main", sessionId: "subagent-requester-session" },
   { key: workerKey, agentId: "worker", sessionId: workerSessionId, label: "delegation-worker" },
   { key: "global", agentId: "worker", sessionId: "raw-worker-session", label: "raw-worker" },
   { key: "agent:stranger:main", agentId: "stranger", sessionId: "stranger-session" },
-  {
-    key: nativeChildKey,
-    agentId: "worker",
-    sessionId: "native-child-session",
-    label: "native-child",
-    spawnedBy: requesterKey,
-  },
-  {
-    key: acpChildKey,
-    agentId: "worker",
-    sessionId: "acp-child-session",
-    label: "acp-child",
-    spawnedBy: requesterKey,
-  },
+  ownedChild(nativeChildKey, "native-child"),
+  ownedChild(acpChildKey, "acp-child"),
 ];
 
 function configFor(
@@ -73,7 +70,6 @@ function configFor(
       defaults: { sandbox: { sessionToolsVisibility: "spawned" } },
       entries: {
         main: options.send === undefined ? {} : { tools: { agentToAgent: { send: options.send } } },
-        // This is an outbound edge, not the worker's permission to receive.
         worker: { tools: { agentToAgent: { send: [] } } },
         stranger: {},
       },
@@ -87,6 +83,8 @@ function configFor(
 }
 
 const callGateway = vi.fn();
+let replyPreview = replyText;
+let historyMessages: ReturnType<typeof assistantReply>[] | undefined;
 
 function assistantReply(text: string, id = runId) {
   return {
@@ -96,16 +94,8 @@ function assistantReply(text: string, id = runId) {
   };
 }
 function mockReplyHistory(preview: string, messages: ReturnType<typeof assistantReply>[]) {
-  const transport = callGateway.getMockImplementation()!;
-  callGateway.mockImplementation(async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
-    if (request.method === "agent.wait") {
-      return { runId, status: "ok", terminalReply: { disposition: "visible", text: preview } };
-    }
-    if (request.method === "chat.history") {
-      return { messages };
-    }
-    return await transport(request);
-  });
+  replyPreview = preview;
+  historyMessages = messages;
 }
 
 function gatewayMethods() {
@@ -114,7 +104,13 @@ function gatewayMethods() {
 
 function send(
   config: OpenClawConfig,
-  target: { agentId?: string; sessionKey?: string; label?: string; watch?: boolean },
+  target: {
+    agentId?: string;
+    sessionKey?: string;
+    label?: string;
+    watch?: boolean;
+    message?: string;
+  } = { agentId: "worker" },
   options: { agentSessionKey?: string; sandboxed?: boolean } = {},
 ) {
   setRuntimeConfigSnapshot(config);
@@ -125,15 +121,21 @@ function send(
     idempotencyKey: runId,
     ...options,
   }).execute("send-policy", {
-    ...target,
     message: "Please handle this task",
     timeoutSeconds: 1,
+    ...target,
   });
 }
 
 function expectNoDispatch() {
   expect(gatewayMethods()).not.toContain("agent");
   expect(gatewayMethods()).not.toContain("agent.wait");
+}
+function gatewayParams(method: string) {
+  return callGateway.mock.calls.find(([request]) => request.method === method)?.[0].params;
+}
+function expectOk(result: Awaited<ReturnType<typeof send>>, extra = {}) {
+  expect(result.details).toMatchObject({ status: "ok", reply: replyText, ...extra });
 }
 
 describe("sessions_send directed policy at the tool boundary", () => {
@@ -164,8 +166,9 @@ describe("sessions_send directed policy at the tool boundary", () => {
   });
 
   beforeEach(() => {
-    // Model only the Gateway transport: resolution returns inventory facts, never policy decisions.
     callGateway.mockReset();
+    replyPreview = replyText;
+    historyMessages = undefined;
     callGateway.mockImplementation(
       async (request: Parameters<AgentToolGatewayRequestCaller>[0]) => {
         const params = isRecord(request.params) ? request.params : {};
@@ -190,14 +193,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
           return {
             sessions: sessions
               .filter((session) => !params.spawnedBy || params.spawnedBy === session.spawnedBy)
-              .map(({ key, agentId, sessionId, label, spawnedBy }) => ({
-                key,
-                agentId,
-                sessionId,
-                label,
-                spawnedBy,
-                classification: "main",
-              })),
+              .map((session) => Object.assign({ classification: "main" }, session)),
           };
         }
         if (request.method === "agent") {
@@ -208,8 +204,11 @@ describe("sessions_send directed policy at the tool boundary", () => {
           return {
             runId,
             status: "ok",
-            terminalReply: { disposition: "visible", text: replyText },
+            terminalReply: { disposition: "visible", text: replyPreview },
           };
+        }
+        if (request.method === "chat.history" && historyMessages) {
+          return { messages: historyMessages };
         }
         throw new Error("Unexpected Gateway method: " + request.method);
       },
@@ -270,30 +269,17 @@ describe("sessions_send directed policy at the tool boundary", () => {
   });
 
   it("prefers sessionKey over a redundant label without trimming the message", async () => {
-    const config = configFor({ send: ["worker"] });
-    setRuntimeConfigSnapshot(config);
-    const result = await createSessionsSendTool({
-      config,
-      agentSessionKey: requesterKey,
-      callGateway,
-      idempotencyKey: runId,
-    }).execute("send-policy-key-label", {
+    const result = await send(configFor({ send: ["worker"] }), {
       sessionKey: workerKey,
       label: "stale-label",
       message: "    indented body",
-      timeoutSeconds: 1,
     });
 
     expect(result.details).toMatchObject({ status: "ok", sessionKey: workerKey });
-    expect(callGateway).toHaveBeenCalledWith(
-      expect.objectContaining({
-        method: "agent",
-        params: expect.objectContaining({
-          sessionKey: workerKey,
-          message: expect.stringMatching(/\n {4}indented body$/u),
-        }),
-      }),
-    );
+    expect(gatewayParams("agent")).toMatchObject({
+      sessionKey: workerKey,
+      message: expect.stringMatching(/\n {4}indented body$/u),
+    });
     expect(callGateway).not.toHaveBeenCalledWith(
       expect.objectContaining({
         method: "sessions.resolve",
@@ -303,16 +289,11 @@ describe("sessions_send directed policy at the tool boundary", () => {
   });
 
   it("sends by session ID under self visibility and returns only that run's reply", async () => {
-    const result = await send(configFor({ send: ["worker"], visibility: "self" }), {
+    const result = await send(configFor({ send: ["worker"] }), {
       sessionKey: workerSessionId,
     });
 
-    expect(result.details).toMatchObject({
-      status: "ok",
-      sessionKey: workerKey,
-      runId,
-      reply: replyText,
-    });
+    expectOk(result, { sessionKey: workerKey, runId });
     const dispatches = callGateway.mock.calls.filter(([request]) => request.method === "agent");
     expect(dispatches).toHaveLength(1);
     expect(dispatches[0]?.[0].params).toMatchObject({
@@ -344,7 +325,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
         assistantReply("Unrelated answer", "later-run"),
       ]);
 
-      const result = await send(configFor({ send: ["worker"] }), { agentId: "worker" });
+      const result = await send(configFor({ send: ["worker"] }));
       expect(result.details).toMatchObject({ status: "ok", reply: full });
       expect(result.details).not.toHaveProperty("replyTruncated");
       expect(Value.Check(SessionsSendOutputSchema, result.details)).toBe(true);
@@ -374,7 +355,7 @@ describe("sessions_send directed policy at the tool boundary", () => {
   it("reports a truncated preview when the accepted run's full reply is unavailable", async () => {
     const preview = `${"a".repeat(4_095)}…`;
     mockReplyHistory(preview, [assistantReply("Unrelated answer", "other-run")]);
-    const result = await send(configFor({ send: ["worker"] }), { agentId: "worker" });
+    const result = await send(configFor({ send: ["worker"] }));
     expect(result.details).toMatchObject({
       status: "ok",
       reply: preview,
@@ -384,81 +365,76 @@ describe("sessions_send directed policy at the tool boundary", () => {
     expect(Value.Check(SessionsSendOutputSchema, result.details)).toBe(true);
   });
 
-  it("denies an unlisted key even with all visibility before dispatch", async () => {
-    const result = await send(configFor({ send: ["worker"], visibility: "all" }), {
-      sessionKey: "agent:stranger:main",
-    });
-    expect(result.details).toMatchObject({
-      status: "forbidden",
-      error: expect.stringContaining("tools.agentToAgent.send"),
-    });
-    expectNoDispatch();
-  });
-
-  it("denies invisible sends when outbound policy is omitted", async () => {
-    const result = await send(configFor({ visibility: "self" }), { agentId: "worker" });
-    expect(result.details).toMatchObject({ status: "forbidden" });
-    expectNoDispatch();
-  });
-
   it.each([
-    {
-      name: "requester excluded",
-      global: { enabled: true, allow: ["worker"] },
-      error: "tools.agentToAgent.allow",
-    },
-    {
-      name: "target excluded",
-      global: { enabled: true, allow: ["main"] },
-      error: "tools.agentToAgent.allow",
-    },
-  ])("keeps the global $name ceiling", async ({ global, error }) => {
-    const result = await send(configFor({ send: ["worker"], global }), { agentId: "worker" });
-    expect(result.details).toMatchObject({
-      status: "forbidden",
-      error: expect.stringContaining(error),
-    });
+    [
+      "unlisted key",
+      { send: ["worker"], visibility: "all" },
+      { sessionKey: "agent:stranger:main" },
+      "tools.agentToAgent.send",
+    ],
+    ["omitted outbound policy", {}, { agentId: "worker" }, undefined],
+    [
+      "requester excluded",
+      { send: ["worker"], global: { enabled: true, allow: ["worker"] } },
+      { agentId: "worker" },
+      "tools.agentToAgent.allow",
+    ],
+    [
+      "target excluded",
+      { send: ["worker"], global: { enabled: true, allow: ["main"] } },
+      { agentId: "worker" },
+      "tools.agentToAgent.allow",
+    ],
+  ] satisfies [
+    string,
+    Parameters<typeof configFor>[0],
+    Parameters<typeof send>[1],
+    string | undefined,
+  ][])("denies %s before dispatch", async (_name, options, target, error) => {
+    const config = configFor(options);
+    const result = await send(config, target);
+    expect(result.details).toMatchObject({ status: "forbidden" });
+    if (error) {
+      expect(result.details).toMatchObject({ error: expect.stringContaining(error) });
+    }
     expectNoDispatch();
   });
 
-  it("denies send-only watch before delivery but permits the plain run-scoped reply", async () => {
-    const watch = vi.spyOn(sessionStateEvents, "registerSessionStateWatch").mockResolvedValue(true);
-    const config = configFor({ send: ["worker"] });
-    const watched = await send(config, { agentId: "worker", watch: true });
-    expect(watched.details).toMatchObject({ status: "forbidden" });
-    expectNoDispatch();
-    expect(watch).not.toHaveBeenCalled();
-
-    const plain = await send(config, { agentId: "worker" });
-    expect(plain.details).toMatchObject({ status: "ok", reply: replyText });
-    expect(watch).not.toHaveBeenCalled();
-  });
-
-  it("still registers a requested watch when the target has read visibility", async () => {
-    const watch = vi.spyOn(sessionStateEvents, "registerSessionStateWatch").mockResolvedValue(true);
-    const result = await send(configFor({ send: ["worker"], visibility: "all" }), {
-      agentId: "worker",
-      watch: true,
-    });
-    expect(result.details).toMatchObject({ status: "ok", reply: replyText, watched: true });
-    expect(watch).toHaveBeenCalledOnce();
-  });
-
-  it("reports a raw-target watch refusal without misreporting an accepted send", async () => {
-    const result = await send(configFor({ send: ["worker"], visibility: "all" }), {
-      label: "raw-worker",
-      agentId: "worker",
-      watch: true,
-    });
-    expect(result.details).toMatchObject({
-      status: "ok",
-      reply: replyText,
-      watched: false,
-      watchError: expect.stringContaining("agent-qualified"),
-    });
-    expect(gatewayMethods()).toContain("agent");
-    expect(gatewayMethods()).toContain("agent.wait");
-  });
+  it.each(["send-only", "readable", "raw-target"] as const)(
+    "reports the requested watch for a %s target",
+    async (access) => {
+      const watch = vi
+        .spyOn(sessionStateEvents, "registerSessionStateWatch")
+        .mockResolvedValue(true);
+      const config = configFor({
+        send: ["worker"],
+        visibility: access === "send-only" ? "self" : "all",
+      });
+      const result = await send(config, {
+        agentId: "worker",
+        watch: true,
+        ...(access === "raw-target" ? { label: "raw-worker" } : {}),
+      });
+      if (access === "send-only") {
+        expect(result.details).toMatchObject({ status: "forbidden" });
+        expectNoDispatch();
+        expect(watch).not.toHaveBeenCalled();
+        expectOk(await send(config));
+        expect(watch).not.toHaveBeenCalled();
+      } else if (access === "readable") {
+        expectOk(result, { watched: true });
+        expect(watch).toHaveBeenCalledOnce();
+      } else {
+        expectOk(result, {
+          watched: false,
+          watchError: expect.stringContaining("agent-qualified"),
+        });
+        expect(watch).not.toHaveBeenCalled();
+        expect(gatewayMethods()).toContain("agent");
+        expect(gatewayMethods()).toContain("agent.wait");
+      }
+    },
+  );
 
   it.each([requesterKey, subagentRequesterKey])(
     "keeps sandbox spawned-only for requester %s",
@@ -472,50 +448,42 @@ describe("sessions_send directed policy at the tool boundary", () => {
       expect(denied.details).toMatchObject({ status: "forbidden" });
       expectNoDispatch();
 
-      // The identical target and outbound edge work without the sandbox ceiling.
       const allowed = await send(config, { sessionKey: workerKey }, { agentSessionKey });
-      expect(allowed.details).toMatchObject({ status: "ok", reply: replyText });
+      expectOk(allowed);
     },
   );
 
-  it("adds restart context when continuing an interrupted child", async () => {
+  it.each([false, true])("retains owned-child access (interrupted=%s)", async (interrupted) => {
     const target = { agentId: "worker", sessionKey: nativeChildKey };
-    const entry = {
-      sessionId: "native-child-session",
-      updatedAt: 1,
-      spawnedBy: requesterKey,
-    };
-    await replaceSessionEntry(target, { ...entry, status: "interrupted" });
-    try {
-      const result = await send(configFor({ send: [], visibility: "tree" }), {
-        sessionKey: nativeChildKey,
-      });
-      expect(result.details).toMatchObject({ status: "ok", reply: replyText });
-      const prompt = callGateway.mock.calls.find(([request]) => request.method === "agent")?.[0]
-        .params.message;
-      expect(prompt).toContain("Please handle this task");
-      expect(prompt).toContain("interrupted by a gateway restart");
-      expect(prompt).toContain("marked interrupted, missing, or aborted");
-      expect(prompt).toContain("unknown outcome");
-      expect(prompt).toContain("not proof of tool failure");
-    } finally {
-      await replaceSessionEntry(target, entry);
+    const entry = { sessionId: "native-child-session", updatedAt: 1, spawnedBy: requesterKey };
+    if (interrupted) {
+      await replaceSessionEntry(target, { ...entry, status: "interrupted" });
     }
-  });
-
-  it("retains owned-child access through its qualified label", async () => {
-    const result = await send(configFor({ send: [], visibility: "tree" }), {
-      label: "native-child",
-      agentId: "worker",
-    });
-    expect(result.details).toMatchObject({
-      status: "ok",
-      sessionKey: nativeChildKey,
-      reply: replyText,
-    });
-    const prompt = callGateway.mock.calls.find(([request]) => request.method === "agent")?.[0]
-      .params.message;
-    expect(prompt).not.toContain("gateway restart");
+    try {
+      const result = await send(
+        configFor({ send: [], visibility: "tree" }),
+        interrupted ? { sessionKey: nativeChildKey } : { label: "native-child", agentId: "worker" },
+      );
+      expectOk(result, { sessionKey: nativeChildKey });
+      const prompt = gatewayParams("agent")?.message;
+      if (interrupted) {
+        for (const text of [
+          "Please handle this task",
+          "interrupted by a gateway restart",
+          "marked interrupted, missing, or aborted",
+          "unknown outcome",
+          "not proof of tool failure",
+        ]) {
+          expect(prompt).toContain(text);
+        }
+      } else {
+        expect(prompt).not.toContain("gateway restart");
+      }
+    } finally {
+      if (interrupted) {
+        await replaceSessionEntry(target, entry);
+      }
+    }
   });
 
   it("does not turn a send grant into list, history, search, or status access", async () => {

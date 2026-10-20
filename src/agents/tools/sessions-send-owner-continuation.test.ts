@@ -1,12 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { waitForGatewayDispatch } from "../../gateway/server-in-process-dispatch.js";
-import {
-  claimAgentRunDelegatedAuthority,
-  clearAgentRunContext,
-  registerAgentRunContext,
-  releaseAgentRunDelegatedAuthority,
-  validateAgentRunDelegatedAuthority,
-} from "../../infra/agent-run-registry.js";
+import * as agentRuns from "../../infra/agent-run-registry.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { createTestAdmittedRunContext } from "../admitted-run-context.test-support.js";
 import {
@@ -16,7 +10,6 @@ import {
   runWithCronCreatorAuthorityCapability,
 } from "../cron-creator-authority-context.js";
 import { SessionFollowupCompletion } from "../subagents/completion/session-followup-completion.js";
-import type { FollowupRequest } from "../subagents/completion/session-followup-completion.types.js";
 import {
   consumeRequesterCronAuthorityAdmission,
   revokeRequesterCronAuthority,
@@ -118,26 +111,17 @@ function prepareFollowup(extra: Partial<Parameters<typeof prepareSessionsSendFol
     ...extra,
   });
 }
-function startReply(
-  extra: Pick<
-    Parameters<typeof startSessionsSendReplyFlow>[0],
-    "completion" | "callGateway" | "runId"
-  > &
-    Partial<Parameters<typeof startSessionsSendReplyFlow>[0]>,
-) {
-  return startSessionsSendReplyFlow({
-    skip: false,
-    notifyRequesterOnWaitFailure: true,
-    targetSessionKey: CHILD,
-    targetAgentId: "main",
-    displayKey: CHILD,
-    requesterSessionKey: SESSION,
-    requesterAgentId: "main",
-    replyTimeoutMs: 1000,
-    replyMode: "one-way",
-    ...extra,
-  });
-}
+const replyDefaults = {
+  skip: false,
+  notifyRequesterOnWaitFailure: true,
+  targetSessionKey: CHILD,
+  targetAgentId: "main",
+  displayKey: CHILD,
+  requesterSessionKey: SESSION,
+  requesterAgentId: "main",
+  replyTimeoutMs: 1000,
+  replyMode: "one-way",
+} satisfies Partial<Parameters<typeof startSessionsSendReplyFlow>[0]>;
 function visibleReply(text: string) {
   return {
     status: "ok" as const,
@@ -147,8 +131,8 @@ function visibleReply(text: string) {
 }
 async function inRun<T>(runId: string, work: () => Promise<T>) {
   const { operationalRunInstance } = createTestAdmittedRunContext(runId);
-  const approvalAuthority = claimAgentRunDelegatedAuthority(operationalRunInstance);
-  registerAgentRunContext(runId, {
+  const approvalAuthority = agentRuns.claimAgentRunDelegatedAuthority(operationalRunInstance);
+  agentRuns.registerAgentRunContext(runId, {
     agentId: "main",
     sessionKey: SESSION,
     sessionId: SESSION_ID,
@@ -160,13 +144,13 @@ async function inRun<T>(runId: string, work: () => Promise<T>) {
         sessionKey: SESSION,
         operationalRunInstance,
         approvalAuthority,
-        receiptAuthority: () => validateAgentRunDelegatedAuthority(approvalAuthority),
+        receiptAuthority: () => agentRuns.validateAgentRunDelegatedAuthority(approvalAuthority),
       },
       work,
     );
   } finally {
-    releaseAgentRunDelegatedAuthority(approvalAuthority);
-    clearAgentRunContext(runId);
+    agentRuns.releaseAgentRunDelegatedAuthority(approvalAuthority);
+    agentRuns.clearAgentRunContext(runId);
   }
 }
 afterEach(() => {
@@ -216,7 +200,8 @@ describe("child followup requester continuation", () => {
       }),
     );
     try {
-      await startReply({
+      await startSessionsSendReplyFlow({
+        ...replyDefaults,
         completion,
         callGateway: callAgentToolGatewayRequest,
         runId: request!.runId,
@@ -225,13 +210,12 @@ describe("child followup requester continuation", () => {
       await completion.settle(request!.runId, visibleReply("Child result"));
       completion.finishExecution(request!.runId);
       await entered.promise;
-      await vi.advanceTimersByTimeAsync(180_000);
-      expect(fixture.release).not.toHaveBeenCalled();
-      expect(fixture.log).not.toHaveBeenCalled();
-      admit.resolve();
-      await vi.advanceTimersByTimeAsync(180_000);
-      expect(fixture.release).not.toHaveBeenCalled();
-      expect(fixture.log).not.toHaveBeenCalled();
+      for (const advance of [() => {}, () => admit.resolve()]) {
+        advance();
+        await vi.advanceTimersByTimeAsync(180_000);
+        expect(fixture.release).not.toHaveBeenCalled();
+        expect(fixture.log).not.toHaveBeenCalled();
+      }
       expect(callGateway).toHaveBeenCalledOnce();
       expect(callGateway.mock.calls[0]?.[0].params).toMatchObject({
         sessionKey: SESSION,
@@ -277,7 +261,7 @@ describe("child followup requester continuation", () => {
       undefined,
       owner,
     )!;
-    const request: FollowupRequest | undefined = await inRun("original", () =>
+    const request = await inRun("original", () =>
       runWithCronCreatorAuthorityCapability(capability, async () => {
         const withRequesterAuthority = bindRequesterYieldCronAuthority("original");
         return await prepareFollowup({ withRequesterAuthority });
@@ -360,7 +344,8 @@ describe("child followup requester continuation", () => {
         assertDispatchCurrent: options?.sessionMutationCommitGuard,
       }),
     );
-    await startReply({
+    await startSessionsSendReplyFlow({
+      ...replyDefaults,
       completion,
       callGateway,
       runId: request!.runId,
@@ -370,12 +355,7 @@ describe("child followup requester continuation", () => {
           : visibleReply("ready"),
     });
     await released.promise;
-    if (
-      outcome === "success" ||
-      outcome === "child error" ||
-      outcome === "observer closed" ||
-      outcome === "receipt replay"
-    ) {
+    if (["success", "child error", "observer closed", "receipt replay"].includes(outcome)) {
       expect(invoked).toHaveBeenCalledTimes(1);
       expect(fixture.log).not.toHaveBeenCalled();
     } else if (outcome === "requester failed while pending") {

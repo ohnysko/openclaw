@@ -31,43 +31,25 @@ describe("resolveSessionDeliveryTargetFromKey", () => {
     setActivePluginRegistry(createSessionConversationTestRegistry());
   });
 
-  it("lets plugins own session-derived target shapes", () => {
-    expectTarget("agent:main:discord:group:dev", { channel: "discord", to: "channel:dev" });
-    expectTarget("agent:main:slack:group:C123", { channel: "slack", to: "channel:C123" });
-  });
-
-  it("preserves decimal thread ids for Slack-style session keys", () => {
-    expectTarget("agent:main:slack:channel:general:thread:1699999999.0001", {
-      channel: "slack",
-      to: "channel:general",
-      threadId: "1699999999.0001",
-    });
-  });
-
-  it("preserves feishu conversation ids that embed :topic: in the base id", () => {
-    expectTarget("agent:main:feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user", {
-      channel: "feishu",
-      to: "oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
-    });
-  });
-
   it.each([
-    {
-      name: "account-scoped dm alias",
-      sessionKey: "agent:main:feishu:work:dm:ou_recipient",
-      expected: { channel: "feishu", to: "user:ou_recipient", accountId: "work" },
-    },
-    {
-      name: "unregistered channel",
-      sessionKey: "agent:main:wecom:direct:opaque-recipient",
-      expected: { channel: "wecom", to: "user:opaque-recipient" },
-    },
-  ])(
-    "resolves $name delivery targets without session-list delivery context",
-    ({ sessionKey, expected }) => {
-      expectTarget(sessionKey, expected);
-    },
-  );
+    ["discord:group:dev", { channel: "discord", to: "channel:dev" }],
+    ["slack:group:C123", { channel: "slack", to: "channel:C123" }],
+    [
+      "slack:channel:general:thread:1699999999.0001",
+      { channel: "slack", to: "channel:general", threadId: "1699999999.0001" },
+    ],
+    [
+      "feishu:group:oc_group_chat:topic:om_topic_root:sender:ou_topic_user",
+      { channel: "feishu", to: "oc_group_chat:topic:om_topic_root:sender:ou_topic_user" },
+    ],
+    [
+      "feishu:work:dm:ou_recipient",
+      { channel: "feishu", to: "user:ou_recipient", accountId: "work" },
+    ],
+    ["wecom:direct:opaque-recipient", { channel: "wecom", to: "user:opaque-recipient" }],
+  ] as const)("resolves the plugin-owned target for %s", (suffix, expected) => {
+    expectTarget(`agent:main:${suffix}`, expected);
+  });
 
   it("does not reinterpret a nested agent session as an external direct target", () => {
     expect(
