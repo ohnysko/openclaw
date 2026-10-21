@@ -1,5 +1,9 @@
 import type { AgentToolResult } from "openclaw/plugin-sdk/agent-core";
-import { jsonResult, readStringParam } from "openclaw/plugin-sdk/channel-actions";
+import {
+  jsonResult,
+  readStringOrNumberParam,
+  readStringParam,
+} from "openclaw/plugin-sdk/channel-actions";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import { resolveTelegramAccountOwnerAgentId } from "./account-owner.js";
@@ -14,6 +18,7 @@ import {
   deleteForumTopicTelegram,
   editForumTopicTelegram,
 } from "./send.js";
+import { parseTelegramTarget } from "./targets.js";
 import { updateTopicName } from "./topic-name-cache.js";
 
 type TelegramForumTopicActionName = "createForumTopic" | "editForumTopic" | "deleteForumTopic";
@@ -25,6 +30,31 @@ function resolveActionTopicNameCacheScope(cfg: OpenClawConfig, accountId?: strin
   });
 }
 
+/**
+ * Shared destination policy admits `to`, while readTelegramChatId prefers `chatId`/`channelId`.
+ * Deletion is irreversible, so every supplied destination field must name the same chat and topic.
+ */
+function assertUnambiguousTopicDeleteDestination(
+  input: Record<string, unknown>,
+  messageThreadId: number,
+): void {
+  const chats = new Set<string>();
+  for (const key of ["to", "chatId", "channelId"] as const) {
+    const raw = readStringOrNumberParam(input, key);
+    if (raw === undefined) {
+      continue;
+    }
+    const target = parseTelegramTarget(String(raw));
+    chats.add(target.chatId);
+    if (target.messageThreadId !== undefined && target.messageThreadId !== messageThreadId) {
+      throw new Error(`Telegram deleteForumTopic ${key} topic conflicts with threadId.`);
+    }
+  }
+  if (chats.size > 1) {
+    throw new Error("Telegram deleteForumTopic received conflicting destination chats.");
+  }
+}
+
 export async function handleTelegramForumTopicAction(params: {
   action: TelegramForumTopicActionName;
   params: Record<string, unknown>;
@@ -32,12 +62,17 @@ export async function handleTelegramForumTopicAction(params: {
   accountId?: string | null;
   apiOptions: Omit<Parameters<typeof createForumTopicTelegram>[2], "token">;
   requireToken: () => string;
-  isActionEnabled: (key: "createForumTopic" | "editForumTopic") => boolean;
+  isActionEnabled: (key: "createForumTopic" | "editForumTopic" | "deleteMessage") => boolean;
 }): Promise<AgentToolResult<unknown>> {
   const { action, params: input, cfg, accountId, apiOptions, requireToken } = params;
-  // topic-delete shares the editForumTopic gate: it manages existing topics and adds no config key.
-  const gateKey = action === "createForumTopic" ? "createForumTopic" : "editForumTopic";
-  if (!params.isActionEnabled(gateKey)) {
+  // topic-delete needs both the topic-management and the message-deletion gates; no new config key.
+  const gateKeys =
+    action === "createForumTopic"
+      ? (["createForumTopic"] as const)
+      : action === "deleteForumTopic"
+        ? (["editForumTopic", "deleteMessage"] as const)
+        : (["editForumTopic"] as const);
+  if (!gateKeys.every((key) => params.isActionEnabled(key))) {
     throw new Error(`Telegram ${action} is disabled.`);
   }
   const chatId = readTelegramChatId(input);
@@ -65,6 +100,7 @@ export async function handleTelegramForumTopicAction(params: {
     throw new Error("messageThreadId or threadId is required.");
   }
   if (action === "deleteForumTopic") {
+    assertUnambiguousTopicDeleteDestination(input, messageThreadId);
     return jsonResult(
       await deleteForumTopicTelegram(chatId ?? "", messageThreadId, {
         ...apiOptions,

@@ -151,7 +151,7 @@ Rich Telegram surfaces: formatted messages, inline keyboards, agent message acti
     - `deleteMessage` (`chatId`, `messageId`)
     - `editMessage` (`chatId`, `messageId`, `content` or `caption`, optional `presentation` inline buttons; button-only edits update reply markup)
     - `createForumTopic` (`chatId`, `name`, optional `iconColor`, `iconCustomEmojiId`)
-    - `deleteForumTopic` (`chatId`, `threadId`; deletes the topic and all its messages, refuses the General topic, needs the bot's `can_delete_messages` right; gated by `editForumTopic`)
+    - `deleteForumTopic` (`chatId`, `threadId`; deletes the topic and all its messages, refuses the General topic, needs the bot's `can_delete_messages` right; requires both `editForumTopic` and `deleteMessage`; conflicting `target`/`chatId` values are rejected)
 
     Ergonomic aliases: `send`, `react`, `delete`, `edit`, `sticker`, `sticker-search`, `topic-create`, `topic-delete`.
 

@@ -777,6 +777,15 @@ describe("Telegram registered adapter conformance over HTTP", () => {
       expectMethods("createForumTopic", "editForumTopic", "editForumTopic", "deleteForumTopic");
       expectFields({ message_thread_id: 99 }, 3);
       await expect(topic("topic-delete", { threadId: 1 })).rejects.toThrow(/General/);
+      await expect(topic("topic-delete", { to: "-1002", threadId: 99 })).rejects.toThrow(
+        /conflicting destination/,
+      );
+      await expect(topic("topic-delete", { to: "-1001:topic:5", threadId: 99 })).rejects.toThrow(
+        /conflicts with threadId/,
+      );
+      actionCfg.channels!.telegram!.actions!.deleteMessage = false;
+      await expect(topic("topic-delete", { threadId: 99 })).rejects.toThrow(/disabled/);
+      expect(requests).toHaveLength(4);
       expect(requests[0]!.fields.name).toBe("Primary");
       expectFields({ message_thread_id: 99, icon_custom_emoji_id: "5231419410191111111" }, 2);
       resetTelegramTopicNameCacheForTest();
