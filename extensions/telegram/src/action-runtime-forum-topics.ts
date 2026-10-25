@@ -44,7 +44,7 @@ function assertUnambiguousTopicDeleteDestination(
     if (raw === undefined) {
       continue;
     }
-    const target = parseTelegramTarget(String(raw));
+    const target = parseTelegramTarget(raw);
     chats.add(target.chatId);
     if (target.messageThreadId !== undefined && target.messageThreadId !== messageThreadId) {
       throw new Error(`Telegram deleteForumTopic ${key} topic conflicts with threadId.`);
