@@ -35,7 +35,6 @@ import { getBrowserRequestScope } from "./request-scope.js";
 export class BrowserServiceError extends Error {
   readonly status?: number;
   readonly code?: BrowserActErrorCode;
-  readonly unrecognizedCode?: true;
   readonly reason?: BrowserErrorMetadata["reason"];
   readonly details?: BrowserNoDisplayErrorDetails;
 
@@ -44,7 +43,6 @@ export class BrowserServiceError extends Error {
     this.name = "BrowserServiceError";
     this.status = status;
     this.code = metadata?.code;
-    this.unrecognizedCode = metadata?.unrecognizedCode;
     this.reason = metadata && "reason" in metadata ? metadata.reason : undefined;
     this.details = metadata && "details" in metadata ? metadata.details : undefined;
   }
@@ -342,7 +340,7 @@ export async function fetchBrowserJson<T>(
   let isDispatcherPath = false;
   try {
     if (isAbsoluteHttp(url)) {
-      if (scope) {
+      if (scope?.managedOnly) {
         throw new Error("Dashboard browser requests must stay on the local managed browser");
       }
       const httpInit = withLoopbackBrowserAuth(url, init);
@@ -355,7 +353,7 @@ export async function fetchBrowserJson<T>(
     for (const [key, value] of parsed.searchParams.entries()) {
       query[key] = value;
     }
-    if (scope) {
+    if (scope?.managedOnly) {
       query.managedOnly = true;
     }
     let body = init?.body;

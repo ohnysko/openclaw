@@ -3,9 +3,10 @@ import {
   signalAccountConfig as accountConfig,
   signalJsonServer,
   listenSignalServer as listen,
-  closeSignalServer as close,
   type SignalRpcEnvelope,
 } from "./signal-rpc.test-support.js";
+
+const reactionStores = await vi.hoisted(() => import("./approval-reactions.test-support.js"));
 
 const signalRpcRequestMock = vi.hoisted(() => vi.fn());
 const resolveOutboundAttachmentFromUrlMock = vi.hoisted(() =>
@@ -27,10 +28,8 @@ vi.mock("openclaw/plugin-sdk/media-runtime", async () => {
   };
 });
 
-const {
-  clearSignalApprovalReactionTargetsForTest,
-  resolveSignalApprovalReactionTargetWithPersistence,
-} = await import("./approval-reactions.js");
+const { resolveSignalApprovalReactionTargetWithPersistence } =
+  await import("./approval-reactions.js");
 const { sendMessageSignal, sendReadReceiptSignal, sendTypingSignal } = await import("./send.js");
 
 const SIGNAL_TEST_CFG = accountConfig("external-native", "http://signal.test");
@@ -50,7 +49,7 @@ function receiptAt(timestamp: number) {
 
 describe("sendMessageSignal receipts", () => {
   beforeEach(() => {
-    clearSignalApprovalReactionTargetsForTest();
+    reactionStores.clearSignalApprovalReactionStoresForTest();
     signalRpcRequestMock.mockReset();
     resolveOutboundAttachmentFromUrlMock.mockClear();
   });
@@ -271,7 +270,7 @@ describe("Signal quoted-message provider replay safety", () => {
         testCase.transportKind === "container" ? "quote_timestamp" : "params.quoteTimestamp";
       expect(requests[0]).toHaveProperty(quoteTimestampPath, 1700000000001);
     } finally {
-      await close(server);
+      await server[Symbol.asyncDispose]();
     }
   });
 });
@@ -386,7 +385,7 @@ describe("Signal native JSON-RPC recipient delivery", () => {
       ]);
       expect(responses).toHaveLength(0);
     } finally {
-      await close(server);
+      await server[Symbol.asyncDispose]();
     }
   });
 });

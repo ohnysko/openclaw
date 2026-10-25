@@ -1,5 +1,6 @@
 import { getPublicKey, type Event, type Filter, type Relay } from "nostr-tools";
-import { beforeEach, expect, it, vi } from "vitest";
+import { beforeEach, expect, it, onTestFinished, vi } from "vitest";
+import { createBuzzRelayInfoFetchMock } from "./buzz-bus.test-helpers.js";
 
 type AuthSigner = (template: {
   kind: number;
@@ -104,15 +105,7 @@ beforeEach(() => {
   relayMocks.connect.mockClear();
   relayMocks.filters.length = 0;
   relayMocks.subscribe.mockReset();
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async () =>
-      Response.json({
-        self: RELAY_PUBLIC_KEY,
-        software: "https://github.com/block/buzz",
-      }),
-    ),
-  );
+  vi.stubGlobal("fetch", createBuzzRelayInfoFetchMock(RELAY_PUBLIC_KEY));
 });
 
 it("discovers only rooms whose member event names the bot public key", async () => {
@@ -166,6 +159,8 @@ it.each([
   async ({ notification, firstSnapshot }) => {
     vi.useFakeTimers();
     const abort = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(abort.signal);
+    onTestFinished(() => timeout.mockRestore());
     type Handlers = Parameters<Relay["prepareSubscription"]>[1];
     const subscribed = Promise.withResolvers<Handlers>();
     let snapshots = 0;
@@ -189,10 +184,7 @@ it.each([
       return { close: vi.fn() };
     });
     const { waitForBuzzRoomAccess } = await import("./room-access-wait.js");
-    const waiting = waitForBuzzRoomAccess({
-      ...connection,
-      signal: abort.signal,
-    });
+    const waiting = waitForBuzzRoomAccess(connection);
     let rooms: Awaited<typeof waiting> | undefined;
     const observed = waiting.then(
       (value) => {

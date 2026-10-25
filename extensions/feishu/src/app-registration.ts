@@ -24,13 +24,11 @@ export interface AppRegistrationResult {
 }
 
 interface InitResponse {
-  nonce: string;
   supported_auth_methods: string[];
 }
 
 interface RawBeginResponse {
   device_code: string;
-  verification_uri: string;
   verification_uri_complete: string;
   interval: number;
   expire_in: number;
@@ -151,9 +149,9 @@ export async function pollAppRegistration(params: {
 
   const expireInMs =
     finiteSecondsToTimerSafeMilliseconds(expireIn) ?? DEFAULT_REGISTRATION_EXPIRE_SECONDS * 1_000;
-  const deadline = Date.now() + expireInMs;
+  const deadline = performance.now() + expireInMs;
 
-  while (Date.now() < deadline) {
+  while (performance.now() < deadline) {
     if (abortSignal?.aborted) {
       return { status: "timeout" };
     }

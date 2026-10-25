@@ -5,16 +5,16 @@ import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import type { ChatEvent } from "../../packages/gateway-protocol/src/index.js";
+import { readRequestText } from "../../test/helpers/gateway-integration-fixtures.js";
+import {
+  replayChatDisplay,
+  type ChatDisplayFrame,
+} from "../../test/helpers/gateway/chat-display-replay.js";
 import { writeOpenAiResponsesSse } from "../../test/helpers/openai-responses-sse.js";
 import { collectTextContentBlocks } from "../agents/content-blocks.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { setTestEnvValue } from "../test-utils/env.js";
-import { replayChatDisplay, type ChatDisplayFrame } from "./chat-display-replay.test-support.js";
-import {
-  closeProvider,
-  listenProvider,
-  readProviderBody,
-} from "./gateway-provider-fixture.test-support.js";
+import { closeProvider, listenProvider } from "./gateway-provider-fixture.test-support.js";
 import {
   createGatewayConfigPath,
   removeGatewayTempHome,
@@ -37,6 +37,13 @@ let provider: ReturnType<typeof createServer>;
 
 function messageText(message: unknown): string {
   return isRecord(message) ? collectTextContentBlocks(message.content).join("\n") : "";
+}
+
+function assistantTexts(messages: unknown[]): string[] {
+  return messages
+    .filter(isRecord)
+    .filter((message) => message.role === "assistant")
+    .map(messageText);
 }
 
 function writeResponse(response: ServerResponse, model: string, attempt: number): void {
@@ -107,7 +114,7 @@ beforeAll(async () => {
         response.writeHead(404).end();
         return;
       }
-      const payload: Record<string, unknown> = JSON.parse(await readProviderBody(request));
+      const payload: Record<string, unknown> = JSON.parse(await readRequestText(request));
       if (typeof payload.model !== "string") {
         throw new Error("Responses request has no model");
       }
@@ -259,20 +266,12 @@ it.each(scenarios)(
         },
       ]);
       const display = replayChatDisplay(displayFrames, sessionKey, runId);
-      expect(display.chatRunId).toBeNull();
-      expect(display.chatStream).toBeNull();
-      expect(display.chatStreamSegments).toEqual([]);
-      expect(
-        display.chatMessages
-          .filter(isRecord)
-          .filter((message) => message.role === "assistant")
-          .map(messageText),
-      ).toEqual(
-        history.messages
-          .filter(isRecord)
-          .filter((message) => message.role === "assistant")
-          .map(messageText),
-      );
+      expect(display).toMatchObject({
+        chatRunId: null,
+        chatStream: null,
+        chatStreamSegments: [],
+      });
+      expect(assistantTexts(display.chatMessages)).toEqual(assistantTexts(history.messages));
     } else {
       expect(completed).toMatchObject({ status: "ok", terminalReply: { text: answer } });
       expect(messageText(history.messages.at(-1))).toBe(answer);
