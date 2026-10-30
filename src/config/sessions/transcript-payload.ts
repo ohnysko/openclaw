@@ -1,5 +1,6 @@
 import { sql, type Expression, type RawBuilder } from "kysely";
 import {
+  jsonObjectValue,
   jsonPathValue,
   jsonRemovePaths,
   jsonValid,
@@ -41,7 +42,30 @@ export {
 
 const MAX_NAVIGATION_BYTES = 16 * 1024;
 const MIN_COMPRESS_BYTES = 1024;
-const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+// This shape owns both the native envelope and its minimum serialized overhead.
+const NAVIGATION_ENVELOPE = {
+  version: 1,
+  report: null,
+  navigation: {},
+  reset: {},
+  model: {},
+  modelBytes: 0,
+  modelWithoutCheckpointBytes: 0,
+  withoutCustomDataBytes: 0,
+};
+function minimumNavigationBytes(navigation: Record<string, number>): number {
+  return (
+    Buffer.byteLength(
+      JSON.stringify({ ...NAVIGATION_ENVELOPE, navigation, reset: navigation, model: navigation }),
+    ) - "null".length
+  );
+}
+const MIN_NAVIGATION_BYTES = [
+  minimumNavigationBytes({}),
+  minimumNavigationBytes({ type: 0, id: 0 }),
+  minimumNavigationBytes({ type: 0, id: 0, parentId: 0 }),
+] as const;
 
 export type TranscriptPayloadRecord = TranscriptPredicateFields & {
   event_json: string | null;
@@ -389,20 +413,27 @@ function navigationProjection(
   report: Expression<string>,
   originalEvent: Expression<string>,
 ): RawBuilder<string | null> {
+  const metadata = jsonObjectValue(database, {
+    ...Object.fromEntries(
+      Object.entries(NAVIGATION_ENVELOPE).map(([key, value]) => [
+        key,
+        typeof value === "number" ? sql.lit(value) : sql`json(${JSON.stringify(value)})`,
+      ]),
+    ),
+    report: sql`json(${report})`,
+    navigation: sql`json(${projectTranscriptPayloadNavigationSql(database, event)})`,
+    reset: sql`json(${projectResetBoundaryNavigationSql(database, originalEvent)})`,
+    model: sql`json(${projectModelContextNavigationSql(database, event, undefined, sql.lit(1))})`,
+    modelBytes: sql`octet_length(${projectModelContextEventSql(database, event, sql.lit(0), undefined, undefined, sql.lit(1))})`,
+    modelWithoutCheckpointBytes: sql`octet_length(${projectModelContextEventSql(database, event, sql.lit(1), undefined, undefined, sql.lit(1))})`,
+    withoutCustomDataBytes: sql`octet_length(json_remove(${event}, '$.data'))`,
+  });
   return /* kysely-allow-raw: record native projections and exact byte costs; exceptional envelopes retain identity behavior. */ sql<
     string | null
   >`CASE WHEN json_valid(${originalEvent}) AND json_valid(${report}) THEN CASE
     WHEN json_type(${event}) != 'object'
       OR coalesce(json_type(${event}, '$.message'), 'null') NOT IN ('object', 'null') THEN NULL
-    ELSE json_object('version', 1,
-      'report', json(${report}),
-      'navigation', json(${projectTranscriptPayloadNavigationSql(database, event)}),
-      'reset', json(${projectResetBoundaryNavigationSql(database, originalEvent)}),
-      'model', json(${projectModelContextNavigationSql(database, event)}),
-      'modelBytes', octet_length(${projectModelContextEventSql(database, event, sql.lit(0))}),
-      'modelWithoutCheckpointBytes', octet_length(${projectModelContextEventSql(database, event, sql.lit(1))}),
-      'withoutCustomDataBytes', octet_length(json_remove(${event}, '$.data')))
-    END ELSE NULL END`;
+    ELSE ${metadata} END ELSE NULL END`;
 }
 
 type NavigationInput = { eventJson: string; reportJson: string };
@@ -499,11 +530,11 @@ export function prepareTranscriptPayload(
   if (rawBytes < MIN_COMPRESS_BYTES) {
     return identity;
   }
-  const bytes = Buffer.from(eventJson, "utf8");
   // A literal unpaired surrogate cannot round-trip through a UTF-8 frame.
-  if (utf8Decoder.decode(bytes) !== eventJson) {
+  if (!eventJson.isWellFormed()) {
     return identity;
   }
+  const bytes = Buffer.from(eventJson, "utf8");
   const compressed = codec.compress(bytes, 1, true);
   const maximumStoredBytes = rawBytes - Math.max(64, Math.ceil(rawBytes / 10));
   if (compressed.byteLength > maximumStoredBytes) {
@@ -517,7 +548,19 @@ export function prepareTranscriptPayload(
     if (findSessionTranscriptHeader([raw])) {
       return identity;
     }
-    reportJson = JSON.stringify(projectSessionTranscriptReportFacts(raw));
+    const report = projectSessionTranscriptReportFacts(raw);
+    reportJson = JSON.stringify(report);
+    // Canonical projections all retain type/id and any serialized parentId.
+    const minimum =
+      MIN_NAVIGATION_BYTES[
+        report.kind === "canonical" ? (report.entry.parentId !== undefined ? 2 : 1) : 0
+      ];
+    if (
+      compressed.byteLength + Buffer.byteLength(reportJson, "utf8") + minimum >
+      maximumStoredBytes
+    ) {
+      return identity;
+    }
   } catch {
     // Unsupported JSON or projection nesting must not reject existing identity bytes.
     return identity;

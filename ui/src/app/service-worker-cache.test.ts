@@ -78,6 +78,21 @@ describe("Control UI service worker HTTP recovery", () => {
     }
   });
 
+  it("does not report expected reachability-probe failures to browser auth recovery", async () => {
+    const worker = createFetchServiceWorker("https://control.example/");
+    const request = {
+      url: worker.scope + "healthz",
+      cache: "no-store" as const,
+      headers: new Headers({ "X-OpenClaw-Reachability-Probe": "1" }),
+    };
+    worker.fetch.mockRejectedValueOnce(new TypeError("offline"));
+    expect((await worker.dispatch(request))?.type).toBe("error");
+    worker.fetch.mockResolvedValueOnce(new Response("Sign in", { status: 401 }));
+    expect((await worker.dispatch(request))?.status).toBe(401);
+    expect(worker.windowClients[0].postMessage).not.toHaveBeenCalled();
+    expect(worker.cachePut).not.toHaveBeenCalled();
+  });
+
   it("serves prior public-asset versions only from complete previous caches without storing new responses", async () => {
     const worker = createFetchServiceWorker();
     const url = worker.scope + "fonts/custom.woff2?v=previous-build";
@@ -689,6 +704,23 @@ describe("Control UI offline app shell", () => {
     expect(worker.priorCache.has(worker.scope + "__offline_shell__")).toBe(true);
   });
 
+  it("preserves an installing replacement cache when the active worker is probed", async () => {
+    const worker = createFetchServiceWorker();
+    worker.fetch.mockResolvedValue(new Response("build asset"));
+    await worker.install();
+    await worker.activate();
+    const replacementName = "openclaw-control-next-fixture";
+    const replacementCache = new Map([
+      [worker.scope + "assets/next.js", new Response("installing replacement")],
+    ]);
+    worker.generations.set(replacementName, replacementCache);
+
+    await worker.probe();
+
+    expect(worker.generations.get(replacementName)).toBe(replacementCache);
+    expect(worker.cache.has(worker.scope + "__offline_shell__")).toBe(true);
+  });
+
   it("uses the cached shell when an online navigation stalls until the deadline", async () => {
     vi.useFakeTimers();
     try {
@@ -902,6 +934,7 @@ function createFetchServiceWorker(
     cache,
     priorCache,
     olderCache,
+    generations,
     info,
     cacheDelete,
     cacheMatch,

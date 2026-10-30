@@ -5,7 +5,7 @@ import {
   clampPositiveTimerTimeoutMs,
 } from "@openclaw/normalization-core/number-coercion";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { asOptionalObjectRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeMediaProviderId } from "../../packages/media-understanding-common/src/provider-id.js";
 import { raceWithTimeout } from "../../packages/retry/src/index.js";
 import { isMinimaxVlmModel, minimaxUnderstandImage } from "../agents/minimax-vlm.js";
@@ -21,10 +21,6 @@ import {
   unwrapSecretSentinelsForProviderEgress,
 } from "../agents/provider-secret-egress.js";
 import { registerProviderStreamForModel } from "../agents/provider-stream.js";
-import {
-  coerceImageAssistantText,
-  hasImageReasoningOnlyResponse,
-} from "../agents/tools/image-tool.helpers.js";
 import { isSecretRef } from "../config/types.secrets.js";
 import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { complete } from "../llm/stream.js";
@@ -32,6 +28,7 @@ import type { AssistantMessage, Context, Model, ProviderStreamOptions } from "..
 import { runPluginStreamConsumer } from "../plugins/plugin-instance-scope.js";
 import { runWithAsyncWorkResources } from "../shared/async-work-resources.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
+import { createMediaAssistantTextCoercer, MediaAssistantNoTextError } from "./assistant-text.js";
 import { resolveImageRuntime } from "./image-model-runtime.js";
 import type {
   ImageDescriptionRequest,
@@ -39,6 +36,66 @@ import type {
   ImagesDescriptionRequest,
   ImagesDescriptionResult,
 } from "./types.js";
+
+const coerceImageAssistantText = createMediaAssistantTextCoercer("Image");
+
+const IMAGE_REASONING_FALLBACK_SIGNATURES = new Set([
+  "reasoning_content",
+  "reasoning",
+  "reasoning_details",
+  "reasoning_text",
+]);
+const MAX_IMAGE_REASONING_FALLBACK_BLOCKS = 50;
+const MAX_IMAGE_REASONING_SIGNATURE_PARSE_CHARS = 2_048;
+const MAX_IMAGE_REASONING_SIGNATURE_SCAN_CHARS = 65_536;
+
+function isImageReasoningFallbackSignature(value: unknown): boolean {
+  if (!value) {
+    return false;
+  }
+  if (typeof value === "string") {
+    if (IMAGE_REASONING_FALLBACK_SIGNATURES.has(value)) {
+      return true;
+    }
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+      return false;
+    }
+    if (trimmed.length > MAX_IMAGE_REASONING_SIGNATURE_PARSE_CHARS) {
+      const scanned = trimmed.slice(0, MAX_IMAGE_REASONING_SIGNATURE_SCAN_CHARS);
+      return /"id"\s*:\s*"rs_/.test(scanned) && /"type"\s*:\s*"reasoning(?:[."])/.test(scanned);
+    }
+    try {
+      return isImageReasoningFallbackSignature(JSON.parse(trimmed));
+    } catch {
+      return false;
+    }
+  }
+  const record = asOptionalObjectRecord(value);
+  if (!record) {
+    return false;
+  }
+  const id = typeof record.id === "string" ? record.id : "";
+  const type = typeof record.type === "string" ? record.type : "";
+  return id.startsWith("rs_") && (type === "reasoning" || type.startsWith("reasoning."));
+}
+
+function hasImageReasoningOnlyResponse(message: AssistantMessage): boolean {
+  if (!Array.isArray(message.content)) {
+    return false;
+  }
+  return message.content.slice(0, MAX_IMAGE_REASONING_FALLBACK_BLOCKS).some((block) => {
+    const record = asOptionalObjectRecord(block);
+    if (!record) {
+      return false;
+    }
+    return (
+      record.type === "thinking" &&
+      typeof record.thinking === "string" &&
+      isImageReasoningFallbackSignature(record.thinkingSignature)
+    );
+  });
+}
 
 function disableReasoningForImageRetryPayload(payload: unknown, model: Model): unknown {
   // Empty-text image responses can be caused by reasoning-only payloads; retry
@@ -462,10 +519,7 @@ export async function describeImagesWithModelPayloadTransformCore(
       });
       return { text, model: model.id };
     } catch (err) {
-      if (
-        !(err instanceof Error && /^Image model returned no text\b/.test(err.message)) ||
-        !hasImageReasoningOnlyResponse(message)
-      ) {
+      if (!(err instanceof MediaAssistantNoTextError) || !hasImageReasoningOnlyResponse(message)) {
         throw err;
       }
     }

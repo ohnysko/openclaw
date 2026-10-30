@@ -7,6 +7,7 @@ import {
   validateUpdateStatusParams,
 } from "../../../../packages/gateway-protocol/src/index.js";
 import { createDeferred } from "../../../../test/helpers/promise.js";
+import { captureSecurityEvents } from "../../../agents/test-helpers/security-events.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { resetDiagnosticEventsForTest } from "../../../infra/diagnostic-events.js";
 import { tryBeginGatewaySuspendAdmission } from "../../../process/gateway-work-admission.js";
@@ -59,7 +60,6 @@ import {
   cleanupGatewayHarnesses,
   connectTrustedProxyUser,
   createGatewayHarnessGate,
-  captureSecurityEvents,
   createCloseMock,
   createConnectedTestClient,
   createHealthSummary,
@@ -281,7 +281,7 @@ describe("attachGatewayWsMessageHandler post-connect health refresh", () => {
       await Promise.all([prewarmStarted.promise, helloSent.promise]);
       expect(prewarmGatewaySessionHistoryMock).toHaveBeenCalledWith(
         loadConfigMock(),
-        expect.objectContaining({ onlyIfCold: true }),
+        expect.objectContaining({ isCancelled: expect.any(Function) }),
       );
       expect(JSON.parse(harness.socketSend.mock.calls[0]![0])).toMatchObject({
         ok: true,
@@ -1816,7 +1816,6 @@ describe("attachGatewayWsMessageHandler post-connect health refresh", () => {
           request: { message: "hello", idempotencyKey: runId },
           hasRestoredCronContinuation: false,
           isOneShotModelRun: false,
-          isRestartRecoveryResumeRun: false,
         }),
       ).toEqual(remote ? undefined : { runId, callerOrigin: { kind: "local" } });
     },
@@ -1844,7 +1843,6 @@ describe("attachGatewayWsMessageHandler post-connect health refresh", () => {
             request: { message: "manage an automation", idempotencyKey: "control-ui-admin-run" },
             hasRestoredCronContinuation: false,
             isOneShotModelRun: false,
-            isRestartRecoveryResumeRun: false,
           });
           const expected = allowed
             ? {

@@ -1,5 +1,5 @@
 import type { JSX } from "@solidjs/web";
-import { createMemo, For, onSettled, Show } from "solid-js";
+import { createMemo, createProjection, For, onSettled, Show } from "solid-js";
 import { normalizeSessionColorValue } from "../../../packages/gateway-protocol/src/session-agent-status.js";
 import { handleContextMenuEvent } from "../lib/keyboard-shortcuts.ts";
 import { t } from "../lib/reactive/i18n.ts";
@@ -43,10 +43,11 @@ export function renderRecentSession(params: RecentSessionParams) {
   );
 }
 function renderRecentSessionRow(params: RecentSessionParams) {
+  // Reconcile presentation fields without replacing the snapshot captured by actions.
+  const view = createProjection(() => params.session);
+  const session = () => view;
+  const actionSession = () => params.session;
   const host = createMemo(() => params.host),
-    session = createMemo(() => params.session, {
-      equals: false,
-    }),
     display = createMemo(() => params.display),
     listItem = createMemo(() => params.listItem ?? true),
     icon = createMemo(() => params.icon);
@@ -99,7 +100,7 @@ function renderRecentSessionRow(params: RecentSessionParams) {
   const label = createMemo(() => session().label);
   const subtitleInput = createMemo(
     () => {
-      const snapshot = host().sidebarSnapshot ? session().snapshotSubtitle : undefined;
+      const snapshot = session().snapshot ? session().snapshotSubtitle : undefined;
       const input = snapshot ? null : sidebarSessionRowSubtitleParams(host(), session(), display());
       return {
         input,
@@ -129,7 +130,7 @@ function renderRecentSessionRow(params: RecentSessionParams) {
         return;
       }
       if (!host().sidebarSnapshot) {
-        host().sidebarMenus.openSessionMenu(session(), x, y, trigger);
+        host().sidebarMenus.openSessionMenu(actionSession(), x, y, trigger);
       }
     });
   const pinLabel = createMemo(() => {
@@ -160,11 +161,10 @@ function renderRecentSessionRow(params: RecentSessionParams) {
   // Personal pins and rail shortcuts do not mutate shared session groups.
   const rowDraggable = createMemo(() => pinnable() || groupWriteAccess().allowed);
   const marqueeLabelTemplate = () => {
-    const teamValue = team();
     const labelValue = label();
     return renderHoverMarquee(
       <>
-        {teamValue ? undefined : indicators.originIndicators}
+        {indicators.originIndicators}
         {labelValue}
       </>,
       "sidebar-recent-session__name",
@@ -236,7 +236,7 @@ function renderRecentSessionRow(params: RecentSessionParams) {
         }
         if (event.dataTransfer) {
           writeSessionDragData(event.dataTransfer, session().key);
-          host().sessionOrganizer.startSessionDrag(session());
+          host().sessionOrganizer.startSessionDrag(actionSession());
         }
       }}
       onDragEnd={() => host().sessionOrganizer.finishSessionDrag()}
@@ -265,7 +265,7 @@ function renderRecentSessionRow(params: RecentSessionParams) {
         draggable="false"
         aria-current={session().visuallyActive ? "page" : undefined}
         aria-describedby={[stateId(), metaId()].filter(Boolean).join(" ") || undefined}
-        onClick={(event: MouseEvent) => host().handleSessionRowClick(event, session())}
+        onClick={(event: MouseEvent) => host().handleSessionRowClick(event, actionSession())}
       >
         {indicators.persistentIndicator}
         <span class="sidebar-recent-session__text">
@@ -303,9 +303,7 @@ function renderRecentSessionRow(params: RecentSessionParams) {
           class={[
             "sidebar-child-session-toggle",
             {
-              "sidebar-child-session-toggle--running": !team() && session().runningChildCount > 0,
-              "sidebar-child-session-toggle--failed":
-                !team() && !(session().runningChildCount > 0) && session().failedChildCount > 0,
+              "sidebar-child-session-toggle--running": session().runningChildCount > 0,
             },
           ]}
           type="button"
@@ -322,20 +320,23 @@ function renderRecentSessionRow(params: RecentSessionParams) {
             },
           )}
           aria-description={
-            !team() && !childrenExpanded() && session().runningChildCount > 0
+            !childrenExpanded() && session().runningChildCount > 0
               ? t("sessionsView.activeRun")
               : undefined
           }
-          onClick={() => host().toggleSessionChildren(session())}
+          onClick={() => host().toggleSessionChildren(actionSession())}
         >
           <span class="sidebar-child-session-toggle__icon" aria-hidden="true">
-            <Icon name={childrenExpanded() ? "chevronDown" : "chevronRight"} />
+            <Show
+              when={!childrenExpanded() && session().runningChildCount > 0}
+              fallback={<Icon name={childrenExpanded() ? "chevronDown" : "chevronRight"} />}
+            >
+              <span class="session-run-spinner" />
+            </Show>
           </span>
-          {team() ? undefined : (
-            <span class="sidebar-child-session-toggle__count">
-              {session().childSessionKeys.length}
-            </span>
-          )}
+          <span class="sidebar-child-session-toggle__count">
+            {session().childSessionKeys.length}
+          </span>
         </button>
       </Show>
       <span class="sidebar-recent-session__aside session-row-aside">
@@ -348,7 +349,7 @@ function renderRecentSessionRow(params: RecentSessionParams) {
               type="button"
               title={pinLabel()}
               aria-label={pinLabel()}
-              onClick={() => host().toggleSessionPin(session())}
+              onClick={() => host().toggleSessionPin(actionSession())}
             >
               <Icon name="pin" />
             </button>
@@ -366,9 +367,10 @@ function renderRecentSessionRow(params: RecentSessionParams) {
             disabled={!archiveAccess().allowed || !archiveAllowed() || archiving()}
             onClick={(event: MouseEvent) => {
               event.stopPropagation();
-              if (session().archived) {
+              const target = actionSession();
+              if (target.archived) {
                 void host().sessionOrganizer.patchSession(
-                  session(),
+                  target,
                   {
                     archived: false,
                   },
@@ -377,7 +379,7 @@ function renderRecentSessionRow(params: RecentSessionParams) {
                   },
                 );
               } else {
-                void host().sessionOrganizer.archiveSessionWithUndo(session());
+                void host().sessionOrganizer.archiveSessionWithUndo(target);
               }
             }}
           >
@@ -395,7 +397,11 @@ function renderRecentSessionRow(params: RecentSessionParams) {
             aria-expanded={menuOpen() ? "true" : "false"}
             onClick={(event) => {
               event.stopPropagation();
-              host().toggleSessionMenu(session(), event.currentTarget, display()?.catalogMenu);
+              host().toggleSessionMenu(
+                actionSession(),
+                event.currentTarget,
+                display()?.catalogMenu,
+              );
             }}
           >
             <Icon name="moreHorizontal" />
@@ -406,10 +412,10 @@ function renderRecentSessionRow(params: RecentSessionParams) {
   );
   return row;
 }
-type PendingSessionCreate = NonNullable<ReturnType<SessionListHost["pendingSessionCreate"]>>;
+type PendingSessionCreate = NonNullable<ReturnType<SessionListHost["sessionCreateDisplay"]>>;
 
-/** The unadmitted create renders in the slot its admitted row will take: selected,
- *  actionless, and aligned with real rows. A create for a rendered custom group
+/** Local create facts occupy the future roster slot until canonical takeover:
+ *  selected, actionless, and aligned with real rows. A rendered custom group
  *  leads that group's list; any other create leads the session list. Only the
  *  native session list has that slot: the agent-only roster shows no row for a
  *  new session, so a handoff row there would flash under the agent and vanish on
@@ -423,7 +429,11 @@ export function renderPendingSessionCreateRow(
       {(value) => {
         const row = (
           <div class="sidebar-recent-session session-row-host sidebar-recent-session--single-line sidebar-recent-session--active sidebar-recent-session--creating">
-            <div class="sidebar-recent-session__link" aria-current="page" aria-busy="true">
+            <div
+              class="sidebar-recent-session__link"
+              aria-current="page"
+              aria-busy={value().creation.admitted ? undefined : "true"}
+            >
               <span class="sidebar-session-indicator" aria-hidden="true" />
               <span class="sidebar-recent-session__text">
                 <span class="sidebar-recent-session__title-row">

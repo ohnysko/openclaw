@@ -1,6 +1,6 @@
+import assert from "node:assert/strict";
 // Keep network/package-manager admission outside this database recovery regression.
 import "./update-command-execution.test-support.js";
-import assert from "node:assert/strict";
 import { fork, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs/promises";
@@ -10,9 +10,9 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { stopChildProcess } from "../../../test/helpers/stop-child-process.js";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { buildBackupArchivePath } from "../../commands/backup-shared.js";
 import { createConfigIO } from "../../config/io.js";
 import * as serviceMembership from "../../daemon/service-process-membership.js";
+import { buildBackupArchivePath } from "../../infra/backup-archive-path-policy.js";
 import { swapStagedPackageInstall } from "../../infra/package-update-swap.js";
 import { createPackageSwapFixture } from "../../infra/package-update-swap.test-support.js";
 import { runtimeProcessEntrypoints } from "../../infra/runtime-process-entrypoints.js";
@@ -26,7 +26,10 @@ import {
   recordUpdateRunVerification,
 } from "../../infra/update-run-ledger.js";
 import { renderUpdateRunReport } from "../../infra/update-run-report.js";
-import { runFixtureGit as git } from "../../infra/update-runner-git-candidate.test-support.js";
+import {
+  isolateGitIdentity,
+  runFixtureGit as git,
+} from "../../infra/update-runner-git-candidate.test-support.js";
 import { updateGitCheckout } from "../../infra/update-runner-git.js";
 import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import { CommandProcessCleanupError } from "../../process/exec-result.js";
@@ -391,15 +394,7 @@ it.each([
       ]);
     };
     if (gitInstall) {
-      vi.stubEnv("GIT_CONFIG_COUNT", "0");
-      for (const key of [
-        "GIT_AUTHOR_NAME",
-        "GIT_AUTHOR_EMAIL",
-        "GIT_COMMITTER_NAME",
-        "GIT_COMMITTER_EMAIL",
-      ]) {
-        vi.stubEnv(key, undefined);
-      }
+      isolateGitIdentity();
       await git(packageRoot, "init", "--initial-branch=main");
       await git(packageRoot, "config", "user.name", "OpenClaw Test");
       await git(packageRoot, "config", "user.email", "openclaw@example.com");
@@ -533,6 +528,10 @@ it.each([
     const readSchemas = schemas.readUpdateStateSchemaVersions;
     vi.spyOn(schemas, "readUpdateStateSchemaVersions").mockImplementation((params) =>
       readSchemas({ ...params, root: undefined }),
+    );
+    const readGenerations = schemas.readUpdateDatabaseGenerationsIsolated;
+    vi.spyOn(schemas, "readUpdateDatabaseGenerationsIsolated").mockImplementation(
+      (paths, options) => readGenerations(paths, { ...options, root: undefined }),
     );
     mocks.runPackageUpdate.mockImplementation(
       async (

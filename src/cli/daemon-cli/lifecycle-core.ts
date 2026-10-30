@@ -24,6 +24,7 @@ import { GatewayRestartPreparationError } from "../../infra/restart-intent-error
 import type { GatewayRestartIntent } from "../../infra/restart-intent.js";
 import { isWSL } from "../../infra/wsl.js";
 import { defaultRuntime, ExitError } from "../../runtime.js";
+import { getAsyncWorkSignal } from "../../shared/async-work-scope.js";
 import { formatCliCommand } from "../command-format.js";
 import { formatInvalidConfigRecoveryHint } from "../config-recovery-hints.js";
 import { resolveGatewayTokenForDriftCheck } from "./gateway-token-drift.js";
@@ -34,6 +35,7 @@ import {
 } from "./lifecycle-audit.js";
 import { createServiceRestartIntent } from "./lifecycle-restart-intent.js";
 import { buildDaemonServiceSnapshot, createDaemonActionContext } from "./response.js";
+import type { GatewayRestartSnapshot } from "./restart-health.types.js";
 import { filterContainerGenericHints, resolveDaemonInstallBlockMessage } from "./shared.js";
 import type { DaemonLifecycleOptions } from "./types.js";
 
@@ -118,6 +120,15 @@ async function resolveServiceLoadedOrFail(
   return (
     loadState.status === "loaded" ||
     (Boolean(opts.acceptInstalledDefinition) && (await hasInstalledDefinition()))
+  );
+}
+
+/** Only observer cancellation belongs to the root; concurrent service failures still report. */
+export function commandInterrupted(error: unknown): boolean {
+  const signal = getAsyncWorkSignal();
+  return (
+    signal?.aborted === true &&
+    (error === signal.reason || (error instanceof Error && error.cause === signal.reason))
   );
 }
 
@@ -276,6 +287,9 @@ export async function runServiceStart(params: {
       if (postCheckFailed || err instanceof ExitError) {
         throw err;
       }
+      if (commandInterrupted(err)) {
+        return;
+      }
       fail(`${params.serviceNoun} start failed: ${String(err)}`, params.renderStartHints());
       return;
     }
@@ -347,6 +361,9 @@ export async function runServiceStart(params: {
         if (postCheckFailed || err instanceof ExitError) {
           throw err;
         }
+        if (commandInterrupted(err)) {
+          return;
+        }
         fail(`${params.serviceNoun} repair failed: ${String(err)}`, params.renderStartHints());
         return;
       }
@@ -361,6 +378,9 @@ export async function runServiceStart(params: {
   } catch (err) {
     if (postCheckFailed || err instanceof ExitError) {
       throw err;
+    }
+    if (commandInterrupted(err)) {
+      return;
     }
     fail(`${params.serviceNoun} start failed: ${String(err)}`, params.renderStartHints());
   }
@@ -457,7 +477,9 @@ export async function runServiceRestart(params: {
   repairLoadedService?: (
     ctx: ServiceStartRepairContext,
   ) => Promise<ServiceRecoveryResult<"restarted"> | null>;
-  postRestartCheck?: (ctx: RestartPostCheckContext) => Promise<GatewayServiceRestartResult | void>;
+  postRestartCheck?: (
+    ctx: RestartPostCheckContext,
+  ) => Promise<(GatewayServiceRestartResult & { readiness?: GatewayRestartSnapshot }) | void>;
   onNotLoaded?: (ctx: ServiceRecoveryContext) => Promise<ServiceRecoveryResult<"restarted"> | null>;
   restartOwnedProcess?: (
     ctx: ServiceRecoveryContext,
@@ -522,6 +544,9 @@ export async function runServiceRestart(params: {
       if (err instanceof ExitError) {
         throw err;
       }
+      if (commandInterrupted(err)) {
+        return false;
+      }
       fail(`${params.serviceNoun} restart failed: ${String(err)}`);
       return false;
     }
@@ -539,6 +564,9 @@ export async function runServiceRestart(params: {
     } catch (err) {
       if (err instanceof ExitError) {
         throw err;
+      }
+      if (commandInterrupted(err)) {
+        return false;
       }
       fail(`${params.serviceNoun} restart failed: ${String(err)}`);
       return false;
@@ -588,6 +616,9 @@ export async function runServiceRestart(params: {
       clearPreparedRestartIntent();
       if (err instanceof ExitError) {
         throw err;
+      }
+      if (commandInterrupted(err)) {
+        return false;
       }
       const hints = renderRestartFailureHints(err);
       fail(`${params.serviceNoun} repair failed: ${String(err)}`, hints);
@@ -668,30 +699,29 @@ export async function runServiceRestart(params: {
     if (restartStatus.scheduled) {
       return emitScheduledRestart(restartStatus, loaded || recoveredLoadedState === true);
     }
-    if (params.postRestartCheck) {
-      const postRestartResult = await params.postRestartCheck({
-        json,
-        stdout,
-        warnings,
-        warn,
-        // Definition repair alone does not record native activation.
-        activationAccepted: restartResult?.outcome === "completed" || Boolean(handledRecovery),
-        preserveDefinition: configIssue ? true : params.opts?.preserveDefinition,
-        fail: (message, hints, result) => {
-          postCheckFailed = true;
-          fail(message, hints, result);
-        },
-      });
-      if (postRestartResult) {
-        restartStatus = describeGatewayServiceRestart(params.serviceNoun, postRestartResult);
-        if (restartStatus.scheduled) {
-          return emitScheduledRestart(restartStatus, loaded || recoveredLoadedState === true);
-        }
+    const postRestartResult = await params.postRestartCheck?.({
+      json,
+      stdout,
+      warnings,
+      warn,
+      // Definition repair alone does not record native activation.
+      activationAccepted: restartResult?.outcome === "completed" || Boolean(handledRecovery),
+      preserveDefinition: configIssue ? true : params.opts?.preserveDefinition,
+      fail: (message, hints, result) => {
+        postCheckFailed = true;
+        fail(message, hints, result);
+      },
+    });
+    if (postRestartResult) {
+      restartStatus = describeGatewayServiceRestart(params.serviceNoun, postRestartResult);
+      if (restartStatus.scheduled) {
+        return emitScheduledRestart(restartStatus, loaded || recoveredLoadedState === true);
       }
     }
     emitMessage({
       ok: true,
       result: "restarted",
+      readiness: postRestartResult ? postRestartResult.readiness : undefined,
       message: handledRecovery?.message ?? handledRepair?.message,
       service: buildDaemonServiceSnapshot(params.service, loaded || recoveredLoadedState === true),
       warnings: warnings.length ? warnings : undefined,
@@ -701,6 +731,9 @@ export async function runServiceRestart(params: {
     // A non-exiting runtime unwinds after emission; never replace that result.
     if (postCheckFailed || err instanceof ExitError) {
       throw err;
+    }
+    if (commandInterrupted(err)) {
+      return false;
     }
     const hints = renderRestartFailureHints(err);
     fail(`${params.serviceNoun} restart failed: ${String(err)}`, hints);

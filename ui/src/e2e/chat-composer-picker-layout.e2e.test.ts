@@ -93,7 +93,7 @@ suite.define(() => {
         ],
       });
       await page.goto(`${suite.server.baseUrl}chat`);
-      await gateway.waitForRequest("chat.startup");
+      await gateway.waitForRequest("sessions.messages.subscribe");
       const composer = page.locator(".agent-chat__input");
       await composer.locator('[data-chat-thinking-select="true"]').waitFor();
       await openChatSidePanelType(page, "Files");
@@ -171,8 +171,9 @@ suite.define(() => {
               }),
             )
             .toBe(true);
-          const box = await layoutBox(trigger);
-          await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+          await layoutBox(trigger);
+          // Mobile editing animates the footer after focus; resolve its current hit target.
+          await trigger.click();
           await expect.poll(() => composer.locator(menuSelector).isVisible()).toBe(true);
           expect(await composer.locator(otherMenuSelector).isVisible()).toBe(false);
           await page.keyboard.press("Escape");

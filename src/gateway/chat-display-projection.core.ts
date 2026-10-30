@@ -307,6 +307,32 @@ function hasVisibleAssistantReplyText(message: Record<string, unknown>): boolean
   });
 }
 
+function isCompletedAssistantMessage(message: Record<string, unknown>): boolean {
+  return (
+    message.role === "assistant" &&
+    (message.stopReason === "stop" || message.stopReason === "length")
+  );
+}
+
+/** Sanitized reasoning is display material without being a recovery-completing answer. */
+function hasAssistantHistoryMaterial(message: Record<string, unknown>): boolean {
+  return (
+    hasVisibleAssistantReplyText(message) ||
+    hasAssistantDisplayableNonTextContent(message) ||
+    hasTranscriptMediaFacts(message) ||
+    (Array.isArray(message.content) &&
+      message.content.some((block) => {
+        const entry = asOptionalRecord(block);
+        return (
+          isAssistantInternalReasoningContentType(entry?.type) &&
+          [entry?.thinking, entry?.text].some(
+            (value) => typeof value === "string" && value.trim().length > 0,
+          )
+        );
+      }))
+  );
+}
+
 function isDiagnosticOnlyAssistantError(value: unknown): boolean {
   const message = asOptionalRecord(value);
   return (
@@ -585,10 +611,11 @@ export function projectChatDisplayMessagesWithState(
       }
     }
   }
-  const sanitizedMessages = toProjectedMessages(
-    sanitizeChatHistoryMessages(projectedErrors, Number.MAX_SAFE_INTEGER, {
-      includeCommentaryFallbacks: options?.includeCommentaryFallbacks,
-    }),
+  // Recovery already admitted records and consumed assistant display content.
+  const sanitizedMessages = sanitizeChatHistoryMessages(projectedErrors, Number.MAX_SAFE_INTEGER, {
+    includeCommentaryFallbacks: options?.includeCommentaryFallbacks,
+  }).filter(
+    (message) => !isCompletedAssistantMessage(message) || hasAssistantHistoryMaterial(message),
   );
   const commentaryFallbacksObserved =
     options?.includeCommentaryFallbacks === true &&
@@ -608,7 +635,7 @@ export function projectChatDisplayMessagesWithState(
     mergeTtsSupplementMessages(filtered.messages),
     options?.maxChars ?? DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS,
     { toolResultMaxChars: options?.toolResultMaxChars },
-  ) as Array<Record<string, unknown>>;
+  );
   const result: ChatDisplayProjectionResult = {
     activity,
     messages: projectCurrentUserProfileAvatars(

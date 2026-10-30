@@ -178,6 +178,14 @@ export type WorkerNodeEnrollment = WorkerNodeBootstrapAccess & {
   openclawVersion: string;
   displayName: string;
   waitForDeviceId: () => Promise<string>;
+  /** Private per-lease inference inputs. Never captured in a prepared image. */
+  workerCodex?: {
+    configToml: string;
+    helperScript: string;
+    /** Original executable path referenced by configToml; provider rewrites it when staging. */
+    helperPath: string;
+    configVersion: string;
+  };
 } & (
     | { mode: "connect"; setupCode: string; setupId: string }
     | { mode: "resume"; deviceId: string }
@@ -486,6 +494,8 @@ export type WorkerProvider = {
   destroy: (lease: {
     leaseId: string;
     profile: WorkerProfile;
+    /** Cancel commands, await their settlement, and reject while teardown remains unconfirmed. */
+    signal?: AbortSignal;
     /**
      * Optional notification that cleanup is accepted and no longer needs the session.
      * The host may reclaim the session, but retains this operation until its promise settles.

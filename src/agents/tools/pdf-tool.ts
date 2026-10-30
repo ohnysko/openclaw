@@ -6,6 +6,7 @@ import { Type } from "typebox";
 import { omitNullRequestHeaders } from "../../../packages/llm-core/src/utils/request-headers.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { captureAmbientGatewayOperatorAuthority } from "../../gateway/operator-invocation-authority.js";
+import { createMediaAssistantTextCoercer } from "../../media-understanding/assistant-text.js";
 import { providerSupportsNativePdfDocument } from "../../media-understanding/defaults.js";
 import { renderDocumentTruncationNotice } from "../../media/document-extraction-metadata.js";
 import {
@@ -60,13 +61,14 @@ import {
 import { anthropicAnalyzePdf, geminiAnalyzePdf } from "./pdf-native-providers.js";
 import {
   buildPdfExtractionContext,
-  coercePdfAssistantText,
   coercePdfModelConfig,
   parsePageRange,
   resolvePdfInputs,
   resolvePdfToolMaxTokens,
 } from "./pdf-tool.helpers.js";
 import { type PdfToolActiveModel, resolvePdfModelConfigForTool } from "./pdf-tool.model-config.js";
+
+const coercePdfAssistantText = createMediaAssistantTextCoercer("PDF");
 
 const DEFAULT_PROMPT = "Analyze this PDF document.";
 const DEFAULT_MAX_PDFS = 10;

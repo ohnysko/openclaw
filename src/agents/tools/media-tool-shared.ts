@@ -13,6 +13,7 @@ import type { AgentModelConfig } from "../../config/types.agents-shared.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { SsrFPolicy } from "../../infra/net/ssrf.js";
 import { resolveChannelInboundAttachmentRootsForChannel } from "../../media/channel-inbound-roots.js";
+import type { decodeDataUrl } from "../../media/image-data-url.js";
 import { getDefaultLocalRootsCore } from "../../media/local-media-access.js";
 import {
   classifyMediaReferenceSource,
@@ -45,7 +46,6 @@ import {
   readStringArrayParam,
   readToolStringParam,
 } from "./common.js";
-import type { decodeDataUrl } from "./image-tool.helpers.js";
 import {
   capabilityAuthOperation,
   getCurrentCapabilityMetadataSnapshot,
@@ -60,17 +60,15 @@ import {
   type ToolModelConfig,
 } from "./model-config.helpers.js";
 
-type TextToolAttempt = {
-  provider: string;
-  model: string;
-  error: string;
-};
-
 type TextToolResult = {
   text: string;
   provider: string;
   model: string;
-  attempts: TextToolAttempt[];
+  attempts: {
+    provider: string;
+    model: string;
+    error: string;
+  }[];
 };
 
 export const REMOTE_MEDIA_READ_IDLE_TIMEOUT_MS = 120_000;
@@ -109,11 +107,6 @@ type CapabilityProvider = {
 type CapabilityProviderSource =
   | readonly CapabilityProvider[]
   | (() => readonly CapabilityProvider[]);
-
-type GenerationCapabilityProviderKey =
-  | "imageGenerationProviders"
-  | "videoGenerationProviders"
-  | "musicGenerationProviders";
 
 /** @deprecated Only synchronous tool-constructor compatibility uses this path. */
 export function isCapabilityProviderConfigured<T extends CapabilityProvider>(params: {
@@ -286,7 +279,7 @@ export function hasGenerationToolAvailability(params: {
   authStore?: AuthProfileStore;
   modelConfig?: AgentModelConfig;
   providers?: CapabilityProviderSource;
-  providerKey: GenerationCapabilityProviderKey;
+  providerKey: "imageGenerationProviders" | "videoGenerationProviders" | "musicGenerationProviders";
 }): boolean {
   if (params.cfg?.plugins?.enabled === false) {
     return false;
@@ -573,7 +566,7 @@ export async function loadMediaToolReferences<T>(params: {
     let media: LoadedToolReferenceMedia;
     try {
       if (reference.isDataUrl) {
-        const { decodeDataUrl } = await import("./image-tool.helpers.js");
+        const { decodeDataUrl } = await import("../../media/image-data-url.js");
         params.signal?.throwIfAborted();
         media = decodeDataUrl(resolvedInput, { maxBytes: params.maxBytes });
       } else {
